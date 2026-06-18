@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Local tooling / editor
+.claude/
+.vscode/
+.idea/
+
+# Run output snapshots (large, regenerated per run)
+/Processing/
+
+# User-generated run artefacts (written to the working directory)
+/slider_state_*.json
+/workflow_*_dp*.json
+/config_*.json
