@@ -1888,6 +1888,28 @@ class dmsfit_ico_hkl(object):
         except:
             return 500
 
+    def residuals(self,inputs):
+        """Per-ROI centre residuals (fitted Gaussian centre - target centre).
+        This is the vector form of `fit` (which returns np.sum(residuals**2)),
+        for use with scipy.optimize.least_squares.  A robust loss (soft_l1 /
+        huber) then downweights the [100,...] fallback rows produced when a
+        per-ROI Gaussian fit fails."""
+        try:
+            self.imcalc(inputs) # adding attribute
+            v1=np.array([[]]*4).T
+            for i1 in range(self.kernel.shape[2]):
+                sumvals,roi = msroi(self.imsim,self.kernel[:,:,i1],self.width)
+                xdata=np.arange(len(sumvals))
+                ydata=sumvals[:,0]
+                try:
+                    coef, pcov,fitpoints = fitgauss(xdata,ydata)
+                    v1=np.vstack([v1,coef])
+                except:
+                    v1=np.vstack([v1,[100,100,100,100]])
+            return v1[:,2]-self.centres[:,0]
+        except:
+            return np.full(self.centres.shape[0], 100.0)
+
     def stats(self,inputs):
         self.imcalc(inputs) # adding attribute
         v1=np.array([[]]*4).T

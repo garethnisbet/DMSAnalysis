@@ -8,11 +8,14 @@ Everything lives in the importable `DMSAnalysis` package. Run the apps as module
 from the repository root (no install or build step required):
 
 ```bash
-python -m DMSAnalysis.slider    [config.json]   # interactive slider refinement
-python -m DMSAnalysis.workflow  [config.json]   # slider refinement → automated fitting
+python -m DMSAnalysis.slider    [config.json]   # GUI: refine → build curves → fit
 python -m DMSAnalysis.fit       [config.json]   # batch fivefold-axis fitting
 python -m DMSAnalysis.dat2config scan.dat out.json --datapoint N --datapoint0 M
 ```
+
+The slider is the single interactive app: refine geometry with the sliders, click
+arcs to select reflections, **Build curves** to integrate the ROIs for the checked
+reflections, then **Fit**. `fit.py` is the non-interactive/batch path.
 
 Each app falls back to the example config in `DMSAnalysis/configs/` when no path is given.
 
@@ -25,9 +28,8 @@ DMS/                          # repository root
 │   ├── loader.py             # Reads Diamond Light Source .dat scan files into a dict-like object
 │   ├── dat2config.py         # Extracts scan metadata from a .dat into a config (the only .dat reader)
 │   ├── config_table.py       # Shared editable Qt table view of a config dict
-│   ├── slider.py             # Interactive slider visualiser for quasicrystal MS simulation
-│   ├── workflow.py           # Unified slider refinement → automated fitting
-│   ├── fit.py                # Fitting script: loads data, builds ROIs, runs optimiser
+│   ├── slider.py             # The GUI: refine → build integrated curves → fit
+│   ├── fit.py                # Batch fitting script: loads data, builds ROIs, runs optimiser
 │   ├── configs/              # Example JSON configs shipped with the package
 │   └── README.md             # Full library API documentation
 └── Processing/               # Timestamped output snapshots (auto-created when save=1, in CWD)
@@ -96,7 +98,7 @@ This code analyses **X-ray multiple scattering (MS)** in an **icosahedral quasic
 
 ```
 numpy  scipy  matplotlib  PIL(Pillow)  shapely  imageio  joblib
-PyQt5  pyqtgraph   (for the slider/workflow GUIs)
+PyQt5  pyqtgraph   (for the slider GUI)
 cctbx  (optional, for loadcif)
 ```
 

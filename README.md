@@ -7,9 +7,9 @@ physical reciprocal vector is `h + h′·τ` (τ = golden ratio). The main quant
 being refined is the **phason strain** — a 3×3 matrix coupling the
 perpendicular-space component of each reflection.
 
-The package provides a core geometry/fitting library plus three applications:
-an interactive slider for manual refinement, a unified slider→fit workflow, and
-a batch fitting script.
+The package provides a core geometry/fitting library plus two applications:
+an interactive GUI (the slider — refine geometry, build integrated curves, then
+fit) and a batch fitting script.
 
 ## Installation
 
@@ -17,7 +17,7 @@ No build step. Clone the repository and run from its root. Requirements:
 
 ```
 numpy  scipy  matplotlib  Pillow  shapely  imageio  joblib
-PyQt5  pyqtgraph          # for the slider / workflow GUIs
+PyQt5  pyqtgraph          # for the slider GUI
 cctbx                     # optional, only for loadcif() when autoreflist=1
 ```
 
@@ -31,23 +31,25 @@ All apps run as modules from the repository root and accept an optional config
 path (falling back to the example config in `DMSAnalysis/configs/`):
 
 ```bash
-# Interactive slider — manually refine the initial guess over the detector image
+# Interactive GUI — refine geometry, build integrated curves, then fit
 python -m DMSAnalysis.slider [config.json]
 
-# Unified workflow — slider refinement → automated optimiser
-python -m DMSAnalysis.workflow [config.json]
-
-# Batch fivefold-axis fitting
+# Batch fivefold-axis fitting (non-interactive)
 python -m DMSAnalysis.fit [config.json]
 
 # Convert a Diamond .dat scan file into a config (the only .dat reader)
 python -m DMSAnalysis.dat2config scan.dat out.json --datapoint N --datapoint0 M
 ```
 
-Typical flow: run `dat2config` (or the slider's **Import**) to extract scan
-metadata into a config, refine geometry in the **slider**, then **Launch** the
-**workflow** to fit. The config is the single source of truth — once the
-`experiment` block is populated, the apps never read the `.dat` again.
+Typical flow in the **slider** (the single interactive app):
+1. Refine geometry with the sliders over the detector image.
+2. Click arcs to select reflections; check/uncheck them in the list.
+3. **Build curves** — integrate the ROIs for the checked reflections.
+4. **Fit** — run the optimiser; fitted parameters flow back to the sliders.
+
+**Save config** writes the current state (incl. selected reflections) for batch
+runs via `python -m DMSAnalysis.fit`. The config is the single source of truth —
+once the `experiment` block is populated, the apps never read the `.dat` again.
 
 ### Using the library
 
@@ -69,8 +71,7 @@ DMS/                          # repository root
 │   ├── loader.py             # reads Diamond .dat scan files
 │   ├── dat2config.py         # extracts scan metadata from a .dat into a config
 │   ├── config_table.py       # shared editable Qt table view of a config
-│   ├── slider.py             # interactive slider visualiser
-│   ├── workflow.py           # slider refinement → automated fitting
+│   ├── slider.py             # the GUI: refine → build curves → fit
 │   ├── fit.py                # batch fivefold-axis fitting
 │   ├── configs/              # example JSON configs
 │   └── README.md             # library API reference

@@ -8,8 +8,7 @@ Library modules:
     config_table  shared editable Qt table view of a config
 
 Applications (run with ``python -m DMSAnalysis.<name>``):
-    slider        interactive slider refinement viewer
-    workflow      slider refinement → automated fitting
+    slider        interactive refinement → build integrated curves → fit (the GUI)
     fit           batch fivefold-axis fitting script
 """
 
