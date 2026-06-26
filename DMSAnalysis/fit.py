@@ -73,6 +73,9 @@ autoreflist= cfg["flags"]["autoreflist"]
 #                               Minimize Method
 #===============================================================================
 OptMethod = cfg["computation"]["opt_method"]
+# Peak-position method for the raw and simulated ROI curves:
+# 'gauss' (Gaussian curve fit) or 'centroid' (centre of mass).
+peak_method = cfg["computation"].get("peak_method", "gauss")
 # OptMethod = ts.minimizers['Nelder-Mead']
 # OptMethod = ts.minimizers['Differential Evolution']
 # OptMethod = ts.minimizers['CG']
@@ -172,7 +175,16 @@ hkllist=ts.pilkhlrange(lattice,hkl,energy,thrange[0],thrange[1]).hklscan(numstep
 hkllistrange = [thrange[0],thrange[1], numsteps]
 #===============================================================================
 ##################### Get reduced reflection list  #######################
-if autoreflist:
+# Conventional crystals are indexed with plain 3-element Miller indices: there
+# is no cut-and-projection and no phason matrix, so reflist2 (the perpendicular
+# component) and the phason matrix are zero.
+CONVENTIONAL = bravais in ts.CONVENTIONAL_SYSTEMS
+
+if CONVENTIONAL:
+    ref_6d = None
+    reflist  = np.array(cfg["crystal"]["reflist_hkl"], dtype=float)
+    reflist2 = np.zeros_like(reflist)
+elif autoreflist:
     mslist=[[np.NAN,np.NAN,np.NAN,np.NAN,np.NAN,np.NAN,np.NAN]]
     hkllistcorse=ts.pilkhlrange(lattice,hkl,energy,thrange[0],thrange[1]).hklscan(30)
     SF, reflist, lattice2 , structure, sfc = ts.loadcif(cif_file,energy)
@@ -208,14 +220,14 @@ mtrx2 = [ig[15],ig[16],ig[17],ig[18],ig[19],ig[20],ig[21],ig[22],ig[23]]
 
 intensity = 1
 threshold = 0
-builderargs=reflist,hkllist,hklint,intensity,psirange,threshold,hkl,detvects,imdata.shape,simsigma,azir,psi,px,py,scatv,detdistancepx,rotx,roty,rotz,energy,ig,reflist2,mtrx2
+builderargs=reflist,hkllist,hklint,intensity,psirange,threshold,hkl,detvects,imdata.shape,simsigma,azir,psi,px,py,scatv,detdistancepx,rotx,roty,rotz,energy,ig,reflist2,mtrx2,(bravais if CONVENTIONAL else None)
 
 
 # builderargs=reflist,hkllist,hklint,psirange,width,[0,0,0,0],imdata,hkl,detvects,imdata,simsigma,azir,psi,px,py,scatv,detdistancepx,rotx,roty,rotz,energy,ig
 kernel=ts.roibuilder_ico_hkl(builderargs)
 
 # linedataxc,linedatayc,linedataxcs,linedataycs, centres = ts.multiroigconv(imdata,kernel,width,[0,5,20],3.0, 2.0)
-imcoeffs,linedatax,linedatay, fitpoints, rois, pcov =ts.multiroifit2(imdata,kernel,width,0.02,10.0)
+imcoeffs,linedatax,linedatay, fitpoints, rois, pcov =ts.multiroifit2(imdata,kernel,width,0.02,10.0,peak_method)
 # imcoeffs,linedatax,linedatay, fitpoints, rois =ts.multiroimin(imdata,kernel,width,0,0.01)
 centres=np.array([imcoeffs[:,2]]).T
 # linedatax,linedatay, centres, rois = ts.multiroicom(imdata,kernel,width,comwidth)
@@ -227,7 +239,12 @@ for _idx, _val in cfg["manual_centres"].items():
     centres[int(_idx)] = _val / 2 * zoomval
 
 #                            0_a        1_b    2_c    3_alpha     4_beta  5_gamma  6_psicor  7_hcor   8_kcor   9_lcor   10_detdist              11_dxrot   12_dyrot    13_dzrot    14_energy           15_pmatrix ->
-if bravais == 'icosahedral':
+if CONVENTIONAL:
+    # Conventional crystal: the free lattice slots are selected by the crystal
+    # system; the phason block is never optimised.
+    ig = initial_guess[ts.reduced_param_indices(bravais, detoptimize, energyopt)]
+
+elif bravais == 'icosahedral':
 
     if detoptimize:
         if energyopt:
@@ -294,6 +311,8 @@ dms = ts.dmsfit_ico_hkl(reflist, hkllistrange, hklint, psirange, width, centres,
 
 dms.setCalLattice(initial_guess[:6])
 dms.setLattice(initial_guess[:6])
+dms.setPeakMethod(peak_method)
+dms.setIGFull(initial_guess)   # full guess for the conventional-crystal branch
 
 
 if fit:
@@ -400,6 +419,10 @@ refnum = 0
 roicount = 0
 axislist=[]
 
+# Per-reflection label for the ROI subplot titles: the 6D indices for a
+# quasicrystal, or the 3-index Miller indices for a conventional crystal.
+ref_labels = np.asarray(reflist) if CONVENTIONAL else ref_6d
+
 def millerSring(input_string):
     output_string = re.sub('-(\d)', r'\\bar{\1}', input_string)
     output_string = output_string.replace('[','$(')
@@ -418,10 +441,11 @@ for i1 in range(kernel.shape[2]):
         plt.plot([centres[i1],centres[i1]],[fitpoints[i1].min(),linedatay[i1].max()],'g',linewidth=0.5)
 
     # plt.title(str(i1)+' '+str(ref_6d[refnum,:]),fontsize=10)
+    _lbl = ref_labels[refnum,:] if refnum < len(ref_labels) else ref_labels[-1,:]
     if show_numbers:
-        title_string = str(i1)+' '+millerSring(str(ref_6d[refnum,:]))
+        title_string = str(i1)+' '+millerSring(str(_lbl))
     else:
-        title_string = millerSring(str(ref_6d[refnum,:]))
+        title_string = millerSring(str(_lbl))
     plt.title(title_string,fontsize=10)
 
     yscale = (linedatay[i1].max()-linedatay[i1].min())/(linedatasimy[i1].max()-linedatasimy[i1].min())

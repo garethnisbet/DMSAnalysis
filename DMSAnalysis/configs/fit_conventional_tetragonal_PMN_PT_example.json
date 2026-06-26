@@ -1,0 +1,86 @@
+{
+  "scan": {
+    "scannum": 1041984,
+    "scanpath": "/home/ndf61257/MintSpace/i16extra/data/2024/mm36559-1/",
+    "datapoint": 35,
+    "datapoint0": 35
+  },
+  "flags": {
+    "save": 1,
+    "fit": 1,
+    "firstplot": 1,
+    "show_centres": 1,
+    "show_numbers": 1,
+    "axis_off": 0,
+    "autoreflist": 0,
+    "detoptimize": 1,
+    "energyopt": 0
+  },
+  "display": {
+    "zoomval": 1,
+    "colourlim": [0, 520],
+    "colmap": "gray",
+    "colourmap": [2, 850],
+    "subcellsx": 7,
+    "subcellsy": 6
+  },
+  "roi": {
+    "width_per_zoom": 45,
+    "comwidth_per_zoom": 5
+  },
+  "geometry": {
+    "hkl": [0.5162, 2.7099, 2.7099],
+    "psi": 0,
+    "px_unscaled": 1087,
+    "py_unscaled": 821,
+    "scatv": 0
+  },
+  "computation": {
+    "numsteps": 300,
+    "simsigma_per_zoom": 4.5,
+    "thrange_delta": [-20, 20],
+    "bravais": "tetragonal",
+    "opt_method": "COBYLA",
+    "peak_method": "gauss",
+    "tolerance": 1e-06,
+    "intensity": 1,
+    "threshold": 0,
+    "n_parallel_starts": 1
+  },
+  "crystal": {
+    "lattice2": [4.023, 4.023, 4.023, 90, 90, 90],
+    "initial_guess_base": [
+      4.023, 4.023, 4.023, 90.0, 90.0, 90.0,
+      0.0, 0.0, 0.0, 0.0,
+      10116.0,
+      0.0, 0.0, 0.0,
+      0.0,
+      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    ],
+    "reflist_hkl": [
+      [0, 0, 2],
+      [-1, 1, 2],
+      [-1, 1, 0],
+      [2, 0, 0],
+      [0, 1, -1],
+      [2, 1, -1],
+      [2, 0, 2],
+      [-2, 2, 2],
+      [-1, 2, -1],
+      [0, 1, 3],
+      [3, 3, 0],
+      [3, 3, 2],
+      [0, 5, 3],
+      [-1, 4, 3],
+      [-2, 2, 0],
+      [-1, 2, 3],
+      [3, 0, 1],
+      [0, 4, 4],
+      [0, 0, 3]
+    ]
+  },
+  "manual_centres": {},
+  "paths": {
+    "cif_file": ""
+  }
+}

@@ -3,7 +3,7 @@
 slider_quasi_AlPdMn_Annealed_hkl_v3.py
 Interactive DMS simulation viewer – PyQtGraph, dark theme, background threading.
 """
-import sys, os, time, itertools, threading, json, re, subprocess, copy
+import sys, os, time, itertools, threading, json, re, subprocess, copy, glob
 os.environ.setdefault('PYQTGRAPH_QT_LIB', 'PyQt5')
 
 PKGDIR  = os.path.abspath(os.path.dirname(__file__))
@@ -109,7 +109,14 @@ width        = _roi.get('width_per_zoom', 45) * zoomval
 comwidth     = _roi.get('comwidth_per_zoom', 5) * zoomval
 _comp        = cfg.get('computation', {})
 bravais      = _comp.get('bravais', 'icosahedral')
+# Conventional (non-quasicrystal) crystals are indexed with 3-element Miller
+# indices and constrained by crystal system; there is no 6D cut-and-projection
+# and no phason matrix (reflist2 = 0, phason = 0).
+CONVENTIONAL = bravais in ts.CONVENTIONAL_SYSTEMS
 opt_method   = _comp.get('opt_method', 'COBYLA')
+# Peak-position method for the raw and simulated ROI curves: 'gauss' (Gaussian
+# curve fit) or 'centroid' (centre of mass).
+peak_method  = _comp.get('peak_method', 'gauss')
 tolerance    = _comp.get('tolerance', 1e-6)
 intensity    = _comp.get('intensity', 1)
 threshold    = _comp.get('threshold', 0)
@@ -148,45 +155,121 @@ ref_6d_manual = np.array([
     [ 1,  0, -3, -1,  3,  4],
 ])
 
+# Conventional 3-index manual reflection list (used when CONVENTIONAL).  Read
+# from the config when provided, else this default (the PMN-PT pseudo-cubic
+# multiple-scattering reflections).
+reflist_hkl_manual = np.array(
+    cfg.get('crystal', {}).get('reflist_hkl',
+        [[ 0,  0,  2],   # T1, T3, T4, T6
+         [-1,  1,  2],   # T1
+         [-1,  1,  0],   # T1
+         [ 2,  0,  0],   # T2, T3
+         [ 0,  1, -1],   # T2
+         [ 2,  1, -1],   # T2
+         [ 2,  0,  2],   # T3
+         [-2,  2,  2],   # T4
+         [-1,  2, -1],   # T6
+         [ 0,  1,  3],
+         [ 3,  3,  0],   # T5
+         [ 3,  3,  2],   # T5
+         [ 0,  5,  3],
+         [-1,  4,  3],
+         [-2,  2,  0],   # T4
+         [-1,  2,  3],   # T6
+         [ 3,  0,  1],   # T7
+         [ 0,  4,  4],   # T7
+         [ 0,  0,  3]]), # T7
+    dtype=int)
+
+# The active "manual" reflection-index source for the current crystal mode.
+ref_manual = reflist_hkl_manual if CONVENTIONAL else ref_6d_manual
+
 # ── initial guess (24-element, shared with workflow.py / dmsfit_ico_hkl) ─────────
 #   [0-5]  a b c α β γ   [6-9]  psicor hcor kcor lcor   [10] detdist
 #   [11-13] rotx roty rotz   [14] energy   [15-23] phason a11..a33
 # hcor/kcor/lcor are reciprocal-index corrections (added to hkl by the _hkl engine);
 # they default to 0 — manual alignment is done with psicor + the detector rotations.
-initial_guess = np.array([
-    6.461053, 6.461053, 6.461053, 90., 90., 90.,
-    -2.171374, 0.0, 0.0, 0.0, 14480.587530 / 3 * zoomval,
-     0.228572,  0.667038, -2.097034, energy + 0.00004667,
-     0.001228,  0.000730,  0.000491,
-     0.000507, -0.000951, -0.002741,
-    -0.000441, -0.001405,  0.002354,
-])
+if CONVENTIONAL:
+    # Conventional crystals take their lattice / geometry from the config
+    # (crystal.initial_guess_base), converted to slider units (detdist → half,
+    # zoom-scaled px; energy → absolute), the same conversions fit.py applies.
+    _base = np.array(cfg['crystal']['initial_guess_base'], dtype=float)
+    _base[10] = _base[10] / 2 * zoomval
+    _base[14] = energy + _base[14]
+    initial_guess = _base
+else:
+    initial_guess = np.array([
+        6.461053, 6.461053, 6.461053, 90., 90., 90.,
+        -2.171374, 0.0, 0.0, 0.0, 14480.587530 / 3 * zoomval,
+         0.228572,  0.667038, -2.097034, energy + 0.00004667,
+         0.001228,  0.000730,  0.000491,
+         0.000507, -0.000951, -0.002741,
+        -0.000441, -0.001405,  0.002354,
+    ])
 
 # ── slider definitions ─────────────────────────────────────────────────────────
 # (label, ig_idx or 'h'/'k'/'l', half_range, fmt)
-slider_defs = [
-    ('a',       0,    0.2,   '%0.6f'),
-    ('h',      'h',   1.2,   '%0.6f'),
-    ('k',      'k',   1.2,   '%0.6f'),
-    ('l',      'l',   1.5,   '%0.6f'),
+# Lattice-slot → (label, half-range, fmt) for the conventional lattice sliders.
+_LATTICE_SLIDER = {
+    0: ('a',     0.3, '%0.6f'),
+    1: ('b',     0.3, '%0.6f'),
+    2: ('c',     0.3, '%0.6f'),
+    3: ('alpha', 1.5, '%0.6f'),
+    4: ('beta',  1.5, '%0.6f'),
+    5: ('gamma', 1.5, '%0.6f'),
+}
+
+# Geometry sliders shared by every mode (after the lattice block).
+# Slots 7/8 (formerly hcor/kcor) are reused as the chi / theta corrections, used
+# in every crystal mode; lcor (slot 9) is dropped as redundant with h/k/l.
+_GEOM_SLIDER_DEFS = [
+    ('h',      'h',   0.12,  '%0.6f'),
+    ('k',      'k',   0.12,  '%0.6f'),
+    ('l',      'l',   0.15,  '%0.6f'),
     ('psicor',  6,    5.5,   '%0.6f'),
-    ('hcor',    7,    1.0,   '%0.6f'),
-    ('kcor',    8,    1.0,   '%0.6f'),
-    ('lcor',    9,    1.0,   '%0.6f'),
+    ('chicor',  7,    5.0,   '%0.6f'),
+    ('thcor',   8,    5.0,   '%0.6f'),
     ('detdist',10,  300.0,   '%0.3f'),
+    ('px',     'px', 250.0,  '%0.2f'),
+    ('py',     'py', 250.0,  '%0.2f'),
     ('rotx',   11,    5.0,   '%0.6f'),
     ('roty',   12,    5.0,   '%0.6f'),
     ('rotz',   13,   10.0,   '%0.6f'),
     ('energy', 14,    0.5,   '%0.6f'),
-    ('a11',    15,   0.05,   '%0.7f'),
-    ('a12',    16,   0.05,   '%0.7f'),
-    ('a13',    17,   0.05,   '%0.7f'),
-    ('a21',    18,   0.05,   '%0.7f'),
-    ('a22',    19,   0.05,   '%0.7f'),
-    ('a23',    20,   0.05,   '%0.7f'),
-    ('a31',    21,   0.05,   '%0.7f'),
-    ('a32',    22,   0.05,   '%0.7f'),
-    ('a33',    23,   0.05,   '%0.7f'),
+]
+_PHASON_SLIDER_DEFS = [
+    ('a11', 15, 0.05, '%0.7f'), ('a12', 16, 0.05, '%0.7f'), ('a13', 17, 0.05, '%0.7f'),
+    ('a21', 18, 0.05, '%0.7f'), ('a22', 19, 0.05, '%0.7f'), ('a23', 20, 0.05, '%0.7f'),
+    ('a31', 21, 0.05, '%0.7f'), ('a32', 22, 0.05, '%0.7f'), ('a33', 23, 0.05, '%0.7f'),
+]
+
+def build_slider_defs(bravais_, conventional_):
+    """Slider list for the active mode: only the symmetry-allowed lattice sliders
+    (conventional) or the single 'a' + phason block (quasicrystal), then the
+    shared geometry sliders (which include psicor / chicor / thcor for every
+    mode)."""
+    if conventional_:
+        lat = [(_LATTICE_SLIDER[s][0], s, _LATTICE_SLIDER[s][1], _LATTICE_SLIDER[s][2])
+               for s in ts.lattice_free_slots(bravais_)]
+        return lat + list(_GEOM_SLIDER_DEFS)
+    return ([('a', 0, 0.2, '%0.6f')] + list(_GEOM_SLIDER_DEFS) + list(_PHASON_SLIDER_DEFS))
+
+slider_defs = build_slider_defs(bravais, CONVENTIONAL)
+
+# Crystal-type selector entries: (display label, bravais value).  The
+# icosahedral family (the quasicrystal modes the slider supports) plus the 7
+# conventional crystal systems.
+CRYSTAL_TYPE_CHOICES = [
+    ('Icosahedral (quasicrystal)', 'icosahedral'),
+    ('Icosahedral (fixed a)',      'icosahedral_fixed_a'),
+    ('Cubic (no strain)',          'cubic_no_strain'),
+    ('Cubic',                      'cubic'),
+    ('Tetragonal',                 'tetragonal'),
+    ('Orthorhombic',               'orthorhombic'),
+    ('Monoclinic (b-unique)',      'monoclinic'),
+    ('Rhombohedral',               'rhombohedral'),
+    ('Hexagonal',                  'hexagonal'),
+    ('Triclinic',                  'triclinic'),
 ]
 
 # ── reflist helpers ────────────────────────────────────────────────────────────
@@ -196,8 +279,21 @@ def hklgen_ico_local(depth):
     idx = np.array(list(itertools.product(rng, repeat=6)))
     return idx[np.any(idx != 0, axis=1)]
 
-def build_reflist_from_6d(ref_6d_arr):
-    p6d = ts.Projection6dArrayApproximant(ref_6d_arr, tau)
+def hklgen_local(depth):
+    """Reflection-index generator for the active crystal mode: 3-element Miller
+    indices for a conventional crystal, 6D indices for the quasicrystal."""
+    return ts.hklgen_3d(depth) if CONVENTIONAL else hklgen_ico_local(depth)
+
+def build_reflist_from_6d(ref_arr):
+    """Return (parallel, perpendicular) reflection components for the reflection
+    indices ``ref_arr``.  For a conventional crystal the indices are already the
+    3-element Miller indices, so the parallel component is the index itself and
+    the perpendicular component is zero (no cut-and-projection).  For the
+    quasicrystal the 6D indices are projected into parallel + perpendicular."""
+    ref_arr = np.asarray(ref_arr)
+    if CONVENTIONAL:
+        return ref_arr.astype(float), np.zeros_like(ref_arr, dtype=float)
+    p6d = ts.Projection6dArrayApproximant(ref_arr, tau)
     r0  = p6d.reflection_6d()
     return np.array(r0[0]), np.array(r0[1])
 
@@ -207,50 +303,60 @@ def filter_6d_by_thresh(ref_6d_arr, thresh):
     return ref_6d_arr[np.any(np.abs(ref_6d_arr) >= thresh, axis=1)]
 
 # ── shared _hkl engine (same as workflow.py / dmsfit_ico_hkl) ────────────────────
-def extract_reduced(full_ig):
-    """Reduced parameter vector consumed by dmsfit_ico_hkl.imcalc, keyed on the
-    bravais / detoptimize / energyopt flags (identical to the workflow)."""
+def reduced_slots():
+    """The 24-element-guess indices that make up the reduced parameter vector,
+    keyed on the bravais / detoptimize / energyopt flags (identical to the
+    workflow).  extract_reduced() = full_ig[reduced_slots()]."""
+    if CONVENTIONAL:
+        return list(ts.reduced_param_indices(bravais, bool(detoptimize), bool(energyopt)))
     if bravais == 'icosahedral':
         if detoptimize:
-            idx = ([0,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] if energyopt
-                   else [0,6,7,8,9,10,11,12,13,15,16,17,18,19,20,21,22,23])
-        else:
-            idx = ([0,6,7,8,9,14,15,16,17,18,19,20,21,22,23] if energyopt
-                   else [0,6,7,8,9,15,16,17,18,19,20,21,22,23])
+            return ([0,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] if energyopt
+                    else [0,6,7,8,9,10,11,12,13,15,16,17,18,19,20,21,22,23])
+        return ([0,6,7,8,9,14,15,16,17,18,19,20,21,22,23] if energyopt
+                else [0,6,7,8,9,15,16,17,18,19,20,21,22,23])
     elif bravais == 'icosahedral_fixed_a':
         if detoptimize:
-            idx = ([6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] if energyopt
-                   else [6,7,8,9,10,11,12,14,15,16,17,18,19,20,21,22,23])
-        else:
-            idx = ([6,7,8,13,14,15,16,17,18,19,20,21,22,23] if energyopt
-                   else [6,7,8,14,15,16,17,18,19,20,21,22,23])
+            return ([6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] if energyopt
+                    else [6,7,8,9,10,11,12,14,15,16,17,18,19,20,21,22,23])
+        return ([6,7,8,13,14,15,16,17,18,19,20,21,22,23] if energyopt
+                else [6,7,8,14,15,16,17,18,19,20,21,22,23])
     elif bravais == 'cubic_no_strain':
         if detoptimize:
-            idx = [0,6,7,8,9,10,11,12,13] if energyopt else [0,6,7,8,9,10,11,12]
-        else:
-            idx = [0,6,7,8,13] if energyopt else [0,6,7,8]
-    else:
-        raise ValueError('Unknown bravais: %s' % bravais)
-    return np.asarray(full_ig, dtype=float)[idx]
+            return [0,6,7,8,9,10,11,12,13] if energyopt else [0,6,7,8,9,10,11,12]
+        return [0,6,7,8,13] if energyopt else [0,6,7,8]
+    raise ValueError('Unknown bravais: %s' % bravais)
+
+def extract_reduced(full_ig):
+    """Reduced parameter vector consumed by dmsfit_ico_hkl.imcalc."""
+    return np.asarray(full_ig, dtype=float)[reduced_slots()]
 
 def make_overlay_dms(reflist_, reflist2_, hkl_, imdata_, psirange_, thrange_,
                      azir_, psi_, px_, py_, ig):
     """Build a dmsfit_ico_hkl in calculator mode (dummy kernel/centres — only
     imcalc/dmsindex/dmslines are used for the live overlay).  This is the *same*
     engine the fit uses, so the overlay and the fit simulation match."""
-    return ts.dmsfit_ico_hkl(
+    dms = ts.dmsfit_ico_hkl(
         np.matrix(reflist_), [thrange_[0], thrange_[1], numsteps],
         hklint, psirange_, width, np.zeros((1, 1)), np.zeros((1, 1, 1)),
         hkl_, detvects, imdata_, simsigma, azir_, psi_, px_, py_, scatv,
         bravais, bool(detoptimize), bool(energyopt),
         ig[10], ig[11], ig[12], ig[13], ig[14],
         np.matrix(reflist2_), list(ig[15:24]), ig[0])
+    # setLattice supplies the fixed lattice used by the 'icosahedral_fixed_a'
+    # branch; harmless for the other modes.
+    dms.setLattice(list(np.asarray(ig, dtype=float)[:6]))
+    if CONVENTIONAL:
+        # The conventional engine reads the constrained lattice and the unrefined
+        # parameters from the full guess vector.
+        dms.setIGFull(ig)
+    return dms
 
 # ── initial reflist ────────────────────────────────────────────────────────────
-_rl, _rl2       = build_reflist_from_6d(ref_6d_manual)
+_rl, _rl2       = build_reflist_from_6d(ref_manual)
 full_reflist    = np.array(_rl)
 full_reflist2   = np.array(_rl2)
-full_reflist_6d = np.array(ref_6d_manual)
+full_reflist_6d = np.array(ref_manual)
 
 _ig0   = initial_guess.copy()
 
@@ -265,11 +371,33 @@ _dms_full_init = make_overlay_dms(
 
 # ── FloatSlider (verbatim from workflow.py) ────────────────────────────────────
 
+class _ValueReadout(QtWidgets.QLineEdit):
+    """Slider value readout that looks like a label but becomes an editable text
+    field on double-click (for direct numeric entry)."""
+    editRequested = QtCore.pyqtSignal()
+    _READ_STYLE = 'QLineEdit { background: transparent; border: none; }'
+    _EDIT_STYLE = 'QLineEdit { background: #202830; border: 1px solid #4488ff; }'
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setFocusPolicy(QtCore.Qt.ClickFocus)
+        self.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.setStyleSheet(self._READ_STYLE)
+        self.setToolTip('Double-click to type an exact value')
+
+    def mouseDoubleClickEvent(self, ev):
+        if self.isReadOnly():
+            self.editRequested.emit()
+        else:
+            super().mouseDoubleClickEvent(ev)
+
+
 class FloatSlider(QtWidgets.QWidget):
     valueChanged = QtCore.pyqtSignal(float)
 
     def __init__(self, label, val_init, val_min, val_max,
-                 fmt='%0.6f', n_steps=10000, parent=None):
+                 fmt='%0.6f', n_steps=100000, fittable=False, parent=None):
         super().__init__(parent)
         self._min = val_min
         self._max = val_max
@@ -280,18 +408,39 @@ class FloatSlider(QtWidgets.QWidget):
         row.setContentsMargins(2, 0, 2, 0)
         row.setSpacing(4)
 
+        # Per-parameter fit-enable checkbox (only for fittable parameters); a
+        # fixed-width spacer keeps the label column aligned when absent.
+        self._fit_chk = None
+        if fittable:
+            self._fit_chk = QtWidgets.QCheckBox()
+            self._fit_chk.setChecked(True)
+            self._fit_chk.setFixedWidth(16)
+            self._fit_chk.setToolTip('Include "%s" in the fit' % label)
+            row.addWidget(self._fit_chk)
+        else:
+            _sp = QtWidgets.QWidget()
+            _sp.setFixedWidth(16)
+            row.addWidget(_sp)
+
         lbl = QtWidgets.QLabel(label)
         lbl.setFixedWidth(52)
         lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 
         self._sl = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self._sl.setRange(0, n_steps)
+        # Fine control: arrow keys / wheel move one step (1/n_steps of the range);
+        # a trough-click pages by ~1% so it still moves a visible amount.
+        self._sl.setSingleStep(1)
+        self._sl.setPageStep(max(1, n_steps // 100))
 
-        self._vl = QtWidgets.QLabel()
+        self._vl = _ValueReadout()
         self._vl.setFixedWidth(88)
         f = self._vl.font()
         f.setFamily('monospace')
         self._vl.setFont(f)
+        self._editing = False
+        self._vl.editRequested.connect(self._begin_edit)
+        self._vl.editingFinished.connect(self._commit_edit)
 
         row.addWidget(lbl)
         row.addWidget(self._sl, 1)
@@ -299,6 +448,43 @@ class FloatSlider(QtWidgets.QWidget):
 
         self.setValue(val_init)
         self._sl.valueChanged.connect(self._emit)
+
+    def _begin_edit(self):
+        self._editing = True
+        self._vl.setReadOnly(False)
+        self._vl.setStyleSheet(self._vl._EDIT_STYLE)
+        self._vl.setFocus(QtCore.Qt.MouseFocusReason)
+        self._vl.selectAll()
+
+    def _commit_edit(self):
+        if not self._editing:
+            return
+        self._editing = False
+        self._vl.setReadOnly(True)
+        self._vl.setStyleSheet(self._vl._READ_STYLE)
+        self._vl.deselect()
+        try:
+            v = float(self._vl.text().strip())
+        except ValueError:
+            self._vl.setText(self._fmt % self.val)   # revert on bad input
+            return
+        # Expand/recentre the range (keeping its span) so a typed value outside
+        # the current range is honoured rather than clamped.
+        if v < self._min or v > self._max:
+            half = (self._max - self._min) / 2.0
+            self._min = v - half
+            self._max = v + half
+        self.setValue(v)
+        self.valueChanged.emit(v)
+
+    def is_fit_enabled(self):
+        """Whether this parameter is included in the fit (True if it has no
+        fit-enable checkbox, i.e. it isn't a fit parameter handled here)."""
+        return self._fit_chk is None or self._fit_chk.isChecked()
+
+    def set_fit_enabled(self, on):
+        if self._fit_chk is not None:
+            self._fit_chk.setChecked(bool(on))
 
     def _to_int(self, v):
         return int(round((v - self._min) / (self._max - self._min) * self._n))
@@ -347,9 +533,11 @@ class UpdateWorker(QtCore.QThread):
         self.lattice   = list(lattice)
         self.thrange   = list(thrange)
 
-    def submit(self, ig, dms_ref, hkl_arr, last_hkl_ref, mode):
+    def submit(self, ig, dms_ref, hkl_arr, last_hkl_ref, mode,
+               sel_dms=None, sel_last_hkl=None):
         locker = QtCore.QMutexLocker(self._mutex)
-        self._pending = (ig.copy(), dms_ref, hkl_arr.copy(), last_hkl_ref, mode)
+        self._pending = (ig.copy(), dms_ref, hkl_arr.copy(), last_hkl_ref, mode,
+                         sel_dms, sel_last_hkl)
         locker.unlock()
         self._cond.wakeOne()
         if not self.isRunning():
@@ -370,35 +558,45 @@ class UpdateWorker(QtCore.QThread):
             if self._quit:
                 self._mutex.unlock()
                 return
-            ig, dms_ref, hkl_arr, last_hkl_ref, mode = self._pending
+            ig, dms_ref, hkl_arr, last_hkl_ref, mode, sel_dms, sel_last_hkl = self._pending
             self._pending = None
             self._mutex.unlock()
 
             self.idle.clear()
             try:
-                # The _hkl engine recomputes hkllist internally from self.hkl +
-                # self.hkllistrange each imcalc, so we only push the current hkl.
-                if not np.allclose(hkl_arr, last_hkl_ref):
-                    dms_ref.hkl = hkl_arr.copy()
-                    last_hkl_ref[:] = hkl_arr
-                # When energy isn't a reduced (fit) parameter it comes from the
-                # engine attribute, so keep the live energy slider in sync.
-                if not energyopt:
-                    dms_ref.energy = ig[14]
+                reduced = extract_reduced(ig)
 
-                dms_ref.imcalc(extract_reduced(ig))
-                if mode == 'selected':
-                    lines = [(np.copy(x), np.copy(y))
-                             for x, y in (getattr(dms_ref, 'dmslines', None) or [])]
-                    self.done.emit('selected', lines)
+                def _push(dms, last):
+                    # The _hkl engine recomputes hkllist internally from self.hkl,
+                    # so we only push the current hkl / energy.
+                    if last is not None and not np.allclose(hkl_arr, last):
+                        dms.hkl = hkl_arr.copy()
+                        last[:] = hkl_arr
+                    if not energyopt:
+                        dms.energy = ig[14]
+
+                # Discovery overlay: scatter of the whole slice + per-reflection
+                # lines (used for click-to-select hit-testing).
+                _push(dms_ref, last_hkl_ref)
+                dms_ref.imcalc(reduced)
+                dmsindex = dms_ref.dmsindex
+                if len(dmsindex) == 2 and len(dmsindex[0]) > 0:
+                    rows = np.asarray(dmsindex[0]).astype(float)
+                    cols = np.asarray(dmsindex[1]).astype(float)
                 else:
-                    dmsindex = dms_ref.dmsindex
-                    if len(dmsindex) == 2 and len(dmsindex[0]) > 0:
-                        rows = np.asarray(dmsindex[0]).astype(float)
-                        cols = np.asarray(dmsindex[1]).astype(float)
-                    else:
-                        rows = np.array([]); cols = np.array([])
-                    self.done.emit('discovery', (rows, cols))
+                    rows = np.array([]); cols = np.array([])
+                disc_lines = [(np.copy(x), np.copy(y))
+                              for x, y in (getattr(dms_ref, 'dmslines', None) or [])]
+
+                # Selected reflections drawn live on top (one extra imcalc).
+                sel_lines = []
+                if sel_dms is not None:
+                    _push(sel_dms, sel_last_hkl)
+                    sel_dms.imcalc(reduced)
+                    sel_lines = [(np.copy(x), np.copy(y))
+                                 for x, y in (getattr(sel_dms, 'dmslines', None) or [])]
+
+                self.done.emit('discovery', (rows, cols, disc_lines, sel_lines))
             except Exception as e:
                 print('UpdateWorker error:', e)
             finally:
@@ -412,13 +610,18 @@ class FitWorker(QtCore.QThread):
     error   = QtCore.pyqtSignal(str, float)
     stopped = QtCore.pyqtSignal(float)
 
-    def __init__(self, dms, reduced, bounds, method, n_starts, parent=None):
+    def __init__(self, dms, reduced, bounds, method, n_starts,
+                 free_idx=None, parent=None):
         super().__init__(parent)
         self._dms        = dms
-        self._reduced    = reduced.copy()
-        self._bounds     = bounds
+        self._reduced    = np.asarray(reduced, dtype=float).copy()
+        self._bounds     = list(bounds)
         self._method     = method
         self._n_starts   = n_starts
+        # Positions within the reduced vector that the optimiser is allowed to
+        # vary; the rest are held at their current value.  None ⇒ all free.
+        self._free = (list(range(len(self._reduced))) if free_idx is None
+                      else list(free_idx))
         self._t0         = time.time()
         self._stop_event = threading.Event()
 
@@ -426,16 +629,24 @@ class FitWorker(QtCore.QThread):
         self._stop_event.set()
 
     def run(self):
-        dms     = self._dms
-        reduced = self._reduced
-        bounds  = self._bounds
-        cur     = self._method
-        ev      = self._stop_event
+        dms      = self._dms
+        template = self._reduced            # full reduced vector (fixed params kept)
+        free     = np.asarray(self._free, dtype=int)
+        bounds   = [self._bounds[i] for i in free]   # bounds for the free params
+        x0       = template[free]                     # free-only start vector
+        cur      = self._method
+        ev       = self._stop_event
 
-        def _fit_checked(x):
+        def _expand(xf):
+            """Scatter a free-only vector back into the full reduced vector."""
+            full = template.copy()
+            full[free] = xf
+            return full
+
+        def _fit_checked(xf):
             if ev.is_set():
                 raise StopIteration('stopped')
-            return dms.fit(x)
+            return dms.fit(_expand(xf))
 
         def _cb_check(*_a, **_k):
             return ev.is_set()
@@ -461,26 +672,26 @@ class FitWorker(QtCore.QThread):
                 # loss (downweights failed-ROI fallback rows).
                 lo = np.array([b[0] for b in bounds])
                 hi = np.array([b[1] for b in bounds])
-                def _resid(x):
+                def _resid(xf):
                     if ev.is_set():
                         raise StopIteration('stopped')
-                    return dms.residuals(x)
-                res = least_squares(_resid, reduced, bounds=(lo, hi),
+                    return dms.residuals(_expand(xf))
+                res = least_squares(_resid, x0, bounds=(lo, hi),
                                     method='trf', loss='soft_l1',
                                     xtol=tolerance, ftol=tolerance)
             elif cur in ('L-BFGS-B', 'TNC'):
                 # Bounded finite-difference-gradient locals, multi-started.
                 n = self._n_starts
                 rng = np.random.default_rng(42)
-                starts = [reduced] + [
-                    reduced + rng.uniform(-0.5, 0.5, reduced.shape)
+                starts = [x0] + [
+                    x0 + rng.uniform(-0.5, 0.5, x0.shape)
                     for _ in range(n - 1)]
                 def _run_one_b(s):
                     if ev.is_set():
                         raise StopIteration('stopped')
                     _d = copy.deepcopy(dms)
-                    return minimize(_d.fit, s, method=cur, bounds=bounds,
-                                    tol=tolerance)
+                    return minimize(lambda xf: _d.fit(_expand(xf)), s, method=cur,
+                                    bounds=bounds, tol=tolerance)
                 results = Parallel(n_jobs=n, prefer='threads')(
                     delayed(_run_one_b)(s) for s in starts)
                 res = min(results, key=lambda r: r.fun)
@@ -489,20 +700,21 @@ class FitWorker(QtCore.QThread):
                           'BHCOBYLA':     ('COBYLA',      400),
                           'BHNelderMead': ('Nelder-Mead', 400)}
                 method, niter = bh_map[cur]
-                res = basinhopping(_fit_checked, reduced,
+                res = basinhopping(_fit_checked, x0,
                                    minimizer_kwargs={"method": method},
                                    niter=niter, callback=_cb_check)
             else:
                 n = self._n_starts
                 rng = np.random.default_rng(42)
-                starts = [reduced] + [
-                    reduced + rng.uniform(-0.5, 0.5, reduced.shape)
+                starts = [x0] + [
+                    x0 + rng.uniform(-0.5, 0.5, x0.shape)
                     for _ in range(n - 1)]
                 def _run_one(s):
                     if ev.is_set():
                         raise StopIteration('stopped')
                     _d = copy.deepcopy(dms)
-                    return minimize(_d.fit, s, method=cur, tol=tolerance,
+                    return minimize(lambda xf: _d.fit(_expand(xf)), s, method=cur,
+                                    tol=tolerance,
                                     options={'xtol': tolerance, 'ftol': tolerance})
                 results = Parallel(n_jobs=n, prefer='threads')(
                     delayed(_run_one)(s) for s in starts)
@@ -510,12 +722,13 @@ class FitWorker(QtCore.QThread):
 
             elapsed = time.time() - self._t0
             dms.hkllistrange[2] = numsteps
-            opt, simim, dmsindex, dataim, inputarray = dms.full(res.x)
+            res_full = _expand(np.asarray(res.x, dtype=float))
+            opt, simim, dmsindex, dataim, inputarray = dms.full(res_full)
             dmslines = [(np.copy(x), np.copy(y)) for x, y in dms.dmslines] \
                 if hasattr(dms, 'dmslines') else []
             self.done.emit({
                 'opt': opt, 'simim': simim, 'dmslines': dmslines,
-                'res_x': np.array(res.x),
+                'res_x': res_full,   # full reduced vector (fixed params included)
                 'dmsindex': dmsindex, 'dataim': np.array(dataim),
                 'inputarray': np.array(inputarray),
                 'elapsed': elapsed, 'method': cur})
@@ -547,6 +760,10 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._sel_dms      = None
         self._sel_order    = []      # arc items in reflist-row order
         self._sel_last_hkl = np.full(3, np.inf)
+        # Cached discovery-overlay per-reflection lines + their indices, used to
+        # click-to-select the auto-generated lines.
+        self._discovery_lines = []
+        self._discovery_ref6d = np.asarray(full_reflist_6d)
 
         # scan-specific state (updated when a different scan is loaded)
         self._lattice        = list(lattice)
@@ -614,6 +831,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._last_fit_output = None
         self._selected_roi  = None
         self._active_method = opt_method if opt_method in algo_methods else algo_methods[0]
+        self._peak_method = peak_method if peak_method in ('gauss', 'centroid') else 'gauss'
 
         self._worker = UpdateWorker()
         self._worker.done.connect(self._on_update_done,
@@ -625,6 +843,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._update_timer.timeout.connect(self._do_update)
 
         self._build_ui()
+        self._update_img_scrub_range()
         self._do_update()
         # Offer to restore the previous session once the event loop is running.
         QtCore.QTimer.singleShot(0, self._maybe_restore_session)
@@ -659,6 +878,18 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._img_item.setImage(imdata, autoLevels=False)
         self._img_item.setLevels(colourlim)
 
+        # ── Histogram / contrast control (draggable levels + colormap editor) ───
+        self._hist = pg.HistogramLUTItem()
+        self._hist.setImageItem(self._img_item)
+        self._hist.setLevels(colourlim[0], colourlim[1])
+        try:
+            self._hist.gradient.setColorMap(cmap)   # keep the configured colormap
+        except Exception:
+            pass
+        gw.addItem(self._hist, 0, 1)
+        self._hist_locked = False
+        self._hist_levels = None
+
         self._dms_scatter = pg.ScatterPlotItem(
             size=3, pen=None, brush=pg.mkBrush(255, 60, 60, 200))
         self._vb.addItem(self._dms_scatter)
@@ -673,8 +904,36 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._mouse_proxy = pg.SignalProxy(
             gw.scene().sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved)
 
+        # ── Image scrubber: slide through the raw images in the scan folder.
+        # Display only — it changes the shown image without reloading geometry,
+        # recomputing the overlay, or touching the analysis datapoint.
+        scrub_row = QtWidgets.QHBoxLayout()
+        scrub_row.setContentsMargins(2, 0, 2, 0)
+        scrub_lbl = QtWidgets.QLabel('Image')
+        self._img_scrub = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._img_scrub.setRange(0, 0)
+        self._img_scrub.setToolTip('Scrub through the detector images in this scan '
+                                   '(display only — no processing)')
+        self._img_scrub_lbl = QtWidgets.QLabel('—')
+        self._img_scrub_lbl.setFixedWidth(108)
+        _fs = self._img_scrub_lbl.font(); _fs.setFamily('monospace'); _fs.setPointSize(8)
+        self._img_scrub_lbl.setFont(_fs)
+        self._img_scrub.valueChanged.connect(self._on_img_scrub)
+        # Lock the histogram: freeze the contrast levels and stop the histogram
+        # view auto-rescaling as images change (handy when comparing frames).
+        self._chk_lock_hist = QtWidgets.QCheckBox('Lock hist')
+        self._chk_lock_hist.setToolTip('Freeze the histogram contrast/levels; the '
+                                       'level handles stop moving and the histogram '
+                                       'view no longer auto-scales between images')
+        self._chk_lock_hist.toggled.connect(self._on_lock_hist)
+        scrub_row.addWidget(scrub_lbl)
+        scrub_row.addWidget(self._img_scrub, 1)
+        scrub_row.addWidget(self._img_scrub_lbl)
+        scrub_row.addWidget(self._chk_lock_hist)
+
         img_col = QtWidgets.QVBoxLayout()
         img_col.addWidget(gw, 1)
+        img_col.addLayout(scrub_row)
         img_col.addWidget(self._coord_lbl)
         img_w = QtWidgets.QWidget()
         img_w.setLayout(img_col)
@@ -684,12 +943,23 @@ class DMSSlider(QtWidgets.QMainWindow):
         gw.scene().sigMouseClicked.connect(self._on_scene_clicked)
         self._gw = gw
 
-        # ── Control panel (right) ──────────────────────────────────────────────
-        ctrl_col = QtWidgets.QVBoxLayout()
-        ctrl_col.setSpacing(4)
+        # ── Control panel (right) — split into two vertical columns ─────────────
         ctrl_w = QtWidgets.QWidget()
-        ctrl_w.setLayout(ctrl_col)
-        ctrl_w.setMinimumWidth(320)
+        ctrl_w.setMinimumWidth(620)
+        ctrl_outer = QtWidgets.QHBoxLayout(ctrl_w)
+        ctrl_outer.setContentsMargins(0, 0, 0, 0)
+        ctrl_outer.setSpacing(6)
+
+        ctrl_col  = QtWidgets.QVBoxLayout()   # left column
+        ctrl_col.setSpacing(4)
+        ctrl_col2 = QtWidgets.QVBoxLayout()   # right column
+        ctrl_col2.setSpacing(4)
+        _ctrl_left  = QtWidgets.QWidget(); _ctrl_left.setLayout(ctrl_col)
+        _ctrl_right = QtWidgets.QWidget(); _ctrl_right.setLayout(ctrl_col2)
+        _ctrl_left.setMinimumWidth(300)
+        _ctrl_right.setMinimumWidth(300)
+        ctrl_outer.addWidget(_ctrl_left)
+        ctrl_outer.addWidget(_ctrl_right)
 
         # ── Scan loader ────────────────────────────────────────────────────────
         scan_box = QtWidgets.QGroupBox('Scan')
@@ -710,6 +980,11 @@ class DMSSlider(QtWidgets.QMainWindow):
         btn_browse.clicked.connect(self._on_browse_scan)
         sbl.addWidget(btn_browse, 1, 0)
 
+        btn_view_dat = QtWidgets.QPushButton('View .dat')
+        btn_view_dat.setToolTip('Show the raw ASCII contents of the loaded .dat scan file')
+        btn_view_dat.clicked.connect(self._on_view_dat)
+        sbl.addWidget(btn_view_dat, 1, 1)
+
         sbl.addWidget(QtWidgets.QLabel('dp0'), 1, 2)
         self._sb_dp0 = QtWidgets.QSpinBox()
         self._sb_dp0.setRange(0, 9999)
@@ -721,6 +996,12 @@ class DMSSlider(QtWidgets.QMainWindow):
         btn_load_scan.setToolTip('Load the selected .dat scan and detector image')
         btn_load_scan.clicked.connect(self._on_load_scan)
         sbl.addWidget(btn_load_scan, 2, 0)
+
+        btn_next_scan = QtWidgets.QPushButton('Next scan →')
+        btn_next_scan.setStyleSheet('background: #102020; color: #aaffff')
+        btn_next_scan.setToolTip('Increment the scan number and load <scannum+1>.dat')
+        btn_next_scan.clicked.connect(self._on_next_scan)
+        sbl.addWidget(btn_next_scan, 2, 1)
 
         sbl.addWidget(QtWidgets.QLabel('dp'), 2, 2)
         self._sb_dp = QtWidgets.QSpinBox()
@@ -743,11 +1024,6 @@ class DMSSlider(QtWidgets.QMainWindow):
         fitl = QtWidgets.QGridLayout(fit_box)
         fitl.setSpacing(4)
         fitl.setContentsMargins(4, 4, 4, 4)
-
-        btn_build = QtWidgets.QPushButton('Build curves')
-        btn_build.setStyleSheet('background: #102030; color: #aaccff')
-        btn_build.clicked.connect(self._on_build_curves)
-        fitl.addWidget(btn_build, 0, 0, 1, 2)
 
         # Number of points along the integrated curves (hkl scan resolution).
         # Drives Build curves and the final fit (numsteps global).
@@ -789,30 +1065,46 @@ class DMSSlider(QtWidgets.QMainWindow):
         fitl.addWidget(_sig_lbl, 3, 0)
         fitl.addWidget(self._sb_simsigma, 3, 1)
 
+        # Peak-position method for the raw and simulated ROI curves.  Rebuild
+        # curves to apply to the experimental centres (and the live overlay).
+        _peak_lbl = QtWidgets.QLabel('Peak pos.')
+        _peak_lbl.setToolTip('How peak positions are located in the raw and '
+                             'simulated ROI curves: Gaussian curve fit or '
+                             'centroid (centre of mass). Rebuild curves to apply.')
+        self._peak_combo = QtWidgets.QComboBox()
+        self._peak_combo.addItem('Curve fit', 'gauss')
+        self._peak_combo.addItem('Centroid', 'centroid')
+        self._peak_combo.setCurrentIndex(
+            self._peak_combo.findData(self._peak_method))
+        self._peak_combo.setToolTip(_peak_lbl.toolTip())
+        self._peak_combo.currentIndexChanged.connect(self._on_peak_method_changed)
+        fitl.addWidget(_peak_lbl, 4, 0)
+        fitl.addWidget(self._peak_combo, 4, 1)
+
         self._algo_combo = QtWidgets.QComboBox()
         for disp in algo_display:
             self._algo_combo.addItem(disp)
         self._algo_combo.setCurrentIndex(algo_methods.index(self._active_method))
         self._algo_combo.currentIndexChanged.connect(
             lambda i: self._on_algo(algo_methods[i]))
-        fitl.addWidget(self._algo_combo, 4, 0, 1, 2)
+        fitl.addWidget(self._algo_combo, 5, 0, 1, 2)
 
         self._btn_fit = QtWidgets.QPushButton('Fit')
         self._btn_fit.setStyleSheet('background: #1a5c1a; color: #ccffcc; font-weight: bold')
         self._btn_fit.clicked.connect(self._do_fit)
-        fitl.addWidget(self._btn_fit, 5, 0)
+        fitl.addWidget(self._btn_fit, 6, 0)
         self._btn_stop = QtWidgets.QPushButton('Stop')
         self._btn_stop.setStyleSheet('background: #5c1a1a; color: #ffcccc; font-weight: bold')
         self._btn_stop.setEnabled(False)
         self._btn_stop.clicked.connect(self._on_stop_fit)
-        fitl.addWidget(self._btn_stop, 5, 1)
+        fitl.addWidget(self._btn_stop, 6, 1)
 
         btn_wf_export = QtWidgets.QPushButton('Export Fit Config')
         btn_wf_export.setStyleSheet('background: #103018; color: #bfe6c8')
         btn_wf_export.setToolTip('Export a fit.py-compatible workflow config JSON '
                                  'for batch (non-interactive) fitting')
         btn_wf_export.clicked.connect(self._on_export_workflow_json)
-        fitl.addWidget(btn_wf_export, 6, 0, 1, 2)
+        fitl.addWidget(btn_wf_export, 7, 0, 1, 2)
 
         self._btn_save_fit = QtWidgets.QPushButton('Save fit → Processing')
         self._btn_save_fit.setStyleSheet('background: #2a2a10; color: #e6e0bf')
@@ -821,7 +1113,7 @@ class DMSSlider(QtWidgets.QMainWindow):
                                       'res.x.txt, Result.txt, config + code snapshots)')
         self._btn_save_fit.setEnabled(False)
         self._btn_save_fit.clicked.connect(self._on_save_fit_processing)
-        fitl.addWidget(self._btn_save_fit, 7, 0, 1, 2)
+        fitl.addWidget(self._btn_save_fit, 8, 0, 1, 2)
 
         ctrl_col.addWidget(fit_box)
 
@@ -836,7 +1128,27 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._cfgtable.configChanged.connect(self._on_cfg_table_changed)
         self._cfgtable.setMaximumHeight(200)
         cbl.addWidget(self._cfgtable)
-        ctrl_col.addWidget(cfg_box)
+        ctrl_col2.addWidget(cfg_box)
+
+        # ── Crystal type selector (Ico / conventional Bravais systems) ──────────
+        ct_box = QtWidgets.QGroupBox('Crystal type')
+        ct_l = QtWidgets.QHBoxLayout(ct_box)
+        ct_l.setContentsMargins(4, 2, 4, 2)
+        self._crystal_combo = QtWidgets.QComboBox()
+        for _disp, _name in CRYSTAL_TYPE_CHOICES:
+            self._crystal_combo.addItem(_disp, _name)
+        _ci = self._crystal_combo.findData(bravais)
+        if _ci < 0:   # launched with a mode not in the list — keep it, don't switch
+            self._crystal_combo.insertItem(0, bravais, bravais)
+            _ci = 0
+        self._crystal_combo.setCurrentIndex(_ci)
+        self._crystal_combo.setToolTip(
+            'Switch between the icosahedral quasicrystal (6D reflections + phason) '
+            'and conventional crystal systems (3-index reflections, symmetry-'
+            'constrained lattice). Changing this clears the reflection selection.')
+        self._crystal_combo.currentIndexChanged.connect(self._on_crystal_type_changed)
+        ct_l.addWidget(self._crystal_combo)
+        ctrl_col.addWidget(ct_box)
 
         # Sliders in scroll area
         scroll = QtWidgets.QScrollArea()
@@ -846,25 +1158,21 @@ class DMSSlider(QtWidgets.QMainWindow):
         vbox  = QtWidgets.QVBoxLayout(inner)
         vbox.setSpacing(1)
         vbox.setContentsMargins(0, 0, 0, 0)
+        self._slider_vbox = vbox
 
-        self._sliders = {}
-        for label, idx, half, fmt in slider_defs:
-            if idx == 'h':
-                centre = float(self._hkl[0])
-            elif idx == 'k':
-                centre = float(self._hkl[1])
-            elif idx == 'l':
-                centre = float(self._hkl[2])
-            else:
-                centre = float(self.ig[idx])
-            fs = FloatSlider(label, centre, centre - half, centre + half, fmt)
-            fs.valueChanged.connect(self._on_slider_changed)
-            vbox.addWidget(fs)
-            self._sliders[label] = fs
+        self._populate_sliders()
 
-        vbox.addStretch()
         scroll.setWidget(inner)
-        ctrl_col.addWidget(scroll)
+        ctrl_col.addWidget(scroll, 1)   # sliders expand to fill the left column
+
+        # Build curves — integrate ROIs for the checked reflections (placed above
+        # the Selected reflections panel it operates on).
+        btn_build = QtWidgets.QPushButton('Build curves')
+        btn_build.setStyleSheet('background: #102030; color: #aaccff')
+        btn_build.setToolTip('Integrate the ROIs for the checked reflections, '
+                             'ready to fit')
+        btn_build.clicked.connect(self._on_build_curves)
+        ctrl_col2.addWidget(btn_build)
 
         # Selected arcs list
         arc_box = QtWidgets.QGroupBox('Selected reflections')
@@ -912,7 +1220,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._chk_live_curve.setFont(f_la)
         self._chk_live_curve.toggled.connect(self._on_live_curve_toggled)
         arc_box_l.addWidget(self._chk_live_curve)
-        ctrl_col.addWidget(arc_box)
+        ctrl_col2.addWidget(arc_box, 1)   # selected-reflections list expands
 
         # Reflist group
         rg = QtWidgets.QGroupBox('Reflist')
@@ -965,7 +1273,7 @@ class DMSSlider(QtWidgets.QMainWindow):
 
         self._lbl_nrefs = QtWidgets.QLabel('N=%d reflections' % n_total)
         rgl.addWidget(self._lbl_nrefs, 5, 0, 1, 4)
-        ctrl_col.addWidget(rg)
+        ctrl_col2.addWidget(rg)
 
         # Pick / Identify group
         pg_box = QtWidgets.QGroupBox('Pick / Identify')
@@ -983,7 +1291,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         f2.setFamily('monospace')
         self._lbl_pick.setFont(f2)
         pgl.addWidget(self._lbl_pick, 1, 0, 1, 2)
-        ctrl_col.addWidget(pg_box)
+        ctrl_col2.addWidget(pg_box)
 
         # Reset / Print / Session row
         btn_row = QtWidgets.QHBoxLayout()
@@ -1012,7 +1320,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         btn_row.addWidget(btn_save)
         btn_row.addWidget(btn_load)
         btn_row.addWidget(btn_clear)
-        ctrl_col.addLayout(btn_row)
+        ctrl_col2.addLayout(btn_row)
 
         # Status label
         self._status = QtWidgets.QLabel('Ready')
@@ -1021,8 +1329,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         f3.setFamily('monospace')
         f3.setPointSize(8)
         self._status.setFont(f3)
-        ctrl_col.addWidget(self._status)
-        ctrl_col.addStretch(1)
+        ctrl_col2.addWidget(self._status)
+        ctrl_col2.addStretch(1)
 
         splitter.addWidget(ctrl_w)
 
@@ -1044,8 +1352,8 @@ class DMSSlider(QtWidgets.QMainWindow):
             slot=self._on_roi_mouse_moved)
         splitter.addWidget(roi_w)
 
-        splitter.setSizes([900, 340, 460])
-        self.resize(1700, 860)
+        splitter.setSizes([820, 640, 420])
+        self.resize(1900, 880)
 
         # Connect controls
         self._chk_auto.stateChanged.connect(
@@ -1077,43 +1385,135 @@ class DMSSlider(QtWidgets.QMainWindow):
                 self._hkl[1] = fs.val
             elif idx == 'l':
                 self._hkl[2] = fs.val
+            elif idx == 'px':
+                self._px = fs.val
+            elif idx == 'py':
+                self._py = fs.val
             else:
                 self.ig[idx] = fs.val
-        self.ig[1] = self.ig[2] = self.ig[0]
-        self.ig[3] = self.ig[4] = self.ig[5] = 90.0
+        if CONVENTIONAL:
+            # Apply the crystal-system lattice constraint so the overlay tracks
+            # the constrained cell (e.g. b=a for tetragonal) as sliders move.
+            self.ig[0:6] = ts.expand_lattice(bravais, self.ig[0:6])
+        else:
+            self.ig[1] = self.ig[2] = self.ig[0]
+            self.ig[3] = self.ig[4] = self.ig[5] = 90.0
+        # The beam centre (px/py) is baked into each engine instance, so push the
+        # slider-driven values in so px/py changes take effect live.
+        for _e in (self._dms, self._sel_dms, self._dms_full, self._fit_dms):
+            if _e is not None:
+                _e.px = self._px
+                _e.py = self._py
+
+    # ── Crystal-type / slider rebuilding ─────────────────────────────────────────
+
+    def _populate_sliders(self):
+        """Create the FloatSliders for the active mode's slider_defs into the
+        (already-created) slider scroll layout.  Parameters that take part in the
+        fit (their ig-slot is in the reduced vector) get a fit-enable checkbox."""
+        try:
+            fit_slots = set(reduced_slots())
+        except Exception:
+            fit_slots = set()
+        self._sliders = {}
+        for label, idx, half, fmt in slider_defs:
+            if idx == 'h':
+                centre = float(self._hkl[0])
+            elif idx == 'k':
+                centre = float(self._hkl[1])
+            elif idx == 'l':
+                centre = float(self._hkl[2])
+            elif idx == 'px':
+                centre = float(self._px)
+            elif idx == 'py':
+                centre = float(self._py)
+            else:
+                centre = float(self.ig[idx])
+            fittable = isinstance(idx, int) and idx in fit_slots
+            fs = FloatSlider(label, centre, centre - half, centre + half, fmt,
+                             fittable=fittable)
+            fs.valueChanged.connect(self._on_slider_changed)
+            self._slider_vbox.addWidget(fs)
+            self._sliders[label] = fs
+        self._slider_vbox.addStretch()
+
+    def _rebuild_sliders(self):
+        """Clear and repopulate the slider panel (after a crystal-type change)."""
+        self._suppress = True
+        while self._slider_vbox.count():
+            item = self._slider_vbox.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._populate_sliders()
+        self._suppress = False
+
+    def _on_crystal_type_changed(self, _idx=None):
+        name = self._crystal_combo.currentData()
+        if name:
+            self._set_crystal_system(name)
+
+    def _set_crystal_system(self, name):
+        """Switch the active crystal mode (Ico / conventional Bravais system) at
+        runtime: re-key the global mode flags, rebuild the slider panel and the
+        reflection list, and redraw.  6D and 3-index reflections are
+        incompatible, so the current selection is cleared."""
+        global bravais, CONVENTIONAL, slider_defs, ref_manual
+        if name == bravais:
+            return
+        bravais      = name
+        CONVENTIONAL = name in ts.CONVENTIONAL_SYSTEMS
+        slider_defs  = build_slider_defs(bravais, CONVENTIONAL)
+        ref_manual   = reflist_hkl_manual if CONVENTIONAL else ref_6d_manual
+
+        # Reconcile the lattice representation carried in the guess vector.
+        if CONVENTIONAL:
+            self.ig[0:6] = ts.expand_lattice(bravais, self.ig[0:6])
+        else:
+            self.ig[1] = self.ig[2] = self.ig[0]
+            self.ig[3] = self.ig[4] = self.ig[5] = 90.0
+
+        # Rebuild the slider panel FIRST so self._sliders matches the new
+        # slider_defs before anything (clear/redraw) calls _sync_ig.
+        self._rebuild_sliders()     # new free-parameter slider set
+        self._on_clear_picks()      # drop now-incompatible reflections
+        self._regenerate_reflist()  # new reflist (6D/3D) + overlay slice + redraw
+        # Arc-tracing engine for the new mode (uses the regenerated full reflist).
+        self._dms_full = make_overlay_dms(
+            self.full_reflist, self.full_reflist2, self._hkl, self._imdata,
+            self._psirange, self._thrange, self._azir, self._psi,
+            self._px, self._py, self.ig)
+        self._status.setText('Crystal type: %s' % bravais)
 
     def _do_update(self):
         self._sync_ig()
         self._worker.lattice = self._lattice
         self._worker.thrange = self._thrange
-        if self._sel_dms is not None and self._sel_order:
-            # Selected reflections: one vectorised imcalc → per-reflection lines.
-            # Always live (responsive); the ROI curves are updated separately.
-            self._worker.submit(self.ig, self._sel_dms, self._hkl,
-                                self._sel_last_hkl, 'selected')
-        else:
-            # Discovery: full-reflist slice scatter (only when nothing selected).
-            self._worker.submit(self.ig, self._dms, self._hkl,
-                                self._last_hkl, 'discovery')
+        # Always show the discovery scatter (the auto-generated slice) so its
+        # lines stay clickable; selected reflections are drawn live on top.
+        sel = (self._sel_dms if (self._sel_dms is not None and self._sel_order)
+               else None)
+        self._worker.submit(self.ig, self._dms, self._hkl, self._last_hkl,
+                            'discovery', sel, self._sel_last_hkl)
 
     def _on_update_done(self, mode, payload):
-        if mode == 'selected':
-            self._dms_scatter.setData(x=[], y=[])
-            lines = payload or []
-            for k, arc in enumerate(self._sel_order):
-                if k < len(lines):
-                    x = np.asarray(lines[k][0], dtype=float)
-                    y = np.asarray(lines[k][1], dtype=float)
-                    m = ~(np.isnan(x) | np.isnan(y))
-                    x, y = x[m], y[m]
-                    arc.setData(x=x, y=y)
-                    arc._x_data, arc._y_data = x, y
-                else:
-                    arc.setData(x=[], y=[])
-            self._maybe_update_live_curves()
-        else:
-            rows, cols = payload
-            self._dms_scatter.setData(x=cols, y=rows)
+        rows, cols, disc_lines, sel_lines = payload
+        # Discovery scatter + per-reflection lines (cached for click-to-select).
+        self._dms_scatter.setData(x=cols, y=rows)
+        self._discovery_lines = disc_lines
+        # Live selected-reflection arcs on top.
+        for k, arc in enumerate(self._sel_order):
+            if k < len(sel_lines):
+                x = np.asarray(sel_lines[k][0], dtype=float)
+                y = np.asarray(sel_lines[k][1], dtype=float)
+                m = ~(np.isnan(x) | np.isnan(y))
+                x, y = x[m], y[m]
+                arc.setData(x=x, y=y)
+                arc._x_data, arc._y_data = x, y
+            else:
+                arc.setData(x=[], y=[])
+        self._maybe_update_live_curves()
         self._status.setText('Ready')
 
     def _maybe_update_live_curves(self):
@@ -1198,10 +1598,13 @@ class DMSSlider(QtWidgets.QMainWindow):
         thresh = self._sb_thresh.value()
         max_n  = self._sb_max_n.value()
         if self._use_auto:
-            src = hklgen_ico_local(depth) if not hasattr(ts, 'hklgen_ico') \
-                  else np.array(ts.hklgen_ico(depth).v())
+            if CONVENTIONAL:
+                src = hklgen_local(depth)
+            else:
+                src = hklgen_ico_local(depth) if not hasattr(ts, 'hklgen_ico') \
+                      else np.array(ts.hklgen_ico(depth).v())
         else:
-            src = np.array(ref_6d_manual)
+            src = np.array(ref_manual)
         src = filter_6d_by_thresh(src, thresh)
         if src.shape[0] == 0:
             self._status.setText('Threshold removed all reflections — lower Thresh')
@@ -1233,6 +1636,9 @@ class DMSSlider(QtWidgets.QMainWindow):
             return
         rl  = self.full_reflist[offset:end]
         rl2 = self.full_reflist2[offset:end]
+        # Reflection indices for this slice, in the same order as the engine's
+        # dmslines — used to identify which auto line was clicked.
+        self._discovery_ref6d = np.asarray(self.full_reflist_6d[offset:end])
         self._dms = make_overlay_dms(
             rl, rl2, self._hkl, self._imdata, self._psirange, self._thrange,
             self._azir, self._psi, self._px, self._py, self.ig)
@@ -1260,14 +1666,109 @@ class DMSSlider(QtWidgets.QMainWindow):
         else:
             self._coord_lbl.setText('row —   col —   I=—')
 
+    # ── Image scrubber (display-only) ─────────────────────────────────────────────
+
+    def _scan_image_files(self):
+        """Sorted list of (image_number, full_path) for the actual detector images
+        in the current scan's ``*-files`` folder.  This is independent of the .dat
+        metadata, so it works for any scan type (energy, psi, hkl, …)."""
+        try:
+            folder = os.path.join(self._scanpath, os.path.dirname(self._imtemplate))
+            ext = os.path.splitext(self._imtemplate)[1] or '.tif'
+            out = []
+            for p in glob.glob(os.path.join(folder, '*' + ext)):
+                m = re.search(r'(\d+)' + re.escape(ext) + r'$', os.path.basename(p))
+                if m:
+                    out.append((int(m.group(1)), p))
+            out.sort()
+            return out
+        except Exception:
+            return []
+
+    def _update_img_scrub_range(self, current=None):
+        """Point the scrub slider at the images actually present in the scan
+        folder, positioned on the analysis datapoint's image when possible."""
+        if current is None:
+            current = self._datapoint
+        self._img_files = self._scan_image_files()
+        n = len(self._img_files)
+        self._img_scrub.blockSignals(True)
+        if n > 0:
+            self._img_scrub.setEnabled(True)
+            self._img_scrub.setRange(0, n - 1)
+            # Prefer the file whose number matches the analysis image (dp+1).
+            target = int(current) + 1
+            pos = next((i for i, (num, _) in enumerate(self._img_files)
+                        if num == target), min(max(int(current), 0), n - 1))
+            self._img_scrub.setValue(pos)
+            self._img_scrub_lbl.setText('%05d  (%d/%d)' %
+                                        (self._img_files[pos][0], pos + 1, n))
+        else:
+            self._img_scrub.setEnabled(False)
+            self._img_scrub.setRange(0, 0)
+            self._img_scrub_lbl.setText('—')
+        self._img_scrub.blockSignals(False)
+
+    def _on_img_scrub(self, idx):
+        """Show the raw image at scrub position ``idx`` (display only — no overlay
+        or geometry recompute)."""
+        files = getattr(self, '_img_files', [])
+        if 0 <= idx < len(files):
+            num, path = files[idx]
+        else:
+            num = idx + 1
+            path = os.path.join(self._scanpath, self._imtemplate % num)
+        try:
+            im = imageio.imread(path)
+            im = ndimage.zoom(im, zoomval, order=3)
+        except Exception as e:
+            self._img_scrub_lbl.setText('err')
+            print('Image scrub load failed:', e)
+            return
+        if self._hist_locked and self._hist_levels is not None:
+            lv = self._hist_levels
+        else:
+            lv = self._hist.getLevels()
+        self._img_item.setImage(im, autoLevels=False)
+        self._img_item.setLevels(lv)          # single [min,max] arg (NOT *lv)
+        if self._hist_locked:
+            self._hist.setLevels(lv[0], lv[1])  # keep the level region pinned
+            self._hist.vb.disableAutoRange()    # keep the histogram view frozen
+        self._img_scrub_lbl.setText('%05d  (%d/%d)' % (num, idx + 1, len(files)))
+
+    def _on_lock_hist(self, locked):
+        """Lock/unlock the histogram: freeze the contrast levels and stop the
+        histogram view auto-scaling between images."""
+        self._hist_locked = bool(locked)
+        try:
+            self._hist.region.setMovable(not locked)
+            if locked:
+                self._hist_levels = self._hist.getLevels()
+                self._hist.vb.setMouseEnabled(x=False, y=False)
+                self._hist.vb.disableAutoRange()
+            else:
+                self._hist.vb.setMouseEnabled(x=False, y=True)
+                self._hist.vb.enableAutoRange()
+        except Exception as e:
+            print('Lock histogram:', e)
+
     # ── Click / pick handling ──────────────────────────────────────────────────
 
     def _on_scene_clicked(self, event):
         if event.button() == QtCore.Qt.MiddleButton:
-            arc = self._nearest_arc_at(event.scenePos())
-            if arc is not None:
-                hkl_6d = self._arc_to_6d[id(arc)]
-                self._add_arc_to_list(hkl_6d, arc)
+            # Add the genuinely nearest reflection — whether it's an already
+            # drawn arc or one of the auto-generated (discovery) lines.
+            ref, arc = self._nearest_selectable(event.scenePos())
+            if ref is None:
+                return
+            if arc is None:
+                # discovery line: skip if already selected, else trace + add
+                if self._ref_in_list(ref):
+                    return
+                arc = self._plot_arc(np.asarray(ref), pg.mkColor('#00cccc'))
+                if arc is None:
+                    return
+            self._add_arc_to_list(np.asarray(ref), arc)
             return
         if event.button() == QtCore.Qt.RightButton:
             arc = self._nearest_arc_at(event.scenePos())
@@ -1362,11 +1863,12 @@ class DMSSlider(QtWidgets.QMainWindow):
             if arc_item is not None:
                 self._remove_arc_from_list(arc_item)
 
-    def _nearest_arc_at(self, scene_pos, threshold=8.0):
-        """Return the arc ScatterPlotItem closest to scene_pos (within threshold view pixels)."""
+    def _nearest_arc_at(self, scene_pos, threshold=None):
+        """Return the arc ScatterPlotItem closest to scene_pos (within a
+        zoom-aware screen-pixel tolerance)."""
         vb_pos = self._vb.mapSceneToView(scene_pos)
         col, row = vb_pos.x(), vb_pos.y()
-        best_arc, best_dist = None, threshold
+        best_arc, best_dist = None, (self._click_tol() if threshold is None else threshold)
         for arc_item in list(self._pick_items):
             if id(arc_item) not in self._arc_to_6d:
                 continue
@@ -1377,6 +1879,58 @@ class DMSSlider(QtWidgets.QMainWindow):
             if d < best_dist:
                 best_dist, best_arc = d, arc_item
         return best_arc
+
+    def _click_tol(self, screen_px=10.0):
+        """Click tolerance in data pixels for ~screen_px on-screen, so picking is
+        consistent regardless of zoom (a fixed data-pixel tolerance is far too
+        tight on a high-resolution detector zoomed to fit)."""
+        try:
+            vps = self._vb.viewPixelSize()
+            return float(screen_px * max(vps[0], vps[1]))
+        except Exception:
+            return 12.0
+
+    def _ref_in_list(self, ref):
+        """True if a reflection is already in the selected-reflections list."""
+        vec_str = '[%s]' % ' '.join('%d' % v for v in np.asarray(ref).astype(int))
+        for i in range(self._arc_list.count()):
+            if self._arc_list.item(i).text() == vec_str:
+                return True
+        return False
+
+    def _nearest_selectable(self, scene_pos):
+        """Nearest reflection to scene_pos as (ref_index, arc): an existing pick
+        arc if one is closest (arc returned), otherwise the nearest auto-generated
+        (discovery) line (arc is None — caller traces it).  Returns (None, None)
+        if nothing is within tolerance."""
+        vb_pos = self._vb.mapSceneToView(scene_pos)
+        col, row = vb_pos.x(), vb_pos.y()
+        best_d, best_ref, best_arc = self._click_tol(), None, None
+        # already-drawn arcs (selected / Geo candidates)
+        for arc in list(self._pick_items):
+            if id(arc) not in self._arc_to_6d or not hasattr(arc, '_x_data'):
+                continue
+            xd, yd = arc._x_data, arc._y_data
+            if xd is None or len(xd) == 0:
+                continue
+            d = float(np.sqrt((xd - col)**2 + (yd - row)**2).min())
+            if d < best_d:
+                best_d, best_ref, best_arc = d, self._arc_to_6d[id(arc)], arc
+        # auto-generated discovery lines
+        lines = getattr(self, '_discovery_lines', None) or []
+        ref6d = getattr(self, '_discovery_ref6d', None)
+        if ref6d is not None:
+            for i, (x, y) in enumerate(lines):
+                if i >= len(ref6d):
+                    break
+                x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+                m = ~(np.isnan(x) | np.isnan(y))
+                if not m.any():
+                    continue
+                d = float(np.sqrt((x[m] - col)**2 + (y[m] - row)**2).min())
+                if d < best_d:
+                    best_d, best_ref, best_arc = d, np.asarray(ref6d[i]), None
+        return best_ref, best_arc
 
     def _on_clear_picks(self):
         for item in self._pick_items:
@@ -1397,9 +1951,14 @@ class DMSSlider(QtWidgets.QMainWindow):
 
     # ── Physics helpers ────────────────────────────────────────────────────────
 
+    def _lattice_now(self):
+        """Current constrained lattice [a,b,c,α,β,γ] for the active crystal mode."""
+        a = self.ig[0]
+        return (ts.expand_lattice(bravais, self.ig[:6]) if CONVENTIONAL
+                else [a, a, a, 90, 90, 90])
+
     def _pixel_to_direction(self, row, col):
-        a       = self.ig[0]
-        thb_cur = ts.bragg([a, a, a, 90, 90, 90], self._hkl, self.ig[14]).th()[0]
+        thb_cur = ts.bragg(self._lattice_now(), self._hkl, self.ig[14]).th()[0]
         irmat   = np.array(
             ts.rotxyz([1, 0, 0], self.ig[11] + thb_cur).rmat() *
             ts.rotxyz([0, 1, 0], self.ig[12]).rmat() *
@@ -1415,9 +1974,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         return diff / n
 
     def _ewald_scores(self, dirs):
-        a  = self.ig[0]
         ko = self.ig[14] / 12.398
-        bm = np.array(ts.bmatrix([a, a, a, 90, 90, 90]).bm())
+        bm = np.array(ts.bmatrix(self._lattice_now()).bm())
         hkl002 = ts.PhasonDistoArray(
             np.array(self.full_reflist),
             np.array(self.full_reflist2),
@@ -1426,7 +1984,19 @@ class DMSSlider(QtWidgets.QMainWindow):
         hkl002_cart = np.array(hkl002) @ bm.T
         N = hkl002_cart.shape[0]
 
-        G_primary  = np.array(self._hkl).flatten()  @ bm.T
+        # Primary reflection direction, including the chi-axis correction: the
+        # engine rotates the scan/primary by chicor (ig slot 7), so the matcher
+        # frame must be rotated the same way, else candidates appear rotated.
+        _chicor = float(self.ig[7])
+        _hkl_p  = np.array(self._hkl, dtype=float).flatten()
+        if _chicor != 0:
+            _chiaxis = np.array((ts.rotxyz(np.cross(
+                (ts.rotxyz(self._hkl, self._dms.psi).rmat()
+                 * np.array([self._dms.azir]).T).T, np.array([self._hkl])), 90).rmat()
+                * np.array([self._hkl]).T).T).flatten()
+            _hkl_p = np.array((ts.rotxyz(_chiaxis, -_chicor).rmat()
+                               * np.array([_hkl_p]).T).T)[0]
+        G_primary  = _hkl_p @ bm.T
         azir_cart  = np.array(self._dms.azir).flatten() @ bm.T
         sample_psi = self._dms.psi
 
@@ -1456,8 +2026,9 @@ class DMSSlider(QtWidgets.QMainWindow):
         rhkangle  = np.degrees(np.arctan2(g_z[:, 0], g_z[:, 1]))
 
         scores = np.zeros(N)
+        _thcor = float(self.ig[8])   # theta (Bragg-angle) correction, slot 8
         for d in dirs:
-            brag1   = np.degrees(np.arcsin(np.clip(d[2], -1., 1.)))
+            brag1   = np.degrees(np.arcsin(np.clip(d[2], -1., 1.))) - _thcor
             psi_abs = np.degrees(np.arctan2(-d[0], d[1]))
             psi_req = sample_psi - psi_abs - self.ig[6]
             orighk  = ko * np.cos(np.radians(brag1))
@@ -1514,6 +2085,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._vb.addItem(arc)
         self._pick_items.append(arc)
         self._arc_to_6d[id(arc)] = hkl_6d.copy()
+        return arc
 
     def _run_geo_search(self, pts):
         self._sync_ig()
@@ -1599,6 +2171,10 @@ class DMSSlider(QtWidgets.QMainWindow):
                 fs.setValue(hkl_reset[1])
             elif idx == 'l':
                 fs.setValue(hkl_reset[2])
+            elif idx == 'px':
+                fs.setValue(self._px)   # beam centre is not part of the guess vector
+            elif idx == 'py':
+                fs.setValue(self._py)
             else:
                 fs.setValue(ig_reset[idx])
         self._suppress = False
@@ -1628,6 +2204,16 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._px = float(geo['px_unscaled']) * zoomval
         if 'py_unscaled' in geo:
             self._py = float(geo['py_unscaled']) * zoomval
+        # Keep the px/py sliders in step with a Config-table edit so the next
+        # _sync_ig doesn't overwrite the edited value with a stale slider position.
+        self._suppress = True
+        for _lbl, _val in (('px', self._px), ('py', self._py)):
+            fs = self._sliders.get(_lbl)
+            if fs is not None:
+                _half = next((d[2] for d in slider_defs if d[0] == _lbl), 250.0)
+                fs.setRange(_val - _half, _val + _half)
+                fs.setValue(_val)
+        self._suppress = False
         self._rebuild_dms_slice()
         self._rebuild_selected_engine()   # psi/px/py are baked into the engine
         self._do_update()
@@ -1700,6 +2286,7 @@ class DMSSlider(QtWidgets.QMainWindow):
 
         return {
             'version':        2,
+            'bravais':        bravais,   # crystal type (Ico / conventional system)
             'scan': {
                 'scanpath':   self._scanpath,
                 'scannum':    int(self._scannum),
@@ -1714,6 +2301,7 @@ class DMSSlider(QtWidgets.QMainWindow):
             'ref_6d':         ref_6d,
             'ref_6d_checked': ref_6d_checked,
             'manual_centres': manual_centres,
+            'peak_method':    self._peak_method,
             'fit_result':     fit_result,
         }
 
@@ -1807,6 +2395,22 @@ class DMSSlider(QtWidgets.QMainWindow):
 
     def _restore_from_dict(self, data):
         """Restore the full workflow state captured by _session_dict()."""
+        # 0. Restore the crystal type FIRST, so the correct slider set, fit engine
+        #    and reflection projection (6D vs 3-index) are active before the scan,
+        #    geometry and reflections below are applied.
+        saved_bravais = data.get('bravais')
+        if saved_bravais and saved_bravais != bravais:
+            combo = getattr(self, '_crystal_combo', None)
+            if combo is not None:
+                combo.blockSignals(True)
+                _i = combo.findData(saved_bravais)
+                if _i < 0:
+                    combo.insertItem(0, saved_bravais, saved_bravais)
+                    _i = 0
+                combo.setCurrentIndex(_i)
+                combo.blockSignals(False)
+            self._set_crystal_system(saved_bravais)
+
         # 1. Reload the scan/image, if the session records one.  Do this first so
         #    the saved geometry below overwrites the scan-derived defaults.
         scan = data.get('scan')
@@ -1833,23 +2437,31 @@ class DMSSlider(QtWidgets.QMainWindow):
         #    migrate a legacy 23-element state (psi/theta/chi, no kcor) by inserting
         #    kcor=0 at index 8 and zeroing the old theta/chi values (no equivalent
         #    in the index model).
-        ig_loaded  = np.array(data['initial_guess'], dtype=float)
+        ig_loaded  = np.array(data.get('initial_guess', self.ig), dtype=float)
         if ig_loaded.size == 23:
             ig_loaded = np.insert(ig_loaded, 8, 0.0)   # insert kcor
             ig_loaded[7] = 0.0                           # old thetacorrection → hcor=0
             ig_loaded[9] = 0.0                           # old chicorrection   → lcor=0
-        hkl_loaded = np.array(data['hkl'], dtype=float)
+        hkl_loaded = np.array(data.get('hkl', self._hkl), dtype=float)
         self._suppress = True
-        for label, idx, *_ in slider_defs:
+        for label, idx, half, *_ in slider_defs:
             fs = self._sliders[label]
             if idx == 'h':
-                fs.setValue(hkl_loaded[0])
+                v = float(hkl_loaded[0])
             elif idx == 'k':
-                fs.setValue(hkl_loaded[1])
+                v = float(hkl_loaded[1])
             elif idx == 'l':
-                fs.setValue(hkl_loaded[2])
+                v = float(hkl_loaded[2])
+            elif idx == 'px':
+                v = float(self._px)     # beam centre comes from the restored scan
+            elif idx == 'py':
+                v = float(self._py)
             else:
-                fs.setValue(ig_loaded[idx])
+                v = float(ig_loaded[idx])
+            # Recentre the slider range so a restored value outside the old range
+            # (e.g. a different crystal's lattice parameter) still shows correctly.
+            fs.setRange(v - half, v + half)
+            fs.setValue(v)
         self._suppress = False
         self.ig[:]   = ig_loaded
         self._hkl[:] = hkl_loaded
@@ -1858,6 +2470,15 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._on_clear_picks()
         self._apply_reflections(data.get('ref_6d', []),
                                 data.get('ref_6d_checked'))
+
+        # 4. Restore the peak-position method (applied on the next Build curves).
+        pm = data.get('peak_method')
+        if pm in ('gauss', 'centroid'):
+            self._peak_method = pm
+            if getattr(self, '_peak_combo', None) is not None:
+                self._suppress = True
+                self._peak_combo.setCurrentIndex(self._peak_combo.findData(pm))
+                self._suppress = False
 
         # 5. Stash manual centre overrides and fit result.  Centre overrides are
         #    applied the next time "Build curves" rebuilds the ROI centres.
@@ -1922,9 +2543,23 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._last_fit_output = None
         self._btn_save_fit.setEnabled(False)
         self._init_line_plot()
-        # Reset geometry sliders to the initial guess for the current scan
-        self._on_reset()
-        self._status.setText('Workflow cleared')
+        # With the session cleared, re-seed the sliders from the current scan's
+        # .dat metadata (lattice + energy); fall back to the initial guess if the
+        # scan can't be reloaded.
+        cur_dat = '%s%s.dat' % (self._scanpath, self._scannum)
+        seeded = False
+        if os.path.exists(cur_dat):
+            try:
+                self._do_load_scan(cur_dat, self._datapoint, self._datapoint0,
+                                   seed_from_metadata=True)
+                seeded = True
+            except Exception as e:
+                print('Clear-session reseed failed:', e)
+        if not seeded:
+            self._on_reset()
+        self._do_update()
+        self._status.setText('Workflow cleared — sliders seeded from scan metadata'
+                             if seeded else 'Workflow cleared')
 
     # ── Scan loading ───────────────────────────────────────────────────────────
 
@@ -1957,7 +2592,65 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._status.setText('Load failed: %s' % str(e)[:70])
             import traceback; traceback.print_exc()
 
-    def _do_load_scan(self, path, dp, dp0):
+    def _on_next_scan(self):
+        """Increment the scan number and load <scannum+1>.dat from the same folder."""
+        nxt  = int(self._scannum) + 1
+        path = os.path.join(self._scanpath, str(nxt) + '.dat')
+        if not os.path.exists(path):
+            self._status.setText('No next scan: %s not found'
+                                 % os.path.basename(path))
+            return
+        self._pending_scan_path = path
+        self._lbl_scan_path.setText(os.path.basename(path))
+        # Clamp dp / dp0 to the new scan's length and update the spinbox ranges.
+        try:
+            n = dat2config.scan_length(path)
+        except Exception:
+            n = 1
+        hi  = max(0, n - 1)
+        dp  = min(self._sb_dp.value(),  hi)
+        dp0 = min(self._sb_dp0.value(), hi)
+        for sb, v in ((self._sb_dp0, dp0), (self._sb_dp, dp)):
+            sb.blockSignals(True)
+            sb.setRange(0, hi)
+            sb.setValue(v)
+            sb.blockSignals(False)
+        self._status.setText('Loading scan %d…' % nxt)
+        QtWidgets.QApplication.processEvents()
+        try:
+            self._do_load_scan(path, dp, dp0)
+        except Exception as e:
+            self._status.setText('Load failed: %s' % str(e)[:70])
+            import traceback; traceback.print_exc()
+
+    def _on_view_dat(self):
+        """Show the raw ASCII contents of the loaded .dat scan in a dialog."""
+        path = os.path.join(self._scanpath, str(self._scannum) + '.dat')
+        if not os.path.exists(path):
+            path = self._pending_scan_path
+        try:
+            with open(path) as fh:
+                text = fh.read()
+        except Exception as e:
+            self._status.setText('Cannot read %s: %s'
+                                 % (os.path.basename(str(path)), str(e)[:50]))
+            return
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(os.path.basename(str(path)))
+        dlg.resize(900, 640)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        edit = QtWidgets.QPlainTextEdit()
+        edit.setReadOnly(True)
+        edit.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        f = edit.font(); f.setFamily('monospace'); f.setPointSize(8); edit.setFont(f)
+        edit.setPlainText(text)
+        lay.addWidget(edit, 1)
+        btn = QtWidgets.QPushButton('Close')
+        btn.clicked.connect(dlg.accept)
+        lay.addWidget(btn)
+        dlg.exec_()
+
+    def _do_load_scan(self, path, dp, dp0, seed_from_metadata=False):
         # The converter is the only sanctioned .dat reader.
         exp = dat2config.extract_metadata(path, dp, dp0)
         lat = list(exp['lattice'])
@@ -1992,10 +2685,62 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._sliders['energy'].setRange(en_new - 0.5, en_new + 0.5)
         self._suppress = False
 
+        # On a fresh load (no active session — e.g. after Clear Session) seed the
+        # lattice and energy sliders straight from the .dat metadata, recentring
+        # their ranges.  Detector/correction sliders are left as-is (they are not
+        # part of the file metadata).
+        if seed_from_metadata:
+            self.ig[14] = en_new
+            if CONVENTIONAL:
+                self.ig[0:6] = ts.expand_lattice(bravais, list(lat))
+            else:
+                self.ig[0] = self.ig[1] = self.ig[2] = float(lat[0])
+                self.ig[3] = self.ig[4] = self.ig[5] = 90.0
+            self._suppress = True
+            for label, idx, half, *_ in slider_defs:
+                if isinstance(idx, int) and (idx < 6 or idx == 14):
+                    v = float(self.ig[idx])
+                    self._sliders[label].setRange(v - half, v + half)
+                    self._sliders[label].setValue(v)
+            self._suppress = False
+
         # Read the current slider state into self.ig / self._hkl so the DMS
         # objects are built with the exact same parameters that were in use
         # before the load (guarantees same file/dp → no shift).
         self._sync_ig()
+
+        # ── Energy-rescale hkl on a same-scan datapoint change ───────────────
+        # When the datapoint changes within the same scan and the scan energy
+        # differs, the reciprocal-space indices scale with the energy ratio
+        # (Bragg condition):  hkl = hkl * E[dp] / E[prev_dp], where prev_dp is
+        # whatever was last loaded for this scan.  Reloading the same dp (or a
+        # dp with the same energy) leaves hkl and the sliders untouched, so the
+        # "same file/dp → no shift" guarantee holds.
+        same_scan = (snum_new == self._scannum and
+                     os.path.normpath(scan_dir) == os.path.normpath(self._scanpath))
+        if same_scan and dp != self._datapoint:
+            try:
+                en_prev = dat2config.energy_at(path, self._datapoint)
+            except Exception:
+                en_prev = None
+            if en_prev and not np.isclose(en_new, en_prev):
+                self._hkl *= en_new / en_prev
+                self.ig[14] = en_new
+                self._suppress = True
+                for _lbl, _idx, _half, _ in slider_defs:
+                    if _idx == 'h':
+                        _v = float(self._hkl[0])
+                    elif _idx == 'k':
+                        _v = float(self._hkl[1])
+                    elif _idx == 'l':
+                        _v = float(self._hkl[2])
+                    elif _idx == 14:
+                        _v = en_new
+                    else:
+                        continue
+                    self._sliders[_lbl].setRange(_v - _half, _v + _half)
+                    self._sliders[_lbl].setValue(_v)
+                self._suppress = False
 
         # Derive geometry from current slider state, not raw scan values
         cur_energy   = self.ig[14]
@@ -2036,14 +2781,23 @@ class DMSSlider(QtWidgets.QMainWindow):
             self.full_reflist, self.full_reflist2, self._hkl, self._imdata,
             self._psirange, self._thrange, self._azir, self._psi,
             self._px, self._py, ig0)
+        # Keep the click-to-select index map matched to _dms (built from the full
+        # reflist here), so every drawn line stays clickable.
+        self._discovery_ref6d = np.asarray(self.full_reflist_6d)
         self._dms_full = make_overlay_dms(
             self.full_reflist, self.full_reflist2, self._hkl, self._imdata,
             self._psirange, self._thrange, self._azir, self._psi,
             self._px, self._py, ig0)
 
-        # Update image display
+        # Update image display, keeping the user's current histogram levels
+        # (or the locked levels when the histogram is locked).
+        _lv = (self._hist_levels if self._hist_locked and self._hist_levels is not None
+               else self._hist.getLevels())
         self._img_item.setImage(imdata_new, autoLevels=False)
-        self._img_item.setLevels(colourlim)
+        self._img_item.setLevels(_lv)         # single [min,max] arg (NOT *_lv)
+        if self._hist_locked:
+            self._hist.setLevels(_lv[0], _lv[1])
+            self._hist.vb.disableAutoRange()
 
         # Refresh the live config + table with the newly imported metadata
         self._cfg.setdefault('scan', {}).update({
@@ -2065,6 +2819,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self.setWindowTitle('DMS Slider v3 — scan %d  dp=%d  E=%.4f keV' %
                             (snum_new, dp, en_new))
         self._rebuild_selected_engine()   # new image/psi baked into the engine
+        self._update_img_scrub_range(dp)  # point the image scrubber at the new scan
         self._do_update()
         self._status.setText('Loaded scan %d dp=%d  E=%.4f keV' % (snum_new, dp, en_new))
 
@@ -2108,7 +2863,7 @@ class DMSSlider(QtWidgets.QMainWindow):
                     'numsteps': numsteps,
                     'simsigma_per_zoom': simsigma / max(zoomval, 1),
                     'thrange_delta': [-27, 10],
-                    'bravais': 'icosahedral',
+                    'bravais': bravais,
                     'opt_method': 'COBYLA',
                     'tolerance': 1e-6,
                     'intensity': 1, 'threshold': 0, 'n_parallel_starts': 1,
@@ -2126,7 +2881,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         if not ref_6d:
             ref_6d = [[int(v) for v in h] for h in self._arc_to_6d.values()]
         if not ref_6d:
-            ref_6d = ref_6d_manual.tolist()
+            ref_6d = ref_manual.tolist()
 
         ig24 = self._workflow_ig24()
 
@@ -2155,14 +2910,22 @@ class DMSSlider(QtWidgets.QMainWindow):
             'py_unscaled': float(self._py / zoomval),
             'scatv':       scatv,
         })
-        cfg['crystal']['ref_6d']             = ref_6d
+        cfg.setdefault('crystal', {})
+        if CONVENTIONAL:
+            # Conventional crystals export 3-index reflections; fit.py reads
+            # crystal.reflist_hkl and never touches ref_6d / tau.
+            cfg['crystal']['reflist_hkl'] = ref_6d
+            cfg['crystal']['lattice2']    = ts.expand_lattice(bravais, ig24[:6])
+        else:
+            cfg['crystal']['ref_6d']     = ref_6d
+            cfg['crystal']['lattice2']   = [float(self.ig[0])] * 3 + [90., 90., 90.]
+            cfg['crystal']['tau_approx'] = float(tau)   # pass rational approx to workflow
         cfg['crystal']['initial_guess_base'] = ig24.tolist()
-        cfg['crystal']['lattice2']           = [float(self.ig[0])] * 3 + [90., 90., 90.]
-        cfg['crystal']['tau_approx']         = float(tau)   # pass rational approx to workflow
         cfg['display']['zoomval']            = zoomval
         cfg['display']['colourlim']          = list(colourlim)
         cfg['computation']['numsteps']       = numsteps
         cfg['computation']['simsigma_per_zoom'] = float(simsigma / max(zoomval, 1))
+        cfg['computation']['peak_method']    = self._peak_method
         cfg.setdefault('roi', {})['width_per_zoom'] = float(width / max(zoomval, 1))
         # Template manual_centres reference ROI indices from a different ref_6d;
         # always clear them so workflow.py doesn't crash with an IndexError.
@@ -2301,11 +3064,13 @@ class DMSSlider(QtWidgets.QMainWindow):
                 self._psirange, threshold, self._hkl, detvects, self._imdata.shape,
                 simsigma, self._azir, self._psi, self._px, self._py, scatv,
                 ig[10], ig[11], ig[12], ig[13], ig[14],
-                ig, self._reflist2_fit, list(ig[15:24])
+                ig, self._reflist2_fit, list(ig[15:24]),
+                (bravais if CONVENTIONAL else None)
             )
             self._kernel = ts.roibuilder_ico_hkl(builderargs)
             self._imcoeffs, self._linedatax, self._linedatay, _, _, _ = \
-                ts.multiroifit2(self._imdata, self._kernel, width, 0.02, 10.0)
+                ts.multiroifit2(self._imdata, self._kernel, width, 0.02, 10.0,
+                                self._peak_method)
             self._centres = np.array([self._imcoeffs[:, 2]]).T
             self._centre_override_rois = set()
             # Re-apply manual centre overrides restored from a session file
@@ -2326,6 +3091,9 @@ class DMSSlider(QtWidgets.QMainWindow):
                 self._reflist2_fit, list(ig[15:24]), ig[0])
             self._fit_dms.setCalLattice(ig[:6].tolist())
             self._fit_dms.setLattice(ig[:6].tolist())
+            self._fit_dms.setPeakMethod(self._peak_method)
+            if CONVENTIONAL:
+                self._fit_dms.setIGFull(ig)
             self._fit_dms.hkllistrange[2] = numsteps_interactive
             try:
                 self._fit_dms.imcalc(extract_reduced(ig))
@@ -2424,7 +3192,8 @@ class DMSSlider(QtWidgets.QMainWindow):
                 and self._sim_curves):
             try:
                 coefs, ldsx, ldsy, _, _, _ = ts.multiroifit(
-                    self._fit_dms.imsim, self._kernel, width, 10)
+                    self._fit_dms.imsim, self._kernel, width, 10,
+                    self._peak_method)
                 self._draw_sim_lines(coefs, ldsx, ldsy)
             except Exception:
                 pass
@@ -2489,6 +3258,19 @@ class DMSSlider(QtWidgets.QMainWindow):
     def _on_algo(self, method):
         self._active_method = method
 
+    def _on_peak_method_changed(self, _idx):
+        """Switch how peak positions are located in the raw and simulated ROI
+        curves (Gaussian curve fit vs centroid).  If curves are already built,
+        rebuild them so the experimental centres and overlay pick up the new
+        method; otherwise just remember the choice for the next Build."""
+        if self._suppress:
+            return
+        self._peak_method = self._peak_combo.currentData()
+        if self._fit_dms is not None:
+            self._fit_dms.setPeakMethod(self._peak_method)
+        if self._kernel is not None and not self._fitting:
+            self._on_build_curves()
+
     def _on_numsteps_changed(self, value):
         """Update the point count (hkl scan resolution) used for the live image
         overlay and the fit.  The live engines bake the resolution into their
@@ -2527,22 +3309,35 @@ class DMSSlider(QtWidgets.QMainWindow):
             return
         self._sync_ig()
         ig = self.ig
-        self._fitting = True
-        self._status.setText('Fitting...')
 
         reduced = extract_reduced(ig)
+        slots   = reduced_slots()
+        # Which reduced-vector positions are enabled by the per-slider checkboxes.
+        enabled = {idx: self._sliders[label].is_fit_enabled()
+                   for label, idx, *_ in slider_defs if isinstance(idx, int)}
+        free = [p for p, s in enumerate(slots) if enabled.get(s, True)]
+        if not free:
+            self._status.setText('Enable at least one parameter (fit checkbox) to fit')
+            return
+
+        self._fitting = True
+        self._status.setText('Fitting %d/%d parameters…' % (len(free), len(slots)))
+
         dms = self._fit_dms
         dms.hkllistrange[2] = numsteps
         dms.detdistancepx = ig[10]; dms.detxrot = ig[11]
         dms.detyrot = ig[12];       dms.detzrot = ig[13]
         dms.energy = ig[14];        dms.a = ig[0]
-        dms.setLattice([ig[0], ig[0], ig[0], 90, 90, 90])
+        dms.setLattice(list(ig[:6]))
+        if CONVENTIONAL:
+            dms.setIGFull(ig)
 
         bounds = list(zip(reduced - 1.5, reduced + 1.5))
         self._worker.idle.wait(timeout=5.0)
 
         self._fit_worker = FitWorker(
-            dms, reduced, bounds, self._active_method, n_parallel_starts)
+            dms, reduced, bounds, self._active_method, n_parallel_starts,
+            free_idx=free)
         self._fit_worker.done.connect(self._on_fit_done)
         self._fit_worker.error.connect(self._on_fit_error)
         self._fit_worker.stopped.connect(self._on_fit_stopped)

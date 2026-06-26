@@ -1,4 +1,12 @@
 {
+  "version": 2,
+  "bravais": "icosahedral",
+  "scan": {
+    "scanpath": "/home/ndf61257/MintSpace/i16extra/data/2021/mm29043-1/",
+    "scannum": 913123,
+    "datapoint": 3,
+    "datapoint0": 1
+  },
   "scannum": 913123,
   "datapoint": 3,
   "hkl": [
@@ -21,7 +29,7 @@
     0.22857199999999978,
     0.6670379999999998,
     -2.0970340000000007,
-    6.2995,
+    6.29954667,
     0.001228,
     0.0007300000000000015,
     0.0004909999999999984,
@@ -62,28 +70,37 @@
   "ref_6d_checked": [
     true,
     true,
+    false,
     true,
     true,
     true,
+    false,
+    true,
+    true,
+    false,
+    true,
+    true,
+    false,
+    true,
+    true,
+    false,
+    true,
+    true,
+    false,
+    false,
+    false,
     true,
     true,
     true,
-    true,
-    true,
-    true,
-    true,
-    true,
-    true,
-    true,
-    true,
-    true,
-    true,
-    true,
-    true,
-    true,
-    true,
-    true,
-    true,
-    true
-  ]
+    false
+  ],
+  "manual_centres": {
+    "0": 20.7208259263602,
+    "8": 22.548797041736456,
+    "24": 29.58212373389463,
+    "28": 26.020563018979168,
+    "30": 24.613464874546793
+  },
+  "peak_method": "gauss",
+  "fit_result": null
 }

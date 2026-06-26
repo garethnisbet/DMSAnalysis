@@ -1,4 +1,11 @@
 {
+  "version": 2,
+  "scan": {
+    "scanpath": "/home/ndf61257/MintSpace/i16extra/data/2021/mm29043-1/",
+    "scannum": 913123,
+    "datapoint": 3,
+    "datapoint0": 1
+  },
   "scannum": 913123,
   "datapoint": 3,
   "hkl": [
@@ -21,7 +28,7 @@
     0.22857199999999978,
     0.6670379999999998,
     -2.0970340000000007,
-    6.2995,
+    6.29954667,
     0.001228,
     0.0007300000000000015,
     0.0004909999999999984,
@@ -85,5 +92,8 @@
     true,
     true,
     true
-  ]
+  ],
+  "manual_centres": {},
+  "peak_method": "gauss",
+  "fit_result": null
 }

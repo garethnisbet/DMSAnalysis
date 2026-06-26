@@ -54,6 +54,12 @@ def _energy_at(d, idx):
     return float(d.metadata.en)
 
 
+def energy_at(dat_path, datapoint):
+    """Return the scan energy (keV) at ``datapoint`` using the same fallback
+    chain as :func:`extract_metadata`."""
+    return _energy_at(do.load(dat_path), datapoint)
+
+
 def _detector_template(dat_path, scannum):
     """Return the ``%05d``-style image template for ``scannum``.
 
@@ -68,12 +74,24 @@ def _detector_template(dat_path, scannum):
 
 
 def scan_length(dat_path):
-    """Return the number of scan points in ``dat_path`` (>= 1)."""
+    """Return the number of scan points in ``dat_path`` (>= 1).
+
+    Works for any scan type: ``energy2`` / ``DCMenergy`` are used when present,
+    otherwise the length of any scanned data column is used (every column has one
+    entry per scan point), so non-energy scans (psi, eta, hkl, …) report their
+    real length instead of 1."""
     d = do.load(dat_path)
     for attr in ('energy2', 'DCMenergy'):
         arr = getattr(d, attr, None)
         if arr is not None and hasattr(arr, '__len__'):
             return len(arr)
+    # Fall back to the length of the first scanned data column.
+    try:
+        for v in d.values():
+            if hasattr(v, '__len__') and not isinstance(v, str):
+                return len(v)
+    except Exception:
+        pass
     return 1
 
 

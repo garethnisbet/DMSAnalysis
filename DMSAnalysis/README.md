@@ -131,6 +131,31 @@ As `vfind` but requires 6-component matches (for icosahedral indexing).
 
 ---
 
+## Conventional-crystal symmetry layer
+
+Table-driven helpers that let the icosahedral DMS engine also fit **ordinary
+crystals** indexed with 3-element Miller indices, constrained by crystal system.
+There is no cut-and-projection and no phason matrix in this mode; the lattice is
+carried in slots `[0..5]` of the 24-element guess vector and the phason block
+`[15..23]` is held at zero. Shared by `slider.py`, `fit.py`, and the fit engine
+so the parameter packing never drifts.
+
+| Name | Returns | Description |
+|------|---------|-------------|
+| `CONVENTIONAL_SYSTEMS` | tuple | `('cubic','tetragonal','orthorhombic','monoclinic','rhombohedral','hexagonal','triclinic')` |
+| `lattice_free_slots(system)` | `list[int]` | Indices into `[a,b,c,α,β,γ]` that are refined for the system (e.g. tetragonal → `[0,2]`) |
+| `expand_lattice(system, six)` | `list` (6) | Full constrained lattice, enforcing the symmetry (e.g. tetragonal → `[a,a,c,90,90,90]`, hexagonal → `[a,a,c,90,90,120]`, monoclinic b-unique → `[a,b,c,90,β,90]`) |
+| `reduced_param_indices(system, detopt, energyopt)` | `list[int]` | Indices into the 24-element guess passed to the optimiser: free lattice slots + `[6,7,8,9]` + detector `[10..13]` (if `detopt`) + energy `[14]` (if `energyopt`); never the phason block |
+| `hklgen_3d(depth)` | `np.ndarray` (N×3) | All integer `[h,k,l]` in `[-depth,depth]³` minus the origin (3D analogue of `hklgen_ico`) |
+
+`dmsfit_ico_hkl` (and the ROI builder's `dmscalc_ico_hkl`) decode a conventional
+crystal when `bravais` ∈ `CONVENTIONAL_SYSTEMS`: pass the full 24-element guess
+via `dmsfit_ico_hkl.setIGFull(ig24)`, supply `reflist2 = 0` and a zero phason
+matrix, and the engine reconstructs the constrained lattice with
+`expand_lattice`.
+
+---
+
 ## Multiple Scattering Geometry
 
 ### `class calcms(lattice, hkl, hklint, hkl2, energy, azir, F=[], F2=[])`

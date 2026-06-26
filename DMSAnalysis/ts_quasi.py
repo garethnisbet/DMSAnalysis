@@ -33,6 +33,87 @@ from joblib import Parallel, delayed
 TAU =  0.5+0.5*5**0.5
 ###################################
 
+# ── Conventional-crystal symmetry layer ────────────────────────────────────────
+# Support for ordinary (non-quasicrystal) crystals indexed with 3-element Miller
+# indices.  These helpers are table-driven and shared by the slider, the batch
+# fitter and the fit engine so the parameter packing can never drift between
+# them.  The lattice is carried in slots [0..5] = [a, b, c, alpha, beta, gamma]
+# of the 24-element guess vector (the same slots the icosahedral path reserves);
+# the phason slots [15..23] are unused for conventional crystals.
+
+CONVENTIONAL_SYSTEMS = ('cubic', 'tetragonal', 'orthorhombic', 'monoclinic',
+                        'rhombohedral', 'hexagonal', 'triclinic')
+
+# Which lattice slots [a,b,c,alpha,beta,gamma] are free (refined) per system.
+# monoclinic uses the standard b-unique setting (beta != 90).
+_LATTICE_FREE_SLOTS = {
+    'cubic':        [0],
+    'tetragonal':   [0, 2],
+    'hexagonal':    [0, 2],
+    'orthorhombic': [0, 1, 2],
+    'monoclinic':   [0, 1, 2, 4],
+    'rhombohedral': [0, 3],
+    'triclinic':    [0, 1, 2, 3, 4, 5],
+}
+
+
+def lattice_free_slots(system):
+    '''Indices into the 6-element lattice [a,b,c,alpha,beta,gamma] that are free
+    (refined) for the given crystal system.'''
+    try:
+        return list(_LATTICE_FREE_SLOTS[system])
+    except KeyError:
+        raise ValueError('Unknown crystal system: %s' % system)
+
+
+def expand_lattice(system, six):
+    '''Return the full constrained lattice [a,b,c,alpha,beta,gamma] for a crystal
+    system, reading only the free slots of ``six`` and enforcing the symmetry
+    constraints.  Stale values in constrained slots are therefore harmless.'''
+    a, b, c, alpha, beta, gamma = (float(six[0]), float(six[1]), float(six[2]),
+                                   float(six[3]), float(six[4]), float(six[5]))
+    if system == 'cubic':
+        return [a, a, a, 90.0, 90.0, 90.0]
+    elif system == 'tetragonal':
+        return [a, a, c, 90.0, 90.0, 90.0]
+    elif system == 'hexagonal':
+        return [a, a, c, 90.0, 90.0, 120.0]
+    elif system == 'orthorhombic':
+        return [a, b, c, 90.0, 90.0, 90.0]
+    elif system == 'monoclinic':
+        return [a, b, c, 90.0, beta, 90.0]
+    elif system == 'rhombohedral':
+        return [a, a, a, alpha, alpha, alpha]
+    elif system == 'triclinic':
+        return [a, b, c, alpha, beta, gamma]
+    raise ValueError('Unknown crystal system: %s' % system)
+
+
+def reduced_param_indices(system, detopt, energyopt):
+    '''Indices into the 24-element guess vector passed to the optimiser for a
+    conventional crystal: the free lattice slots, then psicor (6), chicor (7) and
+    thetacor (8), then the detector geometry (if ``detopt``) and energy (if
+    ``energyopt``).  Slots 7/8 (formerly hcor/kcor) are repurposed as the chi /
+    theta corrections; lcor (9) is redundant with the primary hkl and the phason
+    slots [15..23] are never included.'''
+    idx = lattice_free_slots(system) + [6, 7, 8]
+    if detopt:
+        idx += [10, 11, 12, 13]
+    if energyopt:
+        idx += [14]
+    return idx
+
+
+def hklgen_3d(depth):
+    '''All integer Miller indices [h,k,l] in [-depth, depth]^3 minus the origin
+    (the 3D analogue of the icosahedral 6D hkl generator).'''
+    import itertools as _it
+    rng = range(-depth, depth + 1)
+    idx = np.array(list(_it.product(rng, repeat=3)))
+    return idx[np.any(idx != 0, axis=1)]
+
+###################################
+
 class bmatrix(object):
     """ Convert to Cartesian coordinate system. Returns the Bmatrix and the metric tensors in direct and reciprocal spaces"""
     def __init__(self,lattice):#
@@ -536,6 +617,39 @@ def fitgauss1from2(xdata,ydata,sig):
     fitpoints=gauss(xdata,fitcoeffs[0],fitcoeffs[1],fitcoeffs[2],fitcoeffs[3])
     return fitcoeffs, pcov, fitpoints
 
+def centroid(xdata,ydata):
+    '''Background-subtracted centre-of-mass peak position, returned in the same
+    (coef, pcov, fitpoints) shape as fitgauss/fitgauss1from2 so it can be used
+    as a drop-in alternative.  coef = [sigma, intensity, centre, bg] with
+    coef[2] the centroid; sigma is the RMS width about the centroid.'''
+    xdata=np.asarray(xdata,dtype=float)
+    ydata=np.asarray(ydata,dtype=float)
+    bg=ydata.min()
+    w=ydata-bg
+    total=w.sum()
+    if total<=0:
+        centre=float(xdata[ydata.argmax()])
+        sigma=1.0
+    else:
+        centre=float((xdata*w).sum()/total)
+        var=(w*(xdata-centre)**2).sum()/total
+        sigma=float(np.sqrt(var)) if var>0 else 1.0
+    intensity=float(ydata.max()-bg)
+    fitcoeffs=np.array([sigma,intensity,centre,float(bg)])
+    pcov=np.zeros((4,4))
+    fitpoints=gauss(xdata,sigma,intensity,centre,bg)
+    return fitcoeffs, pcov, fitpoints
+
+def peakfit(xdata,ydata,method='gauss',sig=None):
+    '''Dispatch peak-position extraction by method name: 'centroid' uses the
+    centre of mass, anything else uses Gaussian curve fitting (the two-peak
+    aware fitgauss1from2 when sig is given, otherwise fitgauss).'''
+    if method=='centroid':
+        return centroid(xdata,ydata)
+    if sig is not None:
+        return fitgauss1from2(xdata,ydata,sig)
+    return fitgauss(xdata,ydata)
+
 def uniquearray(inarray):
     tup=tuple(map(tuple, inarray))
     reducedtup = list(set(tup))
@@ -587,6 +701,9 @@ def roibuilder_ico_hkl(args):
     ig=args[20]
     reflist2=args[21]   # perpemdicular component of Bragg reflection
     mtrx2=args[22]      # 3x3 phason matrix
+    # Optional crystal system (conventional crystals only): when set, the ROI
+    # geometry uses the constrained full lattice instead of cubic a=b=c.
+    crystal_system = args[23] if len(args) > 23 else None
 
     numrefs=reflist.shape[0]
     kernelstack=np.zeros((imshape[0],imshape[1],numrefs*2))
@@ -595,6 +712,7 @@ def roibuilder_ico_hkl(args):
         ref=reflist[i1,:]
         emptyim=np.zeros(imshape)
         dmsroi = dmscalc_ico_hkl([ref],hkllist,hklint,1,psirange,100,hkl,detvects,emptyim,simsigma,azir,psi,px,py,scatv,detdistancepx,rotx,roty,rotz,energy,reflist2,mtrx2)
+        dmsroi.crystal_system = crystal_system
 
         roiindex=dmsroi.roiindex(ig)
 
@@ -689,7 +807,7 @@ def msroi2(img, kernel, width):
     v2 = shifted[w_idx, n_idx]                                                 # (M, 2)
     return v1, v2, v
 
-def multiroifit(img,kernel,width,percentileval):
+def multiroifit(img,kernel,width,percentileval,method='gauss'):
     v1=np.array([[]]*4).T
     vx=[]
     vy=[]
@@ -704,7 +822,7 @@ def multiroifit(img,kernel,width,percentileval):
         # ydata=ydata[ydata>np.percentile(ydata, percentileval)]
 #         ydata[ydata<np.percentile(ydata, 10)]=np.percentile(ydata, 10)
         try:
-            coef, pcov,fitpoints = fitgauss(xdata,ydata)
+            coef, pcov,fitpoints = peakfit(xdata,ydata,method)
         except:
             print('Fit not possible for _'+str(i1))
             coef = np.array([0,0,500,0])
@@ -717,12 +835,12 @@ def multiroifit(img,kernel,width,percentileval):
         v4[roi[:,0].astype(int),roi[:,1].astype(int),i1]=1
         pcovlist.append(pcov)
     return v1, np.array(vx),np.array(vy), np.array(v3), v4, pcovlist
-def _multiroifit2_one(img, kernel_slice, width, sig, idx):
+def _multiroifit2_one(img, kernel_slice, width, sig, idx, method='gauss'):
     sumvals, roi, transvect0 = msroi2(img, kernel_slice, width)
     xdata = np.arange(len(sumvals))
     ydata = sumvals[:, 0]
     try:
-        coef, pcov, fitpoints = fitgauss1from2(xdata, ydata, sig)
+        coef, pcov, fitpoints = peakfit(xdata, ydata, method, sig)
     except:
         print('Fit not possible for _' + str(idx))
         coef = np.array([0, 0, 500, 0])
@@ -730,10 +848,10 @@ def _multiroifit2_one(img, kernel_slice, width, sig, idx):
         fitpoints = ydata
     return coef, xdata, ydata, fitpoints, roi, pcov
 
-def multiroifit2(img,kernel,width,percentileval,sig):
+def multiroifit2(img,kernel,width,percentileval,sig,method='gauss'):
     n = kernel.shape[2]
     results = Parallel(n_jobs=-1)(
-        delayed(_multiroifit2_one)(img, kernel[:, :, i1], width, sig, i1)
+        delayed(_multiroifit2_one)(img, kernel[:, :, i1], width, sig, i1, method)
         for i1 in range(n)
     )
     v4 = np.zeros((img.shape[0], img.shape[1], n))
@@ -1443,8 +1561,19 @@ class dmscalc_ico_hkl(object):
         self.hkllist=hkllist
     def imcalc(self,*inputs):
         inputs=inputs[0]
-        a,b,c,alpha,beta,gamma=inputs[0],inputs[0],inputs[0],90, 90, 90
-        psicorrection, h_correction, k_correction, l_correction = inputs[6], inputs[7], inputs[8], inputs[9]
+        # Conventional crystals carry the full lattice in slots [0:6]; the
+        # icosahedral path keeps the cubic a=b=c, 90,90,90 constraint.
+        # The ROI builder always receives the full 24-element guess, so the
+        # corrections sit at fixed slots: psicor(6), chi(7), theta(8).  The hkl
+        # corrections are unused (redundant with the primary hkl).
+        if getattr(self, 'crystal_system', None) in CONVENTIONAL_SYSTEMS:
+            a,b,c,alpha,beta,gamma = expand_lattice(self.crystal_system, inputs[0:6])
+        else:
+            a,b,c,alpha,beta,gamma=inputs[0],inputs[0],inputs[0],90, 90, 90
+        psicorrection   = inputs[6]
+        chicorrection   = inputs[7]
+        thetacorrection = inputs[8]
+        h_correction = k_correction = l_correction = 0.0
 
         if len(inputs) > 10:
             detdistancepx,detxrot,detyrot,detzrot=inputs[10],inputs[11],inputs[12],inputs[13]
@@ -1476,6 +1605,9 @@ class dmscalc_ico_hkl(object):
         azir_cart0  = np.array(self.azir).reshape(3) @ bm.T
         N_refs      = hkl002.shape[0]
         hkllist_arr = np.array(self.hkllist)
+        if chicorrection != 0:
+            chiaxis = (rotxyz(np.cross((rotxyz(self.hkl,self.psi).rmat()*np.array([self.azir]).T).T, np.array([self.hkl])),90).rmat()*np.array([self.hkl]).T).T
+            hkllist_arr = np.array((rotxyz(chiaxis, -chicorrection).rmat()*hkllist_arr.T).T)
         N_steps     = hkllist_arr.shape[0]
 
         hklnotlist       = hkllist_arr @ bm.T                           # (N_steps, 3)
@@ -1539,8 +1671,8 @@ class dmscalc_ico_hkl(object):
         flat[:,:,4]   = psi2
         flat[:,:,5]   = brag1_all[:,np.newaxis]
         flat[:,:,6]   = energy
-        vecs1=psith2v(self.psi-mslist[:,3]-psicorrection,mslist[:,5])
-        vecs2=psith2v(self.psi-mslist[:,4]-psicorrection,mslist[:,5])
+        vecs1=psith2v(self.psi-mslist[:,3]-psicorrection,mslist[:,5]+thetacorrection)
+        vecs2=psith2v(self.psi-mslist[:,4]-psicorrection,mslist[:,5]+thetacorrection)
         vecs=np.concatenate((vecs1,vecs2),0)
         centralv=-psith2v(0,thb)*detdistancepx
         prepxvec=dms2px(detvs[0,:],detvs[1,:],centralv,vecs)
@@ -1641,17 +1773,66 @@ class dmsfit_ico_hkl(object):
         self.mtrx = args[25]
         self.a=args[26]
         self.calibration_lattice = [5.43075,5.43075,5.43075,90.0,90.0,90.0]
+        # Peak-position method for the simulated ROI curves: 'gauss' (curve fit)
+        # or 'centroid' (centre of mass).  Set via setPeakMethod.
+        self.peakmethod = 'gauss'
+        # Full 24-element guess vector — used by the conventional-crystal branch
+        # of imcalc to fill the non-refined parameters around the reduced
+        # optimiser vector.  Defaults to args[26] (the lattice 'a') in slot 0.
+        self.ig_full = None
     def setCalLattice(self, cal_lattice):
         self.calibration_lattice = cal_lattice
+    def setIGFull(self, ig24):
+        '''Store the full 24-element guess vector (conventional crystals only).
+        The optimiser passes a reduced subset to imcalc; the remaining slots
+        (constrained lattice params, detector/energy when not refined, and the
+        always-zero phason block) are read back from this template.'''
+        self.ig_full = np.asarray(ig24, dtype=float).copy()
     def setLattice(self, lattice):
         self.lattice = lattice
+    def setPeakMethod(self, method):
+        self.peakmethod = method
+    def _simcoeffs(self):
+        '''Per-ROI peak coefficients of the current simulated image, using the
+        selected peak-position method.  v1[:,2] is the centre per ROI.'''
+        v1=np.array([[]]*4).T
+        for i1 in range(self.kernel.shape[2]):
+            sumvals,roi = msroi(self.imsim,self.kernel[:,:,i1],self.width)
+            xdata=np.arange(len(sumvals))
+            ydata=sumvals[:,0]
+            try:
+                coef, pcov,fitpoints = peakfit(xdata,ydata,self.peakmethod)
+                v1=np.vstack([v1,coef])
+            except:
+                v1=np.vstack([v1,[100,100,100,100]])
+        return v1
         
 ###########################
     def imcalc(self,*inputs):
         inputs=inputs[0]
-        if self.bravais == 'icosahedral':
+        chicorrection = 0.0    # chi-axis correction; only conventional crystals set it
+        thetacorrection = 0.0  # theta (Bragg-angle) correction; conventional only
+        if self.bravais in CONVENTIONAL_SYSTEMS:
+            # Conventional crystal: scatter the reduced optimiser vector back into
+            # a full 24-element guess, apply the crystal-system lattice
+            # constraint, and leave the phason block at zero.
+            full = (self.ig_full.copy() if self.ig_full is not None
+                    else np.zeros(24))
+            full[reduced_param_indices(self.bravais, self.detopt, self.energyopt)] = inputs
+            a, b, c, alpha, beta, gamma = expand_lattice(self.bravais, full[:6])
+            psicorrection = full[6]
+            chicorrection = full[7]    # slot 7 (formerly hcor) repurposed for chi
+            thetacorrection = full[8]  # slot 8 (formerly kcor) repurposed for theta
+            h_correction = k_correction = l_correction = 0.0
+            detdistancepx, detxrot, detyrot, detzrot = full[10], full[11], full[12], full[13]
+            energy = full[14] if self.energyopt else self.energy
+            self.a11,self.a12,self.a13,self.a21,self.a22,self.a23,self.a31,self.a32,self.a33 = 0,0,0, 0,0,0, 0,0,0
+        elif self.bravais == 'icosahedral':
             a,b,c,alpha,beta,gamma=inputs[0],inputs[0],inputs[0],90.0,90.0,90.0
-            psicorrection, h_correction, k_correction, l_correction =inputs[1],inputs[2],inputs[3],inputs[4]
+            psicorrection   = inputs[1]
+            chicorrection   = inputs[2]   # slot 7 → chi correction
+            thetacorrection = inputs[3]   # slot 8 → theta correction
+            h_correction = k_correction = l_correction = 0.0
             martix_indices = list(-np.r_[1:10])
             martix_indices.reverse()
             self.a11,self.a12,self.a13,self.a21,self.a22,self.a23,self.a31,self.a32,self.a33 = inputs[martix_indices] 
@@ -1670,7 +1851,10 @@ class dmsfit_ico_hkl(object):
 
         elif self.bravais == 'icosahedral_fixed_a':
             a,b,c,alpha,beta,gamma=self.lattice
-            psicorrection,h_correction, k_correction, l_correction = inputs[0], inputs[1], inputs[2], inputs[3]
+            psicorrection   = inputs[0]
+            chicorrection   = inputs[1]   # slot 7 → chi correction
+            thetacorrection = inputs[2]   # slot 8 → theta correction
+            h_correction = k_correction = l_correction = 0.0
             martix_indices = list(-np.r_[1:10])
             martix_indices.reverse()
             self.a11,self.a12,self.a13,self.a21,self.a22,self.a23,self.a31,self.a32,self.a33 = inputs[martix_indices] 
@@ -1689,7 +1873,10 @@ class dmsfit_ico_hkl(object):
                     
         elif self.bravais == 'cubic_no_strain':
             a,b,c,alpha,beta,gamma=inputs[0],inputs[0],inputs[0],90.0,90.0,90.0
-            psicorrection,h_correction, k_correction, l_correction =inputs[1], inputs[2], inputs[3], inputs[4]
+            psicorrection   = inputs[1]
+            chicorrection   = inputs[2]   # slot 7 → chi correction
+            thetacorrection = inputs[3]   # slot 8 → theta correction
+            h_correction = k_correction = l_correction = 0.0
             self.a11,self.a12,self.a13,self.a21,self.a22,self.a23,self.a31,self.a32,self.a33 = 0,0,0, 0,0,0, 0,0,0
             if self.detopt:
                 detdistancepx,detxrot,detyrot,detzrot =inputs[5],inputs[6],inputs[7],inputs[8]
@@ -1713,7 +1900,10 @@ class dmsfit_ico_hkl(object):
                 alpha = self.calibration_lattice[3]
                 beta = self.calibration_lattice[4]
                 gamma = self.calibration_lattice[5]
-                psicorrection,h_correction, k_correction, l_correction = inputs[0], inputs[1], inputs[2], inputs[3]
+                psicorrection   = inputs[0]
+                chicorrection   = inputs[1]   # slot 7 → chi correction
+                thetacorrection = inputs[2]   # slot 8 → theta correction
+                h_correction = k_correction = l_correction = 0.0
                 self.a11,self.a12,self.a13,self.a21,self.a22,self.a23,self.a31,self.a32,self.a33 = 0,0,0, 0,0,0, 0,0,0
                 if self.detopt:
                     detdistancepx,detxrot,detyrot,detzrot =inputs[4],inputs[5],inputs[6],inputs[7]
@@ -1737,6 +1927,12 @@ class dmsfit_ico_hkl(object):
         detvs=np.array(self.detvects*rotxyz([0,0,1],-detzrot).rmat()*rotxyz([0,1,0],-detyrot).rmat()*rotxyz([1,0,0],-detxrot-thb).rmat())
         irmat=rotxyz([1,0,0],detxrot+thb).rmat()*rotxyz([0,1,0],detyrot).rmat()*rotxyz([0,0,1],detzrot).rmat()
         hkllist = pilkhlrange(lattice,hkl,energy,self.hkllistrange[0],self.hkllistrange[1]).hklscan(self.hkllistrange[2])
+        if chicorrection != 0:
+            # Rotate the scan list about the chi axis (perpendicular to the
+            # primary reflection and its azimuthal reference) — same construction
+            # as the reference dmscalc.
+            chiaxis = (rotxyz(np.cross((rotxyz(self.hkl,self.psi).rmat()*np.array([self.azir]).T).T, np.array([self.hkl])),90).rmat()*np.array([self.hkl]).T).T
+            hkllist = np.array((rotxyz(chiaxis, -chicorrection).rmat()*np.array(hkllist).T).T)
         mtrx2=[self.a11,self.a12,self.a13,self.a21,self.a22,self.a23,self.a31,self.a32,self.a33]
 
         # ── Vectorised Ewald sphere calculation ─────────────────────────────
@@ -1820,8 +2016,8 @@ class dmsfit_ico_hkl(object):
         flat[~valid, 3:5] = np.nan                                        # kill non-physical solutions
 
         # ── Pixel projection ─────────────────────────────────────────────────
-        vecs1=psith2v(self.psi-mslist[:,3]-psicorrection,mslist[:,5])
-        vecs2=psith2v(self.psi-mslist[:,4]-psicorrection,mslist[:,5])
+        vecs1=psith2v(self.psi-mslist[:,3]-psicorrection,mslist[:,5]+thetacorrection)
+        vecs2=psith2v(self.psi-mslist[:,4]-psicorrection,mslist[:,5]+thetacorrection)
         vecs=np.concatenate((vecs1,vecs2),0)
         centralv=-psith2v(0,thb)*detdistancepx
         prepxvec=dms2px(detvs[0,:],detvs[1,:],centralv,vecs)
@@ -1873,16 +2069,7 @@ class dmsfit_ico_hkl(object):
     def fit(self,inputs):
         try:
             self.imcalc(inputs) # adding attribute
-            v1=np.array([[]]*4).T
-            for i1 in range(self.kernel.shape[2]):
-                sumvals,roi = msroi(self.imsim,self.kernel[:,:,i1],self.width)
-                xdata=np.arange(len(sumvals))
-                ydata=sumvals[:,0]
-                try:
-                    coef, pcov,fitpoints = fitgauss(xdata,ydata)
-                    v1=np.vstack([v1,coef])
-                except:
-                    v1=np.vstack([v1,[100,100,100,100]])
+            v1=self._simcoeffs()
             result = np.sum((v1[:,2]-self.centres[:,0])**2)
             return result
         except:
@@ -1896,48 +2083,21 @@ class dmsfit_ico_hkl(object):
         per-ROI Gaussian fit fails."""
         try:
             self.imcalc(inputs) # adding attribute
-            v1=np.array([[]]*4).T
-            for i1 in range(self.kernel.shape[2]):
-                sumvals,roi = msroi(self.imsim,self.kernel[:,:,i1],self.width)
-                xdata=np.arange(len(sumvals))
-                ydata=sumvals[:,0]
-                try:
-                    coef, pcov,fitpoints = fitgauss(xdata,ydata)
-                    v1=np.vstack([v1,coef])
-                except:
-                    v1=np.vstack([v1,[100,100,100,100]])
+            v1=self._simcoeffs()
             return v1[:,2]-self.centres[:,0]
         except:
             return np.full(self.centres.shape[0], 100.0)
 
     def stats(self,inputs):
         self.imcalc(inputs) # adding attribute
-        v1=np.array([[]]*4).T
-        for i1 in range(self.kernel.shape[2]):
-            sumvals,roi = msroi(self.imsim,self.kernel[:,:,i1],self.width)
-            xdata=np.arange(len(sumvals))
-            ydata=sumvals[:,0]
-            try:
-                coef, pcov,fitpoints = fitgauss(xdata,ydata)
-                v1=np.vstack([v1,coef])
-            except:
-                v1=np.vstack([v1,[100,100,100,100]])
+        v1=self._simcoeffs()
         pcovarray=np.array(self.pcov)
         return np.abs((v1[:,2]-self.coefs[:,2])),pcovarray[:,2,2]
 
     def full(self,inputs):
         try:
             self.imcalc(inputs) # adding attribute
-            v1=np.array([[]]*4).T
-            for i1 in range(self.kernel.shape[2]):
-                sumvals,roi = msroi(self.imsim,self.kernel[:,:,i1],self.width)
-                xdata=np.arange(len(sumvals))
-                ydata=sumvals[:,0]
-                try:
-                    coef, pcov,fitpoints = fitgauss(xdata,ydata)
-                    v1=np.vstack([v1,coef])
-                except:
-                    v1=np.vstack([v1,[100,100,100,100]])
+            v1=self._simcoeffs()
             result = np.sum((v1[:,2]-self.centres[:,0])**2)
             return result,self.imsim, self.dmsindex, self.imdata, self.inputarray
         except:

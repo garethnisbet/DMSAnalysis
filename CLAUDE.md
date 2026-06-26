@@ -50,8 +50,8 @@ Each app reads a JSON config (passed as an argument, or the `configs/` default).
 | `display` | `zoomval` (1 or 2), `colourlim`, `colmap` — image display settings |
 | `roi` | `width_per_zoom`, `comwidth_per_zoom` — ROI extraction widths (scaled by `zoomval`) |
 | `geometry` | `hkl`, `psi`, `px_unscaled`, `py_unscaled` — primary reflection and detector origin |
-| `computation` | `numsteps`, `simsigma_per_zoom`, `thrange_delta`, `bravais`, `opt_method`, `tolerance` |
-| `crystal` | `lattice2`, `initial_guess_base`, `ref_6d` — starting parameters and 6D reference reflections |
+| `computation` | `numsteps`, `simsigma_per_zoom`, `thrange_delta`, `bravais`, `opt_method`, `peak_method` (`gauss`/`centroid`), `tolerance` |
+| `crystal` | `lattice2`, `initial_guess_base`, `ref_6d` (quasicrystal 6D reflections) **or** `reflist_hkl` (conventional 3-index reflections) — starting parameters and reference reflections |
 | `manual_centres` | Dict of `"roi_index": pixel_position` overrides for poorly fitted ROI centres |
 | `paths` | `cif_file` — path to CIF file used by `loadcif()` |
 
@@ -71,6 +71,41 @@ Each app reads a JSON config (passed as an argument, or the `configs/` default).
 ```
 
 The `bravais` flag selects which subset of indices are passed to the optimiser. For `icosahedral`, parameters [0, 6–9, 10–13, 15–23] (with optional energy) are optimised; lattice parameters 1–5 are locked by symmetry.
+
+## Conventional crystals
+
+The same engine and apps also handle **ordinary (non-quasicrystal) crystals**
+indexed with plain 3-element Miller indices `[h,k,l]`. Set `computation.bravais`
+to one of the 7 standard crystal systems and supply reflections as a 3-index
+list:
+
+```
+cubic  tetragonal  orthorhombic  monoclinic  rhombohedral  hexagonal  triclinic
+```
+
+In this mode there is **no cut-and-projection and no phason matrix** — the
+perpendicular reflection component and the phason block (indices 15–23) are held
+at zero, and the lattice slots [0–5] = `[a,b,c,α,β,γ]` carry the real cell. Each
+system frees only its symmetry-allowed lattice parameters (e.g. tetragonal frees
+`a` and `c` and forces `b=a, α=β=γ=90`; monoclinic uses the b-unique setting with
+free `β`). The free-parameter mapping is table-driven in
+`ts_quasi.py`: `CONVENTIONAL_SYSTEMS`, `lattice_free_slots`, `expand_lattice`,
+`reduced_param_indices`, and `hklgen_3d` (the 3D analogue of the 6D reflection
+generator), all shared by `slider.py` and `fit.py` so the parameter packing
+cannot drift.
+
+Reflections are supplied via `crystal.reflist_hkl` (a list of `[h,k,l]`), the
+depth-based generator (`hklgen_3d` / the slider's **Auto reflist** + **Depth**),
+or the slider's **Geo 3-click** identify — exactly as for the quasicrystal, but
+with 3-element vectors. See
+`configs/fit_conventional_tetragonal_PMN_PT_example.json` for a worked example.
+
+In the slider, the **Crystal type** dropdown switches the active mode at runtime
+between Icosahedral (and the `icosahedral_fixed_a` / `cubic_no_strain` variants)
+and the 7 conventional systems. Switching rebuilds the lattice sliders for the
+new symmetry and regenerates the reflection list; because 6D and 3-index
+reflections are incompatible, the current selection is cleared. `fit.py` (batch)
+takes its mode from `computation.bravais` in the config.
 
 ## Processing output
 
