@@ -266,7 +266,7 @@ CRYSTAL_TYPE_CHOICES = [
     ('Cubic',                      'cubic'),
     ('Tetragonal',                 'tetragonal'),
     ('Orthorhombic',               'orthorhombic'),
-    ('Monoclinic (b-unique)',      'monoclinic'),
+    ('Monoclinic',                 'monoclinic'),
     ('Rhombohedral',               'rhombohedral'),
     ('Hexagonal',                  'hexagonal'),
     ('Triclinic',                  'triclinic'),
@@ -303,33 +303,46 @@ def filter_6d_by_thresh(ref_6d_arr, thresh):
     return ref_6d_arr[np.any(np.abs(ref_6d_arr) >= thresh, axis=1)]
 
 # ── shared _hkl engine (same as workflow.py / dmsfit_ico_hkl) ────────────────────
-def reduced_slots():
-    """The 24-element-guess indices that make up the reduced parameter vector,
-    keyed on the bravais / detoptimize / energyopt flags (identical to the
-    workflow).  extract_reduced() = full_ig[reduced_slots()]."""
-    if CONVENTIONAL:
-        return list(ts.reduced_param_indices(bravais, bool(detoptimize), bool(energyopt)))
-    if bravais == 'icosahedral':
-        if detoptimize:
+def reduced_slots_for(bravais_, detopt, energyopt):
+    """The 24-element-guess indices that make up the reduced parameter vector for
+    a given mode.  Keyed on its own bravais/detopt/energyopt (not the globals) so
+    a stale engine and the current mode can't disagree on the vector length."""
+    detopt = bool(detopt); energyopt = bool(energyopt)
+    if bravais_ in ts.CONVENTIONAL_SYSTEMS:
+        return list(ts.reduced_param_indices(bravais_, detopt, energyopt))
+    if bravais_ == 'icosahedral':
+        if detopt:
             return ([0,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] if energyopt
                     else [0,6,7,8,9,10,11,12,13,15,16,17,18,19,20,21,22,23])
         return ([0,6,7,8,9,14,15,16,17,18,19,20,21,22,23] if energyopt
                 else [0,6,7,8,9,15,16,17,18,19,20,21,22,23])
-    elif bravais == 'icosahedral_fixed_a':
-        if detoptimize:
+    elif bravais_ == 'icosahedral_fixed_a':
+        if detopt:
             return ([6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] if energyopt
                     else [6,7,8,9,10,11,12,14,15,16,17,18,19,20,21,22,23])
         return ([6,7,8,13,14,15,16,17,18,19,20,21,22,23] if energyopt
                 else [6,7,8,14,15,16,17,18,19,20,21,22,23])
-    elif bravais == 'cubic_no_strain':
-        if detoptimize:
+    elif bravais_ == 'cubic_no_strain':
+        if detopt:
             return [0,6,7,8,9,10,11,12,13] if energyopt else [0,6,7,8,9,10,11,12]
         return [0,6,7,8,13] if energyopt else [0,6,7,8]
-    raise ValueError('Unknown bravais: %s' % bravais)
+    raise ValueError('Unknown bravais: %s' % bravais_)
+
+def reduced_slots():
+    """Reduced-vector slots for the current (global) mode."""
+    return reduced_slots_for(bravais, detoptimize, energyopt)
 
 def extract_reduced(full_ig):
-    """Reduced parameter vector consumed by dmsfit_ico_hkl.imcalc."""
+    """Reduced parameter vector consumed by dmsfit_ico_hkl.imcalc (current mode)."""
     return np.asarray(full_ig, dtype=float)[reduced_slots()]
+
+def reduced_for_engine(dms, full_ig):
+    """Reduced parameter vector matched to a specific engine's own mode, so an
+    in-flight worker pass on a stale engine can't crash on a length mismatch."""
+    return np.asarray(full_ig, dtype=float)[
+        reduced_slots_for(getattr(dms, 'bravais', bravais),
+                          getattr(dms, 'detopt', detoptimize),
+                          getattr(dms, 'energyopt', energyopt))]
 
 def make_overlay_dms(reflist_, reflist2_, hkl_, imdata_, psirange_, thrange_,
                      azir_, psi_, px_, py_, ig):
@@ -564,8 +577,6 @@ class UpdateWorker(QtCore.QThread):
 
             self.idle.clear()
             try:
-                reduced = extract_reduced(ig)
-
                 def _push(dms, last):
                     # The _hkl engine recomputes hkllist internally from self.hkl,
                     # so we only push the current hkl / energy.
@@ -576,9 +587,11 @@ class UpdateWorker(QtCore.QThread):
                         dms.energy = ig[14]
 
                 # Discovery overlay: scatter of the whole slice + per-reflection
-                # lines (used for click-to-select hit-testing).
+                # lines (used for click-to-select hit-testing).  Build the reduced
+                # vector from each engine's own mode so a crystal-type switch
+                # in flight can't cause a length mismatch.
                 _push(dms_ref, last_hkl_ref)
-                dms_ref.imcalc(reduced)
+                dms_ref.imcalc(reduced_for_engine(dms_ref, ig))
                 dmsindex = dms_ref.dmsindex
                 if len(dmsindex) == 2 and len(dmsindex[0]) > 0:
                     rows = np.asarray(dmsindex[0]).astype(float)
@@ -592,7 +605,7 @@ class UpdateWorker(QtCore.QThread):
                 sel_lines = []
                 if sel_dms is not None:
                     _push(sel_dms, sel_last_hkl)
-                    sel_dms.imcalc(reduced)
+                    sel_dms.imcalc(reduced_for_engine(sel_dms, ig))
                     sel_lines = [(np.copy(x), np.copy(y))
                                  for x, y in (getattr(sel_dms, 'dmslines', None) or [])]
 
@@ -976,32 +989,36 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._lbl_scan_path.setFont(f_sp)
         sbl.addWidget(self._lbl_scan_path, 0, 0, 1, 4)
 
-        btn_browse = QtWidgets.QPushButton('Browse…')
-        btn_browse.clicked.connect(self._on_browse_scan)
-        sbl.addWidget(btn_browse, 1, 0)
+        # All scan actions on a single row.
+        _btn_row = QtWidgets.QHBoxLayout()
+        _btn_row.setSpacing(4)
+        _scan_btns = [
+            ('Browse…',     self._on_browse_scan, None,
+             'Choose a .dat scan file'),
+            ('View .dat',   self._on_view_dat, None,
+             'Show the raw ASCII contents of the loaded .dat scan file'),
+            ('Load Scan',   self._on_load_scan, 'background: #102020; color: #aaffff',
+             'Load the selected .dat scan and detector image'),
+            ('← Prev',      self._on_prev_scan, 'background: #102020; color: #aaffff',
+             'Decrement the scan number and load <scannum-1>.dat'),
+            ('Next →',      self._on_next_scan, 'background: #102020; color: #aaffff',
+             'Increment the scan number and load <scannum+1>.dat'),
+        ]
+        for _txt, _slot, _style, _tip in _scan_btns:
+            _b = QtWidgets.QPushButton(_txt)
+            if _style:
+                _b.setStyleSheet(_style)
+            _b.setToolTip(_tip)
+            _b.clicked.connect(_slot)
+            _btn_row.addWidget(_b)
+        sbl.addLayout(_btn_row, 1, 0, 1, 4)
 
-        btn_view_dat = QtWidgets.QPushButton('View .dat')
-        btn_view_dat.setToolTip('Show the raw ASCII contents of the loaded .dat scan file')
-        btn_view_dat.clicked.connect(self._on_view_dat)
-        sbl.addWidget(btn_view_dat, 1, 1)
-
-        sbl.addWidget(QtWidgets.QLabel('dp0'), 1, 2)
+        # dp0 / dp on their own row.
+        sbl.addWidget(QtWidgets.QLabel('dp0'), 2, 0)
         self._sb_dp0 = QtWidgets.QSpinBox()
         self._sb_dp0.setRange(0, 9999)
         self._sb_dp0.setValue(self._datapoint0)
-        sbl.addWidget(self._sb_dp0, 1, 3)
-
-        btn_load_scan = QtWidgets.QPushButton('Load Scan')
-        btn_load_scan.setStyleSheet('background: #102020; color: #aaffff')
-        btn_load_scan.setToolTip('Load the selected .dat scan and detector image')
-        btn_load_scan.clicked.connect(self._on_load_scan)
-        sbl.addWidget(btn_load_scan, 2, 0)
-
-        btn_next_scan = QtWidgets.QPushButton('Next scan →')
-        btn_next_scan.setStyleSheet('background: #102020; color: #aaffff')
-        btn_next_scan.setToolTip('Increment the scan number and load <scannum+1>.dat')
-        btn_next_scan.clicked.connect(self._on_next_scan)
-        sbl.addWidget(btn_next_scan, 2, 1)
+        sbl.addWidget(self._sb_dp0, 2, 1)
 
         sbl.addWidget(QtWidgets.QLabel('dp'), 2, 2)
         self._sb_dp = QtWidgets.QSpinBox()
@@ -1137,17 +1154,29 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._crystal_combo = QtWidgets.QComboBox()
         for _disp, _name in CRYSTAL_TYPE_CHOICES:
             self._crystal_combo.addItem(_disp, _name)
-        _ci = self._crystal_combo.findData(bravais)
-        if _ci < 0:   # launched with a mode not in the list — keep it, don't switch
-            self._crystal_combo.insertItem(0, bravais, bravais)
-            _ci = 0
-        self._crystal_combo.setCurrentIndex(_ci)
         self._crystal_combo.setToolTip(
             'Switch between the icosahedral quasicrystal (6D reflections + phason) '
             'and conventional crystal systems (3-index reflections, symmetry-'
             'constrained lattice). Changing this clears the reflection selection.')
+        # Unique-axis selector (tetragonal: which axis is unique; monoclinic:
+        # which angle is the non-90 one).  Hidden for the other systems.
+        self._axis_combo = QtWidgets.QComboBox()
+        self._axis_combo.setToolTip('Tetragonal: unique axis · Monoclinic: '
+                                    'non-90° angle')
+        self._apply_crystal_combos(bravais)   # set both combos from launch mode
         self._crystal_combo.currentIndexChanged.connect(self._on_crystal_type_changed)
-        ct_l.addWidget(self._crystal_combo)
+        self._axis_combo.currentIndexChanged.connect(self._on_axis_changed)
+        # Keep the selected reflections across compatible crystal-type changes.
+        self._chk_keep_refs = QtWidgets.QCheckBox('Keep refs')
+        self._chk_keep_refs.setChecked(True)
+        self._chk_keep_refs.setToolTip(
+            'Keep the selected reflections when switching between compatible '
+            'crystal types (both conventional 3-index, or both icosahedral 6D). '
+            'Switching across the quasicrystal/conventional boundary always '
+            'clears them — 6D and 3-index reflections are incompatible.')
+        ct_l.addWidget(self._crystal_combo, 1)
+        ct_l.addWidget(self._axis_combo, 1)
+        ct_l.addWidget(self._chk_keep_refs)
         ctrl_col.addWidget(ct_box)
 
         # Sliders in scroll area
@@ -1449,23 +1478,95 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._populate_sliders()
         self._suppress = False
 
+    @staticmethod
+    def _split_bravais(b):
+        """Split a bravais value into (base, axis-suffix), e.g. 'tetragonal_a' ->
+        ('tetragonal', '_a').  Only tetragonal/monoclinic have variants."""
+        for base in ('tetragonal', 'monoclinic'):
+            if b == base:
+                return base, ''
+            if b.startswith(base + '_'):
+                return base, b[len(base):]
+        return b, ''
+
+    @staticmethod
+    def _axis_options(base):
+        """(label, suffix) options for the unique-axis combo, per base system."""
+        if base == 'tetragonal':
+            return [('unique c', ''), ('unique a', '_a'), ('unique b', '_b')]
+        if base == 'monoclinic':
+            return [('β ≠ 90', ''), ('α ≠ 90', '_a'),
+                    ('γ ≠ 90', '_c')]
+        return []
+
+    def _refresh_axis_combo(self, base, suffix=''):
+        """Repopulate the unique-axis combo for the given base system, selecting
+        the given suffix; hidden when the base has no axis choice."""
+        self._axis_combo.blockSignals(True)
+        self._axis_combo.clear()
+        opts = self._axis_options(base)
+        if opts:
+            for _disp, _suf in opts:
+                self._axis_combo.addItem(_disp, _suf)
+            j = self._axis_combo.findData(suffix)
+            self._axis_combo.setCurrentIndex(j if j >= 0 else 0)
+        self._axis_combo.setVisible(bool(opts))
+        self._axis_combo.blockSignals(False)
+
+    def _apply_crystal_combos(self, b):
+        """Set the crystal-type and unique-axis combos to reflect bravais ``b``
+        (no signals emitted)."""
+        base, suffix = self._split_bravais(b)
+        self._crystal_combo.blockSignals(True)
+        i = self._crystal_combo.findData(base)
+        if i < 0:   # a mode not in the list — keep it, don't switch
+            self._crystal_combo.insertItem(0, base, base)
+            i = 0
+        self._crystal_combo.setCurrentIndex(i)
+        self._crystal_combo.blockSignals(False)
+        self._refresh_axis_combo(base, suffix)
+
+    def _effective_bravais(self):
+        """Bravais value combining the crystal-type and unique-axis combos."""
+        base = self._crystal_combo.currentData()
+        if base is None:
+            return None
+        suffix = self._axis_combo.currentData() if self._axis_combo.count() else ''
+        return base + (suffix or '')
+
     def _on_crystal_type_changed(self, _idx=None):
-        name = self._crystal_combo.currentData()
-        if name:
-            self._set_crystal_system(name)
+        base = self._crystal_combo.currentData()
+        if base is None:
+            return
+        self._refresh_axis_combo(base)   # default axis for the new base
+        eff = self._effective_bravais()
+        if eff:
+            self._set_crystal_system(eff)
+
+    def _on_axis_changed(self, _idx=None):
+        eff = self._effective_bravais()
+        if eff:
+            self._set_crystal_system(eff)
 
     def _set_crystal_system(self, name):
         """Switch the active crystal mode (Ico / conventional Bravais system) at
         runtime: re-key the global mode flags, rebuild the slider panel and the
-        reflection list, and redraw.  6D and 3-index reflections are
-        incompatible, so the current selection is cleared."""
+        reflection list, and redraw.  The selected reflections are kept when the
+        new mode uses the same reflection representation (both conventional, or
+        both icosahedral) and 'Keep refs' is on; otherwise they are cleared (6D
+        and 3-index reflections are incompatible)."""
         global bravais, CONVENTIONAL, slider_defs, ref_manual
         if name == bravais:
             return
+        was_conventional = CONVENTIONAL
         bravais      = name
         CONVENTIONAL = name in ts.CONVENTIONAL_SYSTEMS
         slider_defs  = build_slider_defs(bravais, CONVENTIONAL)
         ref_manual   = reflist_hkl_manual if CONVENTIONAL else ref_6d_manual
+
+        keep_refs = (getattr(self, '_chk_keep_refs', None) is not None
+                     and self._chk_keep_refs.isChecked()
+                     and was_conventional == CONVENTIONAL)
 
         # Reconcile the lattice representation carried in the guess vector.
         if CONVENTIONAL:
@@ -1474,10 +1575,26 @@ class DMSSlider(QtWidgets.QMainWindow):
             self.ig[1] = self.ig[2] = self.ig[0]
             self.ig[3] = self.ig[4] = self.ig[5] = 90.0
 
+        # Built curves / fit belong to the previous mode's parameter set —
+        # invalidate them so a stale engine isn't reused.
+        self._fit_dms = None
+        self._kernel = self._centres = None
+        self._reflist_fit = self._reflist2_fit = self._ref_6d_fit = None
+        self._last_res_x = None
+        self._last_fit_info = None
+        if getattr(self, '_btn_save_fit', None) is not None:
+            self._btn_save_fit.setEnabled(False)
+        self._init_line_plot()
+
         # Rebuild the slider panel FIRST so self._sliders matches the new
         # slider_defs before anything (clear/redraw) calls _sync_ig.
         self._rebuild_sliders()     # new free-parameter slider set
-        self._on_clear_picks()      # drop now-incompatible reflections
+        if keep_refs:
+            # Keep the selection; re-trace it in the new mode's geometry (rebuild
+            # the selected engine before the redraw below).
+            self._rebuild_selected_engine()
+        else:
+            self._on_clear_picks()  # drop now-incompatible reflections
         self._regenerate_reflist()  # new reflist (6D/3D) + overlay slice + redraw
         # Arc-tracing engine for the new mode (uses the regenerated full reflist).
         self._dms_full = make_overlay_dms(
@@ -2297,6 +2414,8 @@ class DMSSlider(QtWidgets.QMainWindow):
             'scannum':        int(self._scannum),
             'datapoint':      int(self._datapoint),
             'hkl':            self._hkl.tolist(),
+            'px':             float(self._px),
+            'py':             float(self._py),
             'initial_guess':  self.ig.tolist(),
             'ref_6d':         ref_6d,
             'ref_6d_checked': ref_6d_checked,
@@ -2400,15 +2519,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         #    geometry and reflections below are applied.
         saved_bravais = data.get('bravais')
         if saved_bravais and saved_bravais != bravais:
-            combo = getattr(self, '_crystal_combo', None)
-            if combo is not None:
-                combo.blockSignals(True)
-                _i = combo.findData(saved_bravais)
-                if _i < 0:
-                    combo.insertItem(0, saved_bravais, saved_bravais)
-                    _i = 0
-                combo.setCurrentIndex(_i)
-                combo.blockSignals(False)
+            if getattr(self, '_crystal_combo', None) is not None:
+                self._apply_crystal_combos(saved_bravais)
             self._set_crystal_system(saved_bravais)
 
         # 1. Reload the scan/image, if the session records one.  Do this first so
@@ -2433,10 +2545,16 @@ class DMSSlider(QtWidgets.QMainWindow):
             except Exception as e:
                 self._status.setText('Scan reload failed: %s' % str(e)[:60])
 
-        # 2. Restore sliders / ig / hkl.  The slider is now 24-element (psi/h/k/l);
-        #    migrate a legacy 23-element state (psi/theta/chi, no kcor) by inserting
-        #    kcor=0 at index 8 and zeroing the old theta/chi values (no equivalent
-        #    in the index model).
+        # 2. Restore sliders / ig / hkl.  The beam centre (px/py) is not part of
+        #    the .dat metadata, so it is restored from the session here (set before
+        #    the slider loop, which reads self._px / self._py for the px/py sliders).
+        if data.get('px') is not None:
+            self._px = float(data['px'])
+        if data.get('py') is not None:
+            self._py = float(data['py'])
+        #    The slider is now 24-element (psi/h/k/l); migrate a legacy 23-element
+        #    state (psi/theta/chi, no kcor) by inserting kcor=0 at index 8 and
+        #    zeroing the old theta/chi values (no equivalent in the index model).
         ig_loaded  = np.array(data.get('initial_guess', self.ig), dtype=float)
         if ig_loaded.size == 23:
             ig_loaded = np.insert(ig_loaded, 8, 0.0)   # insert kcor
@@ -2592,13 +2710,16 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._status.setText('Load failed: %s' % str(e)[:70])
             import traceback; traceback.print_exc()
 
-    def _on_next_scan(self):
-        """Increment the scan number and load <scannum+1>.dat from the same folder."""
-        nxt  = int(self._scannum) + 1
-        path = os.path.join(self._scanpath, str(nxt) + '.dat')
+    def _step_scan(self, delta):
+        """Load <scannum+delta>.dat from the same folder (delta = +1 next, -1 prev)."""
+        num = int(self._scannum) + delta
+        if num < 0:
+            self._status.setText('No scan %d' % num)
+            return
+        path = os.path.join(self._scanpath, str(num) + '.dat')
         if not os.path.exists(path):
-            self._status.setText('No next scan: %s not found'
-                                 % os.path.basename(path))
+            self._status.setText('Scan %d not found (%s)'
+                                 % (num, os.path.basename(path)))
             return
         self._pending_scan_path = path
         self._lbl_scan_path.setText(os.path.basename(path))
@@ -2615,13 +2736,19 @@ class DMSSlider(QtWidgets.QMainWindow):
             sb.setRange(0, hi)
             sb.setValue(v)
             sb.blockSignals(False)
-        self._status.setText('Loading scan %d…' % nxt)
+        self._status.setText('Loading scan %d…' % num)
         QtWidgets.QApplication.processEvents()
         try:
             self._do_load_scan(path, dp, dp0)
         except Exception as e:
             self._status.setText('Load failed: %s' % str(e)[:70])
             import traceback; traceback.print_exc()
+
+    def _on_next_scan(self):
+        self._step_scan(+1)
+
+    def _on_prev_scan(self):
+        self._step_scan(-1)
 
     def _on_view_dat(self):
         """Show the raw ASCII contents of the loaded .dat scan in a dialog."""
@@ -2639,12 +2766,55 @@ class DMSSlider(QtWidgets.QMainWindow):
         dlg.setWindowTitle(os.path.basename(str(path)))
         dlg.resize(900, 640)
         lay = QtWidgets.QVBoxLayout(dlg)
+
         edit = QtWidgets.QPlainTextEdit()
         edit.setReadOnly(True)
         edit.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         f = edit.font(); f.setFamily('monospace'); f.setPointSize(8); edit.setFont(f)
         edit.setPlainText(text)
+
+        # ── Search bar (Ctrl+F) ─────────────────────────────────────────────────
+        srow = QtWidgets.QHBoxLayout()
+        srow.addWidget(QtWidgets.QLabel('Find:'))
+        search = QtWidgets.QLineEdit()
+        search.setPlaceholderText('Ctrl+F to search · Enter = next · Shift+Enter = prev')
+        srow.addWidget(search, 1)
+        btn_prev = QtWidgets.QPushButton('◀'); btn_prev.setFixedWidth(30)
+        btn_next = QtWidgets.QPushButton('▶'); btn_next.setFixedWidth(30)
+        srow.addWidget(btn_prev); srow.addWidget(btn_next)
+        lay.addLayout(srow)
         lay.addWidget(edit, 1)
+
+        def do_find(backward=False):
+            term = search.text()
+            if not term:
+                return
+            flags = QtGui.QTextDocument.FindFlags()
+            if backward:
+                flags |= QtGui.QTextDocument.FindBackward
+            if not edit.find(term, flags):
+                # wrap around to the start (or end) and try once more
+                cur = edit.textCursor()
+                cur.movePosition(QtGui.QTextCursor.End if backward
+                                 else QtGui.QTextCursor.Start)
+                edit.setTextCursor(cur)
+                found = edit.find(term, flags)
+                search.setStyleSheet('' if found else 'background:#5c2a2a')
+            else:
+                search.setStyleSheet('')
+
+        def on_return():
+            do_find(bool(QtWidgets.QApplication.keyboardModifiers()
+                         & QtCore.Qt.ShiftModifier))
+
+        search.returnPressed.connect(on_return)
+        search.textChanged.connect(lambda _t: search.setStyleSheet(''))
+        btn_next.clicked.connect(lambda: do_find(False))
+        btn_prev.clicked.connect(lambda: do_find(True))
+
+        sc = QtWidgets.QShortcut(QtGui.QKeySequence.Find, dlg)
+        sc.activated.connect(lambda: (search.setFocus(), search.selectAll()))
+
         btn = QtWidgets.QPushButton('Close')
         btn.clicked.connect(dlg.accept)
         lay.addWidget(btn)

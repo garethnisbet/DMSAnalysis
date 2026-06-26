@@ -41,19 +41,26 @@ TAU =  0.5+0.5*5**0.5
 # of the 24-element guess vector (the same slots the icosahedral path reserves);
 # the phason slots [15..23] are unused for conventional crystals.
 
-CONVENTIONAL_SYSTEMS = ('cubic', 'tetragonal', 'orthorhombic', 'monoclinic',
+CONVENTIONAL_SYSTEMS = ('cubic', 'tetragonal', 'tetragonal_a', 'tetragonal_b',
+                        'orthorhombic', 'monoclinic', 'monoclinic_a', 'monoclinic_c',
                         'rhombohedral', 'hexagonal', 'triclinic')
 
 # Which lattice slots [a,b,c,alpha,beta,gamma] are free (refined) per system.
-# monoclinic uses the standard b-unique setting (beta != 90).
+# Tetragonal defaults to the unique-c setting (a=b); the *_a / *_b variants make
+# a or b the unique axis.  Monoclinic defaults to b-unique (beta != 90); the
+# *_a / *_c variants make alpha or gamma the non-90 angle.
 _LATTICE_FREE_SLOTS = {
-    'cubic':        [0],
-    'tetragonal':   [0, 2],
-    'hexagonal':    [0, 2],
-    'orthorhombic': [0, 1, 2],
-    'monoclinic':   [0, 1, 2, 4],
-    'rhombohedral': [0, 3],
-    'triclinic':    [0, 1, 2, 3, 4, 5],
+    'cubic':         [0],
+    'tetragonal':    [0, 2],        # unique c  (a=b)
+    'tetragonal_a':  [0, 1],        # unique a  (b=c)
+    'tetragonal_b':  [0, 1],        # unique b  (a=c)
+    'hexagonal':     [0, 2],
+    'orthorhombic':  [0, 1, 2],
+    'monoclinic':    [0, 1, 2, 4],  # beta  != 90 (b unique)
+    'monoclinic_a':  [0, 1, 2, 3],  # alpha != 90 (a unique)
+    'monoclinic_c':  [0, 1, 2, 5],  # gamma != 90 (c unique)
+    'rhombohedral':  [0, 3],
+    'triclinic':     [0, 1, 2, 3, 4, 5],
 }
 
 
@@ -74,14 +81,22 @@ def expand_lattice(system, six):
                                    float(six[3]), float(six[4]), float(six[5]))
     if system == 'cubic':
         return [a, a, a, 90.0, 90.0, 90.0]
-    elif system == 'tetragonal':
+    elif system == 'tetragonal':       # unique c
         return [a, a, c, 90.0, 90.0, 90.0]
+    elif system == 'tetragonal_a':     # unique a  (b=c, both = slot 1)
+        return [a, b, b, 90.0, 90.0, 90.0]
+    elif system == 'tetragonal_b':     # unique b  (a=c)
+        return [a, b, a, 90.0, 90.0, 90.0]
     elif system == 'hexagonal':
         return [a, a, c, 90.0, 90.0, 120.0]
     elif system == 'orthorhombic':
         return [a, b, c, 90.0, 90.0, 90.0]
-    elif system == 'monoclinic':
+    elif system == 'monoclinic':       # beta unique
         return [a, b, c, 90.0, beta, 90.0]
+    elif system == 'monoclinic_a':     # alpha unique
+        return [a, b, c, alpha, 90.0, 90.0]
+    elif system == 'monoclinic_c':     # gamma unique
+        return [a, b, c, 90.0, 90.0, gamma]
     elif system == 'rhombohedral':
         return [a, a, a, alpha, alpha, alpha]
     elif system == 'triclinic':
