@@ -7,9 +7,23 @@ physical reciprocal vector is `h + h′·τ` (τ = golden ratio). The main quant
 being refined is the **phason strain** — a 3×3 matrix coupling the
 perpendicular-space component of each reflection.
 
-The package provides a core geometry/fitting library plus two applications:
-an interactive GUI (the slider — refine geometry, build integrated curves, then
-fit) and a batch fitting script.
+The same engine also fits **ordinary (non-quasicrystal) crystals** indexed with
+plain 3-index Miller reflections and constrained by crystal system, including
+support for the **pseudo-cubic indexing ambiguity** (re-indexing by any of the 12
+equivalent matrices of Nisbet et al., 2023).
+
+The package provides a core geometry/fitting library plus four applications, in
+two families:
+
+- **Image-based** (match predicted multiple-scattering streaks in a detector
+  image): `slider` — an interactive GUI to refine geometry, build integrated
+  curves, then fit; and `fit` — the batch equivalent.
+- **Image-free** (match the multiple-diffraction geometry directly, via the
+  coincidence of Kossel lines on the stereographic projection): `tripslider` — an
+  interactive GUI; and `tripfit` — the batch equivalent. These refine a
+  conventional lattice by driving secondary-reflection triples to a common
+  triple-intersection point, the sensitive probe for small lattice distortions of
+  pseudo-symmetric crystals.
 
 ## Installation
 
@@ -17,7 +31,7 @@ No build step. Clone the repository and run from its root. Requirements:
 
 ```
 numpy  scipy  matplotlib  Pillow  shapely  imageio  joblib
-PyQt5  pyqtgraph          # for the slider GUI
+PyQt5  pyqtgraph          # for the slider / tripslider GUIs
 cctbx                     # optional, only for loadcif() when autoreflist=1
 ```
 
@@ -31,17 +45,23 @@ All apps run as modules from the repository root and accept an optional config
 path (falling back to the example config in `DMSAnalysis/configs/`):
 
 ```bash
-# Interactive GUI — refine geometry, build integrated curves, then fit
+# Image-based interactive GUI — refine geometry, build integrated curves, then fit
 python -m DMSAnalysis.slider [config.json]
 
-# Batch fivefold-axis fitting (non-interactive)
+# Image-based batch fitting (non-interactive)
 python -m DMSAnalysis.fit [config.json]
+
+# Image-free multiple-intersection GUI — refine a lattice from Kossel-line triples
+python -m DMSAnalysis.tripslider [config.json]
+
+# Image-free multiple-intersection batch fit
+python -m DMSAnalysis.tripfit [config.json]
 
 # Convert a Diamond .dat scan file into a config (the only .dat reader)
 python -m DMSAnalysis.dat2config scan.dat out.json --datapoint N --datapoint0 M
 ```
 
-Typical flow in the **slider** (the single interactive app):
+Typical flow in the **slider** (image-based):
 1. Refine geometry with the sliders over the detector image.
 2. Click arcs to select reflections; check/uncheck them in the list.
 3. **Build curves** — integrate the ROIs for the checked reflections.
@@ -50,6 +70,29 @@ Typical flow in the **slider** (the single interactive app):
 **Save config** writes the current state (incl. selected reflections) for batch
 runs via `python -m DMSAnalysis.fit`. The config is the single source of truth —
 once the `experiment` block is populated, the apps never read the `.dat` again.
+
+Typical flow in the **tripslider** (image-free):
+1. Add or edit triple intersections in the **Triple intersections** table (each
+   row is three secondary reflections that should meet at one point).
+2. Drag the free lattice / ψ sliders and watch each triple's Kossel lines and its
+   residual update live on a stereographic panel; switch crystal system from the
+   dropdown.
+3. **Fit** — run the optimiser in the background (**Stop** to interrupt).
+4. **Save config** to re-run the exact setup in `python -m DMSAnalysis.tripfit`.
+
+### Conventional crystals and pseudo-cubic re-indexing
+
+For an ordinary crystal, set `computation.bravais` to a standard system (`cubic`,
+`tetragonal`, `orthorhombic`, `monoclinic`, `rhombohedral`, `hexagonal`,
+`triclinic`) and supply 3-index reflections via `crystal.reflist_hkl`. To test the
+equivalent pseudo-cubic indexing choices, set `computation.pseudocubic_transform`
+(1–12; 1 = identity) — this re-indexes the primary reflection, azimuthal
+reference and reflection list by the chosen matrix from Table 1 of
+[Nisbet et al. (2023), *J. Appl. Cryst.* **56**, 1046–1050](https://doi.org/10.1107/S1600576723004120).
+The slider also exposes a **Pseudo-cubic M** dropdown that applies these live. The
+12 matrices are a coset decomposition (verifiable via
+`ts_quasi.verify_pseudocubic_transforms`; tests in
+`DMSAnalysis/tests/test_pseudocubic.py`).
 
 ### Using the library
 
@@ -71,16 +114,19 @@ DMS/                          # repository root
 │   ├── loader.py             # reads Diamond .dat scan files
 │   ├── dat2config.py         # extracts scan metadata from a .dat into a config
 │   ├── config_table.py       # shared editable Qt table view of a config
-│   ├── slider.py             # the GUI: refine → build curves → fit
-│   ├── fit.py                # batch fivefold-axis fitting
+│   ├── slider.py             # image-based GUI: refine → build curves → fit
+│   ├── fit.py                # image-based batch fitting
+│   ├── tripfit.py            # image-free multiple-intersection batch lattice fit
+│   ├── tripslider.py         # image-free multiple-intersection GUI
 │   ├── configs/              # example JSON configs
+│   ├── tests/                # self-verification tests (e.g. pseudo-cubic matrices)
 │   └── README.md             # library API reference
 └── Processing/               # timestamped run snapshots (created in CWD when save=1)
 ```
 
 ## Configuration
 
-Each app reads a JSON config. Key sections:
+The **image-based** apps (`slider`, `fit`) read a JSON config with these sections:
 
 | Section | Purpose |
 |---------|---------|
@@ -89,18 +135,28 @@ Each app reads a JSON config. Key sections:
 | `geometry` | `hkl`, `psi`, `px_unscaled`, `py_unscaled`, `scatv` — primary reflection and detector origin |
 | `display` | `zoomval`, `colourlim`, `colmap` — image display |
 | `roi` | `width_per_zoom`, `comwidth_per_zoom` — ROI extraction widths |
-| `computation` | `numsteps`, `simsigma_per_zoom`, `thrange_delta`, `bravais`, `opt_method`, `tolerance` |
-| `crystal` | `lattice2`, `initial_guess_base` (24-element vector), `ref_6d` — starting parameters |
+| `computation` | `numsteps`, `simsigma_per_zoom`, `thrange_delta`, `bravais`, `pseudocubic_transform` (conventional only), `opt_method`, `tolerance` |
+| `crystal` | `lattice2`, `initial_guess_base` (24-element vector), `ref_6d` (6D) **or** `reflist_hkl` (3-index) — starting parameters |
 | `flags` | `save`, `fit`, `firstplot`, `detoptimize`, `energyopt` — run controls |
 | `paths` | `cif_file` — CIF used by `loadcif()` when `autoreflist=1` |
 
-See [`CLAUDE.md`](CLAUDE.md) for the parameter-vector index map and developer notes.
+The **image-free** apps (`tripfit`, `tripslider`) read a lighter, separate schema
+(no `scan`/`roi`/`ref_6d`): `geometry` (`hkl`, `psi`, `azir`), `computation`
+(`bravais`, `resolution`, `opt_method`, `tolerance`, `boundrange`, …),
+`crystal.initial_guess` (6-element lattice), and an `intersections` list — one
+entry per triple `{label, reflist (3×3), energy, intercepts, target}`. See
+[`configs/tripfit_rhombohedral_PMN_PT_example.json`](DMSAnalysis/configs/tripfit_rhombohedral_PMN_PT_example.json).
+
+See [`CLAUDE.md`](CLAUDE.md) for the parameter-vector index map, the full tripfit
+schema, and developer notes.
 
 ## Output
 
-With `save=1`, the fit creates an immutable snapshot under
+With `save=1`, the image fit creates an immutable snapshot under
 `Processing/YYYYMMDDHHMM_<imnum>_<scannum>_<description>_<fittype>/` containing
-the script, library, config, fit results, and rendered images.
+the script, library, config, fit results, and rendered images. `tripfit` writes a
+lighter snapshot under `Processing/YYYYMMDDHHMM_TripFit/` (script, library,
+config, `PLOT.svg`, `Result.txt`).
 
 ## Author & license
 

@@ -1,0 +1,42 @@
+{
+  "flags": {
+    "save": 0,
+    "fit": 0
+  },
+  "geometry": {
+    "hkl": [-2, -3, -3],
+    "psi": 163.90876,
+    "azir": [1, 1, 1]
+  },
+  "computation": {
+    "bravais": "rhombohedral",
+    "resolution": 1000,
+    "opt_method": "Powell",
+    "tolerance": 1e-17,
+    "boundrange": [-0.012, 0.012],
+    "rr": 0.0
+  },
+  "crystal": {
+    "initial_guess": [4.0204417, 4.0204417, 4.0204417, 89.9118, 89.9118, 89.9118]
+  },
+  "intersections": [
+    {
+      "label": "T1",
+      "reflist": [[-1, 1, 2], [2, 1, -1], [3, 1, 4]],
+      "energy": 8.3545,
+      "intercepts": [0, 0, 0],
+      "target": 0.0
+    },
+    {
+      "label": "T2",
+      "reflist": [[-1, 2, 1], [2, -1, 1], [3, 4, 1]],
+      "energy": 8.354,
+      "intercepts": [0, 1, 1],
+      "target": 0.0
+    }
+  ],
+  "display": {
+    "lim": 0.005,
+    "dpi": 130
+  }
+}

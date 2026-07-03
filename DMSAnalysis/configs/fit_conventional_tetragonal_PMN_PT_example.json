@@ -40,6 +40,7 @@
     "simsigma_per_zoom": 4.5,
     "thrange_delta": [-20, 20],
     "bravais": "tetragonal",
+    "pseudocubic_transform": 1,
     "opt_method": "COBYLA",
     "peak_method": "gauss",
     "tolerance": 1e-06,

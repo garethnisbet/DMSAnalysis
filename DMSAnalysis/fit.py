@@ -147,6 +147,21 @@ except:
 
 azir=[d.metadata['azih'],d.metadata['azik'],d.metadata['azil']]
 
+# ── Pseudo-cubic re-indexing (Table 1 of doi:10.1107/S1600576723004120) ───────
+# computation.pseudocubic_transform selects one of the 12 equivalent pseudo-cubic
+# indexing matrices (1 = identity).  The primary hkl, the azimuthal reference and
+# the reflection list are all re-indexed as hkl' = M @ hkl.  Conventional
+# (3-index) crystals only — 6D quasicrystal indices cannot be re-indexed by a
+# 3x3 matrix.
+pc_transform = int(cfg["computation"].get("pseudocubic_transform", 1))
+if pc_transform != 1 and bravais in ts.CONVENTIONAL_SYSTEMS:
+    _pcm   = ts.pseudocubic_matrix(pc_transform)
+    hkl    = _pcm @ hkl
+    hklint = np.round(hkl)
+    azir   = list(_pcm @ np.asarray(azir, dtype=float))
+    print('Pseudo-cubic transform %d applied: %s'
+          % (pc_transform, ts.pseudocubic_label(pc_transform)))
+
 ################################### Load and filter image ##################
 
 mask = [494,1274,980,1470]
@@ -183,6 +198,9 @@ CONVENTIONAL = bravais in ts.CONVENTIONAL_SYSTEMS
 if CONVENTIONAL:
     ref_6d = None
     reflist  = np.array(cfg["crystal"]["reflist_hkl"], dtype=float)
+    if pc_transform != 1:
+        # hkl' = M @ hkl for each row  <=>  reflist @ M.T
+        reflist = reflist @ ts.pseudocubic_matrix(pc_transform).T
     reflist2 = np.zeros_like(reflist)
 elif autoreflist:
     mslist=[[np.NAN,np.NAN,np.NAN,np.NAN,np.NAN,np.NAN,np.NAN]]

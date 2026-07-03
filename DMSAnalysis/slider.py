@@ -181,6 +181,25 @@ reflist_hkl_manual = np.array(
          [ 0,  0,  3]]), # T7
     dtype=int)
 
+# ── Pseudo-cubic re-indexing (Table 1 of doi:10.1107/S1600576723004120) ───────
+# computation.pseudocubic_transform selects one of the 12 equivalent pseudo-cubic
+# indexing matrices (1 = identity).  The primary hkl, the azimuthal reference and
+# the manual reflection list are re-indexed as hkl' = M @ hkl.  Conventional
+# (3-index) crystal modes only — 6D quasicrystal indices cannot be re-indexed by
+# a 3x3 matrix.  The GUI combo can switch the active matrix at runtime.
+pc_transform = int(_comp.get('pseudocubic_transform', 1)) if CONVENTIONAL else 1
+if pc_transform != 1:
+    _pcm   = ts.pseudocubic_matrix(pc_transform)
+    hkl    = _pcm @ hkl
+    hklint = np.round(hkl)
+    azir   = list(_pcm @ np.asarray(azir, dtype=float))
+    reflist_hkl_manual = reflist_hkl_manual @ _pcm.T
+    # the theta window follows the (re-indexed) primary reflection
+    thb      = ts.bragg(lattice, hkl, energy).th()[0]
+    thrange  = [thb - 27, thb + 10]
+    hkllist  = ts.pilkhlrange(lattice, hkl, energy, thrange[0], thrange[1]).hklscan(numsteps)
+    hkllistrange = [thrange[0], thrange[1], numsteps]
+
 # The active "manual" reflection-index source for the current crystal mode.
 ref_manual = reflist_hkl_manual if CONVENTIONAL else ref_6d_manual
 
@@ -777,6 +796,9 @@ class DMSSlider(QtWidgets.QMainWindow):
         # click-to-select the auto-generated lines.
         self._discovery_lines = []
         self._discovery_ref6d = np.asarray(full_reflist_6d)
+        # Pool of pg.TextItem hkl labels drawn next to the overlay lines when the
+        # "Labels" toggle is on (created lazily, reused across updates).
+        self._label_items = []
 
         # scan-specific state (updated when a different scan is loaded)
         self._lattice        = list(lattice)
@@ -785,6 +807,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._py             = py
         self._psi            = psi
         self._azir           = list(azir)
+        # active pseudo-cubic re-indexing matrix (1-based Table-1 index; 1 = id)
+        self._pc_idx         = pc_transform
         self._imdata         = imdata.copy()
         self._hkl_ref        = hkl.copy()
         self._hklint         = hklint.copy()
@@ -1149,8 +1173,10 @@ class DMSSlider(QtWidgets.QMainWindow):
 
         # ── Crystal type selector (Ico / conventional Bravais systems) ──────────
         ct_box = QtWidgets.QGroupBox('Crystal type')
-        ct_l = QtWidgets.QHBoxLayout(ct_box)
-        ct_l.setContentsMargins(4, 2, 4, 2)
+        ct_v = QtWidgets.QVBoxLayout(ct_box)
+        ct_v.setContentsMargins(4, 2, 4, 2)
+        ct_v.setSpacing(2)
+        ct_l = QtWidgets.QHBoxLayout()
         self._crystal_combo = QtWidgets.QComboBox()
         for _disp, _name in CRYSTAL_TYPE_CHOICES:
             self._crystal_combo.addItem(_disp, _name)
@@ -1177,6 +1203,30 @@ class DMSSlider(QtWidgets.QMainWindow):
         ct_l.addWidget(self._crystal_combo, 1)
         ct_l.addWidget(self._axis_combo, 1)
         ct_l.addWidget(self._chk_keep_refs)
+        ct_v.addLayout(ct_l)
+        # Pseudo-cubic re-indexing matrix (Table 1 of
+        # doi:10.1107/S1600576723004120).  Selecting a matrix re-indexes the
+        # primary hkl, the azimuthal reference, the manual reflist and the
+        # selected reflections as hkl' = M @ hkl.  Conventional modes only.
+        pc_row = QtWidgets.QHBoxLayout()
+        pc_lbl = QtWidgets.QLabel('Pseudo-cubic M')
+        pc_lbl.setToolTip(
+            'Pseudo-cubic re-indexing matrix (Table 1 of Nisbet et al. (2023), '
+            'J. Appl. Cryst. 56, 1046-1050).  Re-indexes the primary hkl, the '
+            'azimuthal reference and the reflection list as M · hkl to test '
+            'the equivalent indexing choices of a pseudo-cubic crystal.  The '
+            'lattice parameters are left untouched.  Conventional (3-index) '
+            'crystal modes only.')
+        self._pc_combo = QtWidgets.QComboBox()
+        for _i in range(1, len(ts.PSEUDOCUBIC_TRANSFORMS) + 1):
+            self._pc_combo.addItem('%2d  %s' % (_i, ts.pseudocubic_label(_i)), _i)
+        self._pc_combo.setToolTip(pc_lbl.toolTip())
+        self._pc_combo.setCurrentIndex(pc_transform - 1)
+        self._pc_combo.setEnabled(CONVENTIONAL)
+        self._pc_combo.currentIndexChanged.connect(self._on_pc_transform_changed)
+        pc_row.addWidget(pc_lbl)
+        pc_row.addWidget(self._pc_combo, 1)
+        ct_v.addLayout(pc_row)
         ctrl_col.addWidget(ct_box)
 
         # Sliders in scroll area
@@ -1249,6 +1299,32 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._chk_live_curve.setFont(f_la)
         self._chk_live_curve.toggled.connect(self._on_live_curve_toggled)
         arc_box_l.addWidget(self._chk_live_curve)
+
+        # Labels: draw the hkl indices next to each overlay DMS line.  Off by
+        # default (the labels clutter a dense discovery slice).  "Selected only"
+        # restricts them to the picked reflections; unchecked labels every drawn
+        # line, discovery slice included.
+        lbl_row = QtWidgets.QHBoxLayout()
+        lbl_row.setSpacing(6)
+        self._chk_labels = QtWidgets.QCheckBox('Labels')
+        self._chk_labels.setChecked(False)
+        self._chk_labels.setToolTip('Attach the hkl indices to each overlay DMS '
+                                    'line (the selected arcs and, unless '
+                                    '"selected only", the discovery slice).')
+        self._chk_labels_sel_only = QtWidgets.QCheckBox('selected only')
+        self._chk_labels_sel_only.setChecked(True)
+        self._chk_labels_sel_only.setEnabled(False)   # enabled with Labels
+        self._chk_labels_sel_only.setToolTip('Label only the selected reflection '
+                                             'arcs, not the auto discovery slice.')
+        for _c in (self._chk_labels, self._chk_labels_sel_only):
+            _f = _c.font(); _f.setPointSize(7); _c.setFont(_f)
+        self._chk_labels.toggled.connect(self._on_labels_toggled)
+        self._chk_labels_sel_only.toggled.connect(
+            lambda _=None: self._refresh_overlay_labels())
+        lbl_row.addWidget(self._chk_labels)
+        lbl_row.addWidget(self._chk_labels_sel_only)
+        lbl_row.addStretch()
+        arc_box_l.addLayout(lbl_row)
         ctrl_col2.addWidget(arc_box, 1)   # selected-reflections list expands
 
         # Reflist group
@@ -1601,7 +1677,83 @@ class DMSSlider(QtWidgets.QMainWindow):
             self.full_reflist, self.full_reflist2, self._hkl, self._imdata,
             self._psirange, self._thrange, self._azir, self._psi,
             self._px, self._py, self.ig)
+        # Pseudo-cubic re-indexing applies to 3-index reflections only.
+        if getattr(self, '_pc_combo', None) is not None:
+            self._pc_combo.setEnabled(CONVENTIONAL)
         self._status.setText('Crystal type: %s' % bravais)
+
+    # ── Pseudo-cubic re-indexing (Table 1 of doi:10.1107/S1600576723004120) ────
+
+    def _on_pc_transform_changed(self, _idx=None):
+        new = self._pc_combo.currentData()
+        if new is None or int(new) == self._pc_idx:
+            return
+        if not CONVENTIONAL:
+            # 6D quasicrystal indices cannot be re-indexed by a 3x3 matrix —
+            # snap the combo back to the active matrix.
+            self._pc_combo.blockSignals(True)
+            self._pc_combo.setCurrentIndex(self._pc_idx - 1)
+            self._pc_combo.blockSignals(False)
+            self._status.setText('Pseudo-cubic re-indexing needs a conventional '
+                                 'crystal mode')
+            return
+        self._apply_pc_transform(int(new))
+
+    def _apply_pc_transform(self, new_idx):
+        """Re-index the primary hkl, the azimuthal reference, the manual reflist
+        and the selected reflections from the active Table-1 matrix to matrix
+        ``new_idx``.  The matrices are orthogonal, so the relative re-indexing
+        from the current setting is R = M_new · M_oldᵀ."""
+        global hklint, reflist_hkl_manual, ref_manual
+        R = (ts.pseudocubic_matrix(new_idx)
+             @ ts.pseudocubic_matrix(self._pc_idx).T)
+        self._pc_idx = new_idx
+
+        # primary reflection (+ integer reference baked into new engines)
+        self._hkl[:] = np.asarray(R, dtype=float) @ self._hkl
+        hklint       = np.round(self._hkl)
+        self._hklint = hklint.copy()
+        # azimuthal reference
+        self._azir = list(np.asarray(R, dtype=float)
+                          @ np.asarray(self._azir, dtype=float))
+        # manual reflection list (the source _regenerate_reflist reads when
+        # Auto reflist is off)
+        reflist_hkl_manual = np.asarray(reflist_hkl_manual, dtype=int) @ R.T
+        ref_manual = reflist_hkl_manual
+        # selected reflections: re-index in place and refresh the list labels
+        for _aid in list(self._arc_to_6d):
+            _ref = np.asarray(self._arc_to_6d[_aid])
+            if _ref.size == 3:      # 3-index only (6D entries are never active here)
+                self._arc_to_6d[_aid] = R @ _ref.astype(int)
+        self._arc_list.blockSignals(True)
+        for _aid, _item in self._arc_to_list_item.items():
+            _ref = self._arc_to_6d.get(_aid)
+            if _ref is not None:
+                _item.setText('[%s]' % ' '.join('%d' % v for v in _ref))
+        self._arc_list.blockSignals(False)
+
+        # Built curves / fit belong to the previous indexing — invalidate them.
+        self._fit_dms = None
+        self._kernel = self._centres = None
+        self._reflist_fit = self._reflist2_fit = self._ref_6d_fit = None
+        self._last_res_x = None
+        self._last_fit_info = None
+        if getattr(self, '_btn_save_fit', None) is not None:
+            self._btn_save_fit.setEnabled(False)
+        self._init_line_plot()
+
+        self._rebuild_sliders()          # recentre h/k/l on the new indices
+        self._rebuild_selected_engine()  # new hkl/azir baked into the engine
+        self._regenerate_reflist()       # new slice engine + redraw
+        self._dms_full = make_overlay_dms(
+            self.full_reflist, self.full_reflist2, self._hkl, self._imdata,
+            self._psirange, self._thrange, self._azir, self._psi,
+            self._px, self._py, self.ig)
+        # record in the live config so a saved config reproduces this indexing
+        self._cfg.setdefault('computation', {})['pseudocubic_transform'] = new_idx
+        self._cfgtable.set_config(self._cfg)
+        self._status.setText('Pseudo-cubic transform %d applied: %s'
+                             % (new_idx, ts.pseudocubic_label(new_idx)))
 
     def _do_update(self):
         self._sync_ig()
@@ -1630,8 +1782,78 @@ class DMSSlider(QtWidgets.QMainWindow):
                 arc._x_data, arc._y_data = x, y
             else:
                 arc.setData(x=[], y=[])
+        self._refresh_overlay_labels()
         self._maybe_update_live_curves()
         self._status.setText('Ready')
+
+    # ── Overlay hkl labels ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ref_label_text(ref):
+        """Compact bracketed hkl label for an overlay line, e.g. '[0 0 2]'."""
+        return '[%s]' % ' '.join('%d' % int(v) for v in np.asarray(ref).ravel())
+
+    def _label_anchor(self, x, y):
+        """Anchor point for a line's label: the topmost drawn point (smallest y;
+        the view is y-inverted, so this sits at the visible top of the arc).
+        Returns None when the line has no finite points."""
+        x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+        m = ~(np.isnan(x) | np.isnan(y))
+        if not m.any():
+            return None
+        x, y = x[m], y[m]
+        i = int(np.argmin(y))
+        return float(x[i]), float(y[i])
+
+    def _refresh_overlay_labels(self):
+        """(Re)place the hkl text labels on the overlay lines to match the current
+        geometry.  Reuses a pool of pg.TextItem; hidden entirely when the Labels
+        toggle is off."""
+        if getattr(self, '_chk_labels', None) is None:
+            return
+        want = []   # (text, x, y, colour)
+        if self._chk_labels.isChecked():
+            # Selected reflection arcs (always, when labelling is on).
+            for arc in self._sel_order:
+                ref = self._arc_to_6d.get(id(arc))
+                xd = getattr(arc, '_x_data', None)
+                if ref is None or xd is None:
+                    continue
+                pt = self._label_anchor(xd, getattr(arc, '_y_data', None))
+                if pt is not None:
+                    col = getattr(arc, '_colour', None) or pg.mkColor('#ffd040')
+                    want.append((self._ref_label_text(ref), pt[0], pt[1], col))
+            # Discovery slice, unless restricted to the selection.
+            sel_only = (getattr(self, '_chk_labels_sel_only', None) is not None
+                        and self._chk_labels_sel_only.isChecked())
+            if not sel_only:
+                ref6d = getattr(self, '_discovery_ref6d', None)
+                for i, (x, y) in enumerate(self._discovery_lines or []):
+                    if ref6d is None or i >= len(ref6d):
+                        break
+                    pt = self._label_anchor(x, y)
+                    if pt is not None:
+                        want.append((self._ref_label_text(ref6d[i]),
+                                     pt[0], pt[1], pg.mkColor(255, 120, 120)))
+        # Grow the reusable TextItem pool as needed.
+        while len(self._label_items) < len(want):
+            t = pg.TextItem(anchor=(0.5, 1.0))
+            t.setZValue(20)
+            self._vb.addItem(t)
+            self._label_items.append(t)
+        # Apply / show the wanted labels, hide the surplus.
+        for t, (text, x, y, col) in zip(self._label_items, want):
+            t.setText(text)
+            t.setColor(col)
+            t.setPos(x, y)
+            t.setVisible(True)
+        for t in self._label_items[len(want):]:
+            t.setVisible(False)
+
+    def _on_labels_toggled(self, checked):
+        self._chk_labels_sel_only.setEnabled(checked)
+        self._refresh_overlay_labels()
+        self._status.setText('Overlay labels on' if checked else 'Overlay labels off')
 
     def _maybe_update_live_curves(self):
         """When 'Live Curve' is on, recompute the ROI integrated curves at the
@@ -2331,6 +2553,16 @@ class DMSSlider(QtWidgets.QMainWindow):
                 fs.setRange(_val - _half, _val + _half)
                 fs.setValue(_val)
         self._suppress = False
+        # A computation.pseudocubic_transform edit re-indexes live through the
+        # combo (its handler does the full re-index + engine rebuild).
+        try:
+            _pc_new = int(new_cfg.get('computation', {})
+                          .get('pseudocubic_transform', self._pc_idx))
+        except (TypeError, ValueError):
+            _pc_new = self._pc_idx
+        if (_pc_new != self._pc_idx and CONVENTIONAL
+                and 1 <= _pc_new <= len(ts.PSEUDOCUBIC_TRANSFORMS)):
+            self._pc_combo.setCurrentIndex(_pc_new - 1)
         self._rebuild_dms_slice()
         self._rebuild_selected_engine()   # psi/px/py are baked into the engine
         self._do_update()
@@ -2404,6 +2636,9 @@ class DMSSlider(QtWidgets.QMainWindow):
         return {
             'version':        2,
             'bravais':        bravais,   # crystal type (Ico / conventional system)
+            # active pseudo-cubic re-indexing matrix (hkl/ref_6d are stored
+            # already re-indexed; restore sets the bookkeeping only)
+            'pc_transform':   int(self._pc_idx),
             'scan': {
                 'scanpath':   self._scanpath,
                 'scannum':    int(self._scannum),
@@ -2522,6 +2757,22 @@ class DMSSlider(QtWidgets.QMainWindow):
             if getattr(self, '_crystal_combo', None) is not None:
                 self._apply_crystal_combos(saved_bravais)
             self._set_crystal_system(saved_bravais)
+
+        # 0.5 Restore the pseudo-cubic re-indexing matrix.  The session's hkl and
+        #     reflections are stored already re-indexed, so only the bookkeeping
+        #     index and the combo are set here — no relative transform is applied.
+        #     Must happen before the scan reload below, which re-derives azir
+        #     from the .dat in the active indexing.
+        try:
+            _pc = int(data.get('pc_transform', 1))
+        except (TypeError, ValueError):
+            _pc = 1
+        self._pc_idx = _pc if (CONVENTIONAL
+                               and 1 <= _pc <= len(ts.PSEUDOCUBIC_TRANSFORMS)) else 1
+        if getattr(self, '_pc_combo', None) is not None:
+            self._pc_combo.blockSignals(True)
+            self._pc_combo.setCurrentIndex(self._pc_idx - 1)
+            self._pc_combo.blockSignals(False)
 
         # 1. Reload the scan/image, if the session records one.  Do this first so
         #    the saved geometry below overwrites the scan-derived defaults.
@@ -2831,6 +3082,11 @@ class DMSSlider(QtWidgets.QMainWindow):
 
         en_new    = float(exp['energy'])
         azir_new  = list(exp['azir'])
+        # The .dat carries the as-measured azimuthal reference; keep it in the
+        # active pseudo-cubic indexing.
+        if CONVENTIONAL and getattr(self, '_pc_idx', 1) != 1:
+            azir_new = list(ts.pseudocubic_matrix(self._pc_idx)
+                            @ np.asarray(azir_new, dtype=float))
         scan_dir  = os.path.dirname(os.path.abspath(path)) + os.sep
         basename  = os.path.basename(path)
         m         = re.match(r'^(\d+)\.dat$', basename)
@@ -3096,6 +3352,9 @@ class DMSSlider(QtWidgets.QMainWindow):
         cfg['computation']['numsteps']       = numsteps
         cfg['computation']['simsigma_per_zoom'] = float(simsigma / max(zoomval, 1))
         cfg['computation']['peak_method']    = self._peak_method
+        # The exported hkl / azir / reflections are already in the active
+        # pseudo-cubic indexing — the consumer must not re-apply the matrix.
+        cfg['computation']['pseudocubic_transform'] = 1
         cfg.setdefault('roi', {})['width_per_zoom'] = float(width / max(zoomval, 1))
         # Template manual_centres reference ROI indices from a different ref_6d;
         # always clear them so workflow.py doesn't crash with an IndexError.

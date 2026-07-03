@@ -147,6 +147,37 @@ so the parameter packing never drifts.
 | `expand_lattice(system, six)` | `list` (6) | Full constrained lattice, enforcing the symmetry (e.g. tetragonal → `[a,a,c,90,90,90]`, hexagonal → `[a,a,c,90,90,120]`, monoclinic b-unique → `[a,b,c,90,β,90]`) |
 | `reduced_param_indices(system, detopt, energyopt)` | `list[int]` | Indices into the 24-element guess passed to the optimiser: free lattice slots + `[6,7,8,9]` + detector `[10..13]` (if `detopt`) + energy `[14]` (if `energyopt`); never the phason block |
 | `hklgen_3d(depth)` | `np.ndarray` (N×3) | All integer `[h,k,l]` in `[-depth,depth]³` minus the origin (3D analogue of `hklgen_ico`) |
+| `PSEUDOCUBIC_TRANSFORMS` | tuple of 12 `np.ndarray` (3×3, int) | The 12 pseudo-cubic re-indexing matrices of Table 1 in [Nisbet et al. (2023), *J. Appl. Cryst.* **56**, 1046–1050](https://doi.org/10.1107/S1600576723004120); entry 0 is the identity |
+| `pseudocubic_matrix(index)` | `np.ndarray` (3×3) | The Table-1 matrix for 1-based `index` (1–12); raises `ValueError` outside that range |
+| `pseudocubic_label(index)` | `str` | Compact row-wise label, e.g. `'(1 0 0)(0 -1 0)(0 0 -1)'`; `'identity'` for index 1 |
+| `cubic_proper_rotations()` | `list` of 24 `np.ndarray` | The proper rotations of point group 432 (all signed permutation matrices, det +1) |
+| `rhombohedral_proper_group()` | `list` of 6 `np.ndarray` | Point group 32 (D3) oriented as the rhombohedral subgroup of the cube (3-fold along `[111]` + three `⟨1-10⟩` 2-folds) |
+| `coset_decomposition(group, subgroup)` | `list[list]` | Left-coset decomposition partitioning `group` by `subgroup` |
+| `pseudocubic_domains()` | `list` of 4 `np.ndarray` | The 4 distinct indexing domains = left cosets of 32 in 432, one canonical representative each (identity first) |
+| `verify_pseudocubic_transforms()` | `dict` | Self-check: raises `AssertionError` unless the 12 tabulated matrices are proper cubic rotations distributing 3-per-domain across all 4 cosets |
+
+**Self-verification.** The 12 matrices are transcribed from a published table, so
+they carry a transcription risk. The functions above re-derive the group theory
+from first principles: the pseudo-cubic indexing ambiguity is twinning by
+pseudo-merohedry ([Flack (1987), *Acta Cryst.* A**43**, 564–568](https://journals.iucr.org/paper?S0108767387099008=)),
+whose distinct settings are the left cosets of the crystal's rhombohedral point
+group (32) in the cubic metric holohedry (432) — exactly 4 domains. The table is
+confirmed complete and correct by `verify_pseudocubic_transforms()` (every entry
+a proper cubic rotation; all 4 domains represented; three tabulated entries per
+domain, counting the published matrix 9 = matrix 2 duplicate). The tests in
+`DMSAnalysis/tests/test_pseudocubic.py` run this check (standalone via
+`python -m DMSAnalysis.tests.test_pseudocubic`, or under pytest).
+
+**Pseudo-cubic re-indexing.** Indexing mistakes are easy to make on pseudo-cubic
+crystals; the 12 Table-1 matrices enumerate the equivalent indexing choices. A
+matrix `M` re-indexes a reflection as `hkl' = M @ hkl` and must be applied
+consistently to the primary reflection, the azimuthal reference and every
+reflection in the list. Both apps do this for conventional (3-index) crystals
+when `computation.pseudocubic_transform` (1–12, default 1 = identity) is set in
+the config; the slider additionally has a **Pseudo-cubic M** combo in the
+*Crystal type* box that switches the active matrix at runtime (re-indexing the
+primary hkl, azimuthal reference, manual reflist and the selected reflections in
+place). The lattice parameters are never touched.
 
 `dmsfit_ico_hkl` (and the ROI builder's `dmscalc_ico_hkl`) decode a conventional
 crystal when `bravais` ∈ `CONVENTIONAL_SYSTEMS`: pass the full 24-element guess
@@ -285,6 +316,33 @@ Minimisation wrapper: evaluates the sum-of-squared residuals for a Gaussian-plus
 
 ### `class gaussfit(x, y)`
 Alternative Gaussian fitting class using direct minimisation rather than `curve_fit`.
+
+---
+
+## Multiple-Intersection (Renninger triple-intersection) fitting
+
+Image-free lattice refinement via the coincidence of Kossel lines on the
+stereographic projection — the multiple-diffraction geometry that is sensitive to
+small lattice distortions of pseudo-symmetric crystals. Used by the
+`python -m DMSAnalysis.tripfit` batch app; ported from the standalone
+`calcms/ts_light.py` so the whole workflow lives in the package.
+
+| Name | Signature | Description |
+|------|-----------|-------------|
+| `kosscalc` | `(lattice, energy, ref1, ref2, azir, psi, start, end, steps)` | Kossel-line locus of secondary reflections `ref2` about primary `ref1`, swept over azimuth; returns `[x,y,z,ψ,θ]` per sample |
+| `stereoproj` | `(vin)` | Stereographic projection of unit vectors (N×3) → 2×N `[x,y]` |
+| `intersections` | `(a, b)` | Intersection points of two closed stereographic loci (uses shapely); returns `(xs, ys, ring_a, ring_b)` |
+
+### `class tripfit(hkl, reflist, azir, psi, resolution, bravais, energy, kintercepts, target)`
+Fits a conventional lattice by driving the three Kossel lines of a secondary-reflection triple (`reflist`, 3×3) to a common triple-intersection point.
+
+- `bravais` — one of `CONVENTIONAL_SYSTEMS`; selects the free lattice parameters via `lattice_free_slots` / `expand_lattice` (shared with the image fit, so the packing cannot drift).
+- `kintercepts` — which intersection point of each line pair to score; `target` — desired residual (0 for a perfect triple intersection).
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `fit(reduced)` | `float` | Scalar residual for a reduced free-parameter vector (500 on geometric failure) |
+| `full(reduced)` | tuple | `(intercepts, st0, st1, st2, vr0, vr1, vr2)` for plotting |
 
 ---
 

@@ -28,6 +28,12 @@ from scipy.optimize import curve_fit
 import copy
 #from scipy.optimize import differential_evolution
 from joblib import Parallel, delayed
+# shapely powers the Kossel-line intersection test used by the tripfit engine;
+# imported lazily-friendly (the rest of the module works without it).
+try:
+    from shapely.geometry.polygon import LinearRing as _LinearRing
+except Exception:      # pragma: no cover - shapely is a declared dependency
+    _LinearRing = None
 
 
 TAU =  0.5+0.5*5**0.5
@@ -126,6 +132,184 @@ def hklgen_3d(depth):
     rng = range(-depth, depth + 1)
     idx = np.array(list(_it.product(rng, repeat=3)))
     return idx[np.any(idx != 0, axis=1)]
+
+
+# ── Pseudo-cubic re-indexing matrices ──────────────────────────────────────────
+# Table 1 of Nisbet et al. (2023), J. Appl. Cryst. 56, 1046-1050
+# (https://doi.org/10.1107/S1600576723004120): the 12 transformation matrices
+# relating the equivalent indexing choices of a pseudo-cubic crystal.  Matrix 1
+# is the identity (indexing unchanged).  A matrix M re-indexes a reflection as
+# hkl' = M @ hkl; it must be applied consistently to the primary reflection, the
+# azimuthal reference and every reflection in the list.  The matrices are listed
+# in the order they appear in the table (row-major: table rows 1-4, three
+# matrices per row; the three matrices in a table row give the same truth-table
+# vector).  Note: as published, matrix 9 is identical to matrix 2.
+PSEUDOCUBIC_TRANSFORMS = tuple(np.array(_m, dtype=int) for _m in (
+    # table row 1
+    [[ 1,  0,  0], [ 0,  1,  0], [ 0,  0,  1]],   # 1  (identity)
+    [[ 1,  0,  0], [ 0, -1,  0], [ 0,  0, -1]],   # 2
+    [[ 0, -1,  0], [-1,  0,  0], [ 0,  0, -1]],   # 3
+    # table row 2
+    [[ 0, -1,  0], [ 1,  0,  0], [ 0,  0,  1]],   # 4
+    [[ 1,  0,  0], [ 0,  0,  1], [ 0, -1,  0]],   # 5
+    [[ 0,  1,  0], [ 1,  0,  0], [ 0,  0, -1]],   # 6
+    # table row 3
+    [[-1,  0,  0], [ 0, -1,  0], [ 0,  0,  1]],   # 7
+    [[ 0,  0,  1], [ 0, -1,  0], [ 1,  0,  0]],   # 8
+    [[ 1,  0,  0], [ 0, -1,  0], [ 0,  0, -1]],   # 9  (as published; = matrix 2)
+    # table row 4
+    [[ 0,  1,  0], [-1,  0,  0], [ 0,  0,  1]],   # 10
+    [[ 1,  0,  0], [ 0,  0, -1], [ 0,  1,  0]],   # 11
+    [[ 0,  0, -1], [ 0, -1,  0], [-1,  0,  0]],   # 12
+))
+
+
+def pseudocubic_matrix(index):
+    '''The Table-1 pseudo-cubic re-indexing matrix for 1-based ``index`` (1-12);
+    index 1 is the identity.'''
+    index = int(index)
+    if not 1 <= index <= len(PSEUDOCUBIC_TRANSFORMS):
+        raise ValueError('pseudocubic transform index must be 1..%d, got %s'
+                         % (len(PSEUDOCUBIC_TRANSFORMS), index))
+    return PSEUDOCUBIC_TRANSFORMS[index - 1]
+
+
+def pseudocubic_label(index):
+    '''Compact one-line label for a Table-1 matrix, e.g.
+    ``'(1 0 0)(0 -1 0)(0 0 -1)'``; index 1 returns ``'identity'``.'''
+    if int(index) == 1:
+        return 'identity'
+    m = pseudocubic_matrix(index)
+    return ''.join('(%s)' % ' '.join('%d' % v for v in row) for row in m)
+
+
+# ── Coset-decomposition derivation of the pseudo-cubic domains ──────────────────
+# The 12 hard-coded PSEUDOCUBIC_TRANSFORMS were transcribed from a published
+# table, so they carry a transcription risk.  The functions below re-derive the
+# underlying group theory from first principles — the pseudo-cubic indexing
+# ambiguity is a twinning-by-pseudo-merohedry problem (Flack, H. D. (1987),
+# Acta Cryst. A43, 564-568): the distinct indexing choices are the left cosets
+# of the crystal's (rhombohedral) point group in the cubic metric holohedry.
+# `verify_pseudocubic_transforms` checks the hard-coded table against this
+# derivation, so a sign slip or dropped matrix cannot pass silently.
+
+def cubic_proper_rotations():
+    '''The 24 proper rotations of the cube (point group 432 / O): every 3x3
+    signed permutation matrix with determinant +1.'''
+    import itertools as _it
+    mats = []
+    for perm in _it.permutations(range(3)):
+        for signs in _it.product((1, -1), repeat=3):
+            M = np.zeros((3, 3), dtype=int)
+            for i, p in enumerate(perm):
+                M[i, p] = signs[i]
+            if int(round(np.linalg.det(M))) == 1:
+                mats.append(M)
+    return mats
+
+
+def _rot180(axis):
+    '''Integer matrix of a 180 degrees rotation about ``axis`` (a lattice
+    direction); exact for the <100>/<110>/<111> axes of the cube.'''
+    n = np.asarray(axis, dtype=float)
+    n = n / np.linalg.norm(n)
+    return np.round(2.0 * np.outer(n, n) - np.eye(3)).astype(int)
+
+
+def rhombohedral_proper_group():
+    '''The 6 proper rotations of point group 32 (D3), oriented as the
+    rhombohedral subgroup of the cube: the 3-fold about the body diagonal
+    [111] together with the three 2-folds about the <1-10> directions
+    perpendicular to it.'''
+    A = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]], dtype=int)   # 3-fold [111]
+    return [np.eye(3, dtype=int), A, A @ A,
+            _rot180([1, -1, 0]), _rot180([0, 1, -1]), _rot180([1, 0, -1])]
+
+
+def _mat_in(M, group):
+    return any(np.array_equal(M, G) for G in group)
+
+
+def coset_decomposition(group, subgroup):
+    '''Left-coset decomposition of ``group`` by ``subgroup``: a list of cosets
+    (each a list of matrices) that partitions ``group``.  ``subgroup`` must be a
+    genuine subgroup, so the cosets tile the group with no overlap.'''
+    cosets, seen = [], set()
+    for g in group:
+        if tuple(g.flatten()) in seen:
+            continue
+        cs = [g @ h for h in subgroup]
+        cosets.append(cs)
+        seen.update(tuple(c.flatten()) for c in cs)
+    return cosets
+
+
+def pseudocubic_domains():
+    '''The 4 distinct pseudo-cubic indexing domains, derived as the left cosets
+    of the rhombohedral proper group (32, 3-fold along [111]) in the cubic
+    proper holohedry (432).  Returns one canonical representative matrix per
+    coset (the member with the fewest sign changes, ties broken
+    lexicographically), identity domain first.
+
+    These 4 cosets are the group-theoretic content behind the 12
+    PSEUDOCUBIC_TRANSFORMS: the tabulated matrices distribute three-per-coset
+    across these domains (see `verify_pseudocubic_transforms`).  Inversion is
+    not needed — reflection indexing is centrosymmetric (Friedel's law), so the
+    proper rotation groups already capture every distinct indexing.'''
+    cosets = coset_decomposition(cubic_proper_rotations(),
+                                 rhombohedral_proper_group())
+
+    def _key(M):
+        return (int((M < 0).sum()), tuple(-M.flatten()))
+
+    reps = [min(cs, key=_key) for cs in cosets]
+    eye = np.eye(3, dtype=int)
+    reps.sort(key=lambda M: (not np.array_equal(M, eye), _key(M)))
+    return reps
+
+
+def verify_pseudocubic_transforms():
+    '''Check the hard-coded PSEUDOCUBIC_TRANSFORMS table against the coset
+    decomposition, confirming it is the correct and complete set of pseudo-cubic
+    indexing matrices.  Raises AssertionError on any mismatch; returns a summary
+    dict on success.
+
+    Verifies that
+      * every tabulated matrix is a proper cubic rotation (an element of 432);
+      * the cubic proper group splits into exactly 4 cosets of the rhombohedral
+        proper group (the 4 distinct indexing domains), each of order 6;
+      * every domain is represented by the table (it is complete); and
+      * counting the table exactly as published (matrix 9 is a duplicate of
+        matrix 2), three tabulated entries fall in each of the 4 domains.'''
+    O  = cubic_proper_rotations()
+    D3 = rhombohedral_proper_group()
+    assert len(O) == 24, 'cubic proper group must have 24 elements'
+    assert all(_mat_in(g, O) for g in D3), 'D3 is not a subgroup of O'
+    assert all(_mat_in(a @ b, D3) for a in D3 for b in D3), 'D3 not closed'
+
+    cosets = coset_decomposition(O, D3)
+    assert len(cosets) == 4 and all(len(c) == 6 for c in cosets), \
+        'expected 4 cosets of order 6, got sizes %s' % [len(c) for c in cosets]
+
+    def coset_of(M):
+        for i, cs in enumerate(cosets):
+            if _mat_in(M, cs):
+                return i
+        return None
+
+    n = len(PSEUDOCUBIC_TRANSFORMS)
+    counts = [0, 0, 0, 0]
+    for i in range(1, n + 1):
+        M = pseudocubic_matrix(i)
+        assert _mat_in(M, O), 'matrix %d is not a proper cubic rotation' % i
+        c = coset_of(M)
+        assert c is not None, 'matrix %d not located in any coset' % i
+        counts[c] += 1
+    assert set(coset_of(pseudocubic_matrix(i)) for i in range(1, n + 1)) \
+        == {0, 1, 2, 3}, 'not all 4 domains are represented by the table'
+    assert all(k == 3 for k in counts), \
+        'expected 3 tabulated matrices per domain, got %s' % counts
+    return {'n_domains': 4, 'per_domain': counts, 'n_matrices': n}
 
 ###################################
 
@@ -2117,3 +2301,162 @@ class dmsfit_ico_hkl(object):
             return result,self.imsim, self.dmsindex, self.imdata, self.inputarray
         except:
             return 500,np.zeros(self.imdata.shape), np.array([[],[]]), self.imdata, self.inputarray
+
+
+# ── Multiple-intersection (Renninger triple-intersection) lattice fitting ───────
+# Ported from calcms/ts_light.py so the tripfit workflow lives in the package
+# alongside the image-based fit.  A "triple intersection" is the coincidence, on
+# the stereographic projection, of the three Kossel lines of three secondary
+# reflections that share a primary reflection — the multiple-diffraction geometry
+# that is highly sensitive to small (e.g. pseudo-cubic) lattice distortions.
+# Refining the lattice so the three lines meet at a single point (per group)
+# measures those distortions without needing the detector image.
+
+def kosscalc(lattice, energy, ref1, ref2, azir, psi, startval, endval, steps):
+    '''Kossel-line locus for secondary reflections ``ref2`` (N x 3) about primary
+    ``ref1``, swept over azimuth [startval, endval] in ``steps`` points.  Returns
+    an (N*steps) x 5 array of [x, y, z, psi_angle, theta_angle]; the leading 3
+    columns are the (unnormalised) direction, used by the tripfit projection.'''
+    c, e, h = 299792458, 1.602176487e-19, 6.62606896e-34
+    ko = (1e7 * h * c / e) / energy          # wavelength (A); keV2A / energy
+    azir = np.array(azir); ref1 = np.array(ref1); ref2 = np.array(ref2)
+    bragglist = bragg(lattice, ref2, energy).th()
+    bm = bmatrix(lattice).bm()
+    azirc = (bm @ azir.T)
+    ref1c = (bm @ ref1.T).T
+    vectz = np.array([[0, 0, 1]])
+    vectzc = (bm @ vectz.T).T
+    angprimsec = interplanarangle(lattice, ref1, vectz).ang()
+    vecttorotang = np.cross(ref1c, vectzc)
+    # Rotate everything into the frame with the primary reflection along z.
+    if abs(angprimsec) >= 0.001:
+        ref1c = ref1c @ rotxyz(vecttorotang, angprimsec[0]).rmat()
+        ref2c = (bm @ ref2.T).T @ rotxyz(vecttorotang, angprimsec[0]).rmat()
+        azirc = azirc @ rotxyz(vecttorotang, angprimsec[0]).rmat()
+    else:
+        ref2c = (bm @ ref2.T).T
+    azirangle = (np.arctan2(azirc[0, 0], azirc[0, 1]) * 180 / np.pi)
+    vectnorms = np.linalg.norm(ref2c)
+    v1norm = ref2c / vectnorms * ko
+    perpvects = np.cross(np.roll(v1norm, 1)
+                         * np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]), ref2c)
+    v1norms = [v1norm[i1, :] * rotxyz(perpvects[i1, :], 90 - bragglist[i1]).rmat()
+               for i1 in range(ref2.shape[0])]
+    v1 = np.array([[]] * v1norm.shape[1]).T
+    for ang in np.linspace(startval, endval, steps):
+        v1a = v1norms @ rotxyz(ref2c, ang).rmat()
+        v1 = np.vstack([v1, v1a])
+    v1 = np.array(v1 @ rotxyz([0, 0, 1], -azirangle).rmat())
+    psangles = np.reshape(np.arctan2(v1[:, 0], v1[:, 1]) * 180 / np.pi, (v1.shape[0], 1))
+    thangles = np.reshape(np.arctan2(v1[:, 2], np.sqrt(v1[:, 0]**2 + v1[:, 1]**2))
+                          * 180 / np.pi, (v1.shape[0], 1))
+    return np.concatenate((v1, psangles, thangles), 1)
+
+
+def stereoproj(vin):
+    '''Stereographic projection of unit vectors ``vin`` (N x 3) onto the plane,
+    returned as a 2 x N array of [x, y].'''
+    return np.concatenate((vin[:, 0] / (1. - vin[:, 2]),
+                           vin[:, 1] / (1. - vin[:, 2])), 1).T
+
+
+def intersections(a, b):
+    '''Intersection points of two closed stereographic loci ``a`` and ``b`` (each
+    a sequence of 2D points).  Returns (xs, ys, ring_a, ring_b).'''
+    if _LinearRing is None:
+        raise ImportError('shapely is required for tripfit intersections')
+    ea = _LinearRing(a)
+    eb = _LinearRing(b)
+    mp = ea.intersection(eb)
+    geoms = getattr(mp, 'geoms', mp)      # shapely >=2 needs .geoms to iterate
+    x = [p.x for p in geoms]
+    y = [p.y for p in geoms]
+    return x, y, ea, eb
+
+
+class tripfit(object):
+    '''Fit a conventional lattice by driving three Kossel lines of a secondary-
+    reflection triple to a common (triple-intersection) point on the stereographic
+    projection.  This is the multiple-diffraction analogue of the image fit: no
+    detector image is needed, only the geometry.
+
+    Constructor:
+        tripfit(hkl, reflist, azir, psi, resolution, bravais, energy,
+                kintercepts, target)
+
+    ``reflist`` is a 3 x 3 matrix of the three secondary reflections; ``bravais``
+    is one of ``CONVENTIONAL_SYSTEMS`` and selects which lattice parameters are
+    free (via ``lattice_free_slots`` / ``expand_lattice``, shared with the image
+    fit so the parameter packing cannot drift).  ``kintercepts`` picks which of
+    the (possibly several) intersection points of each line pair to score;
+    ``target`` is the desired residual (0 for a perfect triple intersection).
+
+    ``fit(reduced)`` returns the scalar residual for a reduced free-parameter
+    vector; ``full(reduced)`` returns (intercepts, st0, st1, st2, vr0, vr1, vr2)
+    for plotting.'''
+    def __init__(self, hkl, reflist, azir, psi, resolution, bravais, energy,
+                 kintercepts, target):
+        self.hkl = hkl
+        self.reflist = np.matrix(reflist)
+        self.azir = azir
+        self.psi = psi
+        self.resolution = resolution
+        self.bravais = bravais
+        self.energy = energy
+        self.kintercepts = kintercepts
+        self.target = target
+
+    def _lattice_from_reduced(self, reduced):
+        '''Expand a reduced free-parameter vector into the full constrained
+        lattice [a,b,c,alpha,beta,gamma] for this crystal system.'''
+        reduced = np.asarray(reduced, dtype=float).ravel()
+        six = np.zeros(6, dtype=float)
+        for slot, val in zip(lattice_free_slots(self.bravais), reduced):
+            six[slot] = val
+        return expand_lattice(self.bravais, six)
+
+    def kosselcalc(self, inputs):
+        _lattice = self._lattice_from_reduced(inputs)
+        vr0 = kosscalc(_lattice, self.energy, self.hkl, self.reflist[0, :],
+                       self.azir, self.psi, 0, 360, self.resolution)[:, :3]
+        vr1 = kosscalc(_lattice, self.energy, self.hkl, self.reflist[1, :],
+                       self.azir, self.psi, 0, 360, self.resolution)[:, :3]
+        vr2 = kosscalc(_lattice, self.energy, self.hkl, self.reflist[2, :],
+                       self.azir, self.psi, 0, 360, self.resolution)[:, :3]
+        self.vr0 = np.matrix(vr0 / np.array([np.apply_along_axis(np.linalg.norm, 1, vr0)]).T)
+        self.vr1 = np.matrix(vr1 / np.array([np.apply_along_axis(np.linalg.norm, 1, vr1)]).T)
+        self.vr2 = np.matrix(vr2 / np.array([np.apply_along_axis(np.linalg.norm, 1, vr2)]).T)
+        self.st0 = stereoproj(self.vr0).T
+        self.st1 = stereoproj(self.vr1).T
+        self.st2 = stereoproj(self.vr2).T
+
+    def fit(self, inputs):
+        try:
+            self.kosselcalc(inputs)
+            _x1, _y1, ea1, eb1 = intersections(self.st0, self.st1)
+            _x2, _y2, ea2, eb2 = intersections(self.st0, self.st2)
+            _x3, _y3, ea3, eb3 = intersections(self.st1, self.st2)
+            v1 = np.matrix([[_x1[self.kintercepts[0]], _y1[self.kintercepts[0]]]])
+            v2 = np.matrix([[_x2[self.kintercepts[1]], _y2[self.kintercepts[1]]]])
+            v3 = np.matrix([[_x3[self.kintercepts[2]], _y3[self.kintercepts[2]]]])
+            scal = np.abs(np.linalg.norm(v1) - (v1 / np.linalg.norm(v1) * v2.T)
+                          + np.linalg.norm(v2) - (v2 / np.linalg.norm(v2) * v3.T)
+                          + np.linalg.norm(v1) - (v1 / np.linalg.norm(v1) * v3.T))
+            opt = np.abs(np.array(scal)[0][0] - self.target)
+        except Exception:
+            opt = 500
+        return opt
+
+    def full(self, inputs):
+        self.kosselcalc(inputs)
+        try:
+            _x1, _y1, ea1, eb1 = intersections(self.st0, self.st1)
+            _x2, _y2, ea2, eb2 = intersections(self.st0, self.st2)
+            _x3, _y3, ea3, eb3 = intersections(self.st1, self.st2)
+            intercepts = np.array([[_x1[self.kintercepts[0]], _x2[self.kintercepts[1]],
+                                    _x3[self.kintercepts[2]]],
+                                   [_y1[self.kintercepts[0]], _y2[self.kintercepts[1]],
+                                    _y3[self.kintercepts[2]]]]).T
+        except Exception:
+            intercepts = np.zeros((3, 2))
+        return intercepts, self.st0, self.st1, self.st2, self.vr0, self.vr1, self.vr2

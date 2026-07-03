@@ -8,14 +8,33 @@ Everything lives in the importable `DMSAnalysis` package. Run the apps as module
 from the repository root (no install or build step required):
 
 ```bash
-python -m DMSAnalysis.slider    [config.json]   # GUI: refine → build curves → fit
-python -m DMSAnalysis.fit       [config.json]   # batch fivefold-axis fitting
+python -m DMSAnalysis.slider     [config.json]   # GUI: refine → build curves → fit (image-based)
+python -m DMSAnalysis.fit        [config.json]   # batch fivefold-axis fitting (image-based)
+python -m DMSAnalysis.tripfit    [config.json]   # batch multiple-intersection lattice fit (image-free)
+python -m DMSAnalysis.tripslider [config.json]   # GUI for the multiple-intersection fit (image-free)
 python -m DMSAnalysis.dat2config scan.dat out.json --datapoint N --datapoint0 M
 ```
 
 The slider is the single interactive app: refine geometry with the sliders, click
 arcs to select reflections, **Build curves** to integrate the ROIs for the checked
 reflections, then **Fit**. `fit.py` is the non-interactive/batch path.
+
+`tripfit.py` is a separate, image-free batch app: it refines a conventional
+lattice by driving the three Kossel lines of one or more secondary-reflection
+triples to a common point on the stereographic projection (the Renninger
+triple-intersection / multiple-diffraction geometry). It needs no detector image
+— only the reflection geometry — and is the sensitive probe for the small
+lattice distortions of pseudo-symmetric crystals (see the pseudo-cubic
+re-indexing note under *Conventional crystals*). `tripslider.py` is its
+interactive pyqtgraph GUI (dark theme, matching `slider.py`): drag the free
+lattice / ψ sliders and watch each triple's Kossel lines and its residual update
+live on a stereographic panel, switch crystal system from a dropdown, and run the
+optimiser in the background with **Fit** / **Stop**. The **Triple intersections**
+table at the bottom edits the group list at runtime — **Add triple**,
+**Duplicate**, **Remove**, and per-cell editing of each group's label, three
+reflections, energy, intercepts and target; the panels rebuild live (wrapping to
+a grid past four groups). It reads and writes the same config schema as
+`tripfit.py`, so a config saved from the GUI runs unchanged in the batch app.
 
 Each app falls back to the example config in `DMSAnalysis/configs/` when no path is given.
 
@@ -30,6 +49,8 @@ DMS/                          # repository root
 │   ├── config_table.py       # Shared editable Qt table view of a config dict
 │   ├── slider.py             # The GUI: refine → build integrated curves → fit
 │   ├── fit.py                # Batch fitting script: loads data, builds ROIs, runs optimiser
+│   ├── tripfit.py            # Batch image-free lattice fit via Kossel-line triple intersections
+│   ├── tripslider.py         # pyqtgraph GUI for the multiple-intersection (tripfit) fit
 │   ├── configs/              # Example JSON configs shipped with the package
 │   └── README.md             # Full library API documentation
 └── Processing/               # Timestamped output snapshots (auto-created when save=1, in CWD)
@@ -50,7 +71,7 @@ Each app reads a JSON config (passed as an argument, or the `configs/` default).
 | `display` | `zoomval` (1 or 2), `colourlim`, `colmap` — image display settings |
 | `roi` | `width_per_zoom`, `comwidth_per_zoom` — ROI extraction widths (scaled by `zoomval`) |
 | `geometry` | `hkl`, `psi`, `px_unscaled`, `py_unscaled` — primary reflection and detector origin |
-| `computation` | `numsteps`, `simsigma_per_zoom`, `thrange_delta`, `bravais`, `opt_method`, `peak_method` (`gauss`/`centroid`), `tolerance` |
+| `computation` | `numsteps`, `simsigma_per_zoom`, `thrange_delta`, `bravais`, `pseudocubic_transform` (1–12, conventional only), `opt_method`, `peak_method` (`gauss`/`centroid`), `tolerance` |
 | `crystal` | `lattice2`, `initial_guess_base`, `ref_6d` (quasicrystal 6D reflections) **or** `reflist_hkl` (conventional 3-index reflections) — starting parameters and reference reflections |
 | `manual_centres` | Dict of `"roi_index": pixel_position` overrides for poorly fitted ROI centres |
 | `paths` | `cif_file` — path to CIF file used by `loadcif()` |
@@ -107,6 +128,19 @@ new symmetry and regenerates the reflection list; because 6D and 3-index
 reflections are incompatible, the current selection is cleared. `fit.py` (batch)
 takes its mode from `computation.bravais` in the config.
 
+**Pseudo-cubic re-indexing.** Indexing mistakes are easy to make on pseudo-cubic
+samples. `computation.pseudocubic_transform` (1–12, default 1 = identity) selects
+one of the 12 equivalent-indexing matrices from Table 1 of Nisbet et al. (2023),
+*J. Appl. Cryst.* **56**, 1046–1050 (doi:10.1107/S1600576723004120), applied as
+`hkl' = M @ hkl` to the primary hkl, the azimuthal reference and the reflection
+list (conventional modes only; lattice parameters untouched). The matrices live
+in `ts_quasi.py` (`PSEUDOCUBIC_TRANSFORMS`, `pseudocubic_matrix`,
+`pseudocubic_label`). In the slider, the **Pseudo-cubic M** combo in the Crystal
+type box switches the active matrix at runtime, re-indexing the current
+selection in place; exported workflow configs always carry already-re-indexed
+values with `pseudocubic_transform` reset to 1 so the matrix is never applied
+twice.
+
 ## Processing output
 
 When `save=1`, the script creates a timestamped directory under `Processing/`:
@@ -124,6 +158,31 @@ Processing/YYYYMMDDHHMM_<imnum>_<scannum>_<description>_<fittype>/
 ```
 
 These directories are immutable run records — do not modify them.
+
+`tripfit.py` writes a lighter snapshot under `Processing/<YYYYMMDDHHMM>_TripFit/`
+(`tripfit.py`, `ts_quasi.py`, the config, `PLOT.svg`, `Result.txt`).
+
+## Multiple-intersection (tripfit) configuration
+
+`tripfit.py` reads its own JSON schema (image-free — there is no `scan`, `roi` or
+`ref_6d` section):
+
+| Section | Purpose |
+|---------|---------|
+| `flags` | `save`, `fit` — run controls |
+| `geometry` | `hkl` (primary reflection), `psi`, `azir` (azimuthal reference) |
+| `computation` | `bravais` (a `CONVENTIONAL_SYSTEMS` name), `resolution` (Kossel-line sampling for the fit), `opt_method` (`Powell`/`Nelder-Mead`/`COBYLA`/`TNC`/`GA`/`BH*`), `tolerance`, `boundrange` `[lo,hi]` added to the guess for bounds, optional `rr` (azimuthal pre-rotation, deg), `bh_niter`, `de_strategy`, and (GUI only) `live_resolution` for the interactive overlay |
+| `crystal` | `initial_guess` — full 6-element lattice `[a,b,c,α,β,γ]`; only the crystal system's free slots are refined |
+| `intersections` | list of triples, each `{label, reflist (3×3), energy, intercepts, target}` — the three secondary reflections whose Kossel lines must meet |
+| `display` | `lim`, `dpi` — plot settings |
+
+The lattice constraints reuse `ts_quasi.lattice_free_slots` / `expand_lattice`
+(the same table-driven layer as the image fit), so e.g. `rhombohedral` refines
+`[a, α]` only. The objective is the summed triple-intersection residual over all
+groups; `fit=0` just evaluates and plots at the initial guess. The engine
+(`ts_quasi.kosscalc`, `stereoproj`, `intersections`, `tripfit`) is ported from
+the standalone `calcms/ts_light.py` so the whole workflow lives in the package.
+See `configs/tripfit_rhombohedral_PMN_PT_example.json`.
 
 ## Physics context
 
