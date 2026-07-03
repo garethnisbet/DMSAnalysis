@@ -97,8 +97,7 @@ for gi, gc in enumerate(_groups_cfg):
     if rr != 0.0:
         reflist = np.round((_R * reflist.T).T)
     tf = ts.tripfit(hkl, reflist, azir, resolution, bravais,
-                    float(gc['energy']), list(gc.get('intercepts', [0, 0, 0])),
-                    float(gc.get('target', 0.0)))
+                    float(gc['energy']), float(gc.get('target', 0.0)))
     groups.append({'label': gc.get('label', 'T%d' % (gi + 1)),
                    'reflist': reflist, 'tf': tf})
 

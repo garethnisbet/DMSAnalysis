@@ -178,7 +178,7 @@ These directories are immutable run records — do not modify them.
 | `geometry` | `hkl` (primary reflection), `azir` (azimuthal reference) |
 | `computation` | `bravais` (a `CONVENTIONAL_SYSTEMS` name), `resolution` (Kossel-line sampling for the fit), `opt_method` (`Powell`/`Nelder-Mead`/`COBYLA`/`TNC`/`GA`/`BH*`), `tolerance`, `boundrange` `[lo,hi]` added to the guess for bounds, optional `rr` (azimuthal pre-rotation, deg), `bh_niter`, `de_strategy`, `pseudocubic_transform` (1–12, GUI only — the Table-1 pseudo-cubic indexing matrix applied to the base indexing at load, same key/semantics as `fit.py`/`slider.py`; 1 = identity), and (GUI only) `live_resolution` for the interactive overlay |
 | `crystal` | `initial_guess` — full 6-element lattice `[a,b,c,α,β,γ]`; only the crystal system's free slots are refined |
-| `intersections` | list of triples, each `{label, reflist (3×3), energy, intercepts, target}` — the three secondary reflections whose Kossel lines must meet. `intercepts` seeds which crossing of each line pair to follow at the first evaluation; the engine then tracks that branch (nearest-crossing) so the selection stays consistent and the residual doesn't jump as the lattice varies during the fit |
+| `intersections` | list of triples, each `{label, reflist (3×3), energy, target}` — the three secondary reflections whose Kossel lines must meet. Which crossing of each line pair to score is chosen automatically: the engine takes the tightest (mutually-closest) triple, so the selection stays consistent and the residual doesn't jump as the lattice varies. (A legacy `intercepts` index vector, if present, is ignored.) |
 | `display` | `lim`, `dpi` — plot settings |
 
 The lattice constraints reuse `ts_quasi.lattice_free_slots` / `expand_lattice`

@@ -333,11 +333,12 @@ small lattice distortions of pseudo-symmetric crystals. Used by the
 | `stereoproj` | `(vin)` | Stereographic projection of unit vectors (N×3) → 2×N `[x,y]` |
 | `intersections` | `(a, b)` | Intersection points of two closed stereographic loci (uses shapely); returns `(xs, ys, ring_a, ring_b)` |
 
-### `class tripfit(hkl, reflist, azir, resolution, bravais, energy, kintercepts, target)`
+### `class tripfit(hkl, reflist, azir, resolution, bravais, energy, target)`
 Fits a conventional lattice by driving the three Kossel lines of a secondary-reflection triple (`reflist`, 3×3) to a common triple-intersection point.
 
 - `bravais` — one of `CONVENTIONAL_SYSTEMS`; selects the free lattice parameters via `lattice_free_slots` / `expand_lattice` (shared with the image fit, so the packing cannot drift).
-- `kintercepts` — which intersection point of each line pair to score **at the first evaluation**; it then seeds a tracked branch (`_intercepts`): later evaluations pick the crossing nearest the previously selected one so the selected point cannot flip to the other intersection as the lattice varies (shapely returns the crossings in a geometry-dependent order, so a fixed index would make the residual jump). `full` tracks the branch (updates the anchor, for interactive use); `fit` holds it fixed so every optimiser probe is scored against the same branch. `reset_tracking()` re-seeds from `kintercepts`. `target` — desired residual (0 for a perfect triple intersection).
+- Intercept selection is automatic (`_intercepts`): each line pair may cross at several points, so the **tightest (mutually-closest) triple** — one crossing per pair — is scored. This follows the physical triple intersection directly and continuously, with no dependence on shapely's geometry-dependent point ordering, so the selection cannot jump as the lattice varies (and no per-pair intercept index is needed).
+- `target` — desired residual (0 for a perfect triple intersection).
 
 | Method | Returns | Description |
 |--------|---------|-------------|

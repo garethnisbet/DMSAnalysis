@@ -321,7 +321,6 @@ class TripSlider(QtWidgets.QMainWindow):
             reflist = np.matrix(np.array(gc['reflist'], dtype=float))
             tf = ts.tripfit(self._hkl, reflist, self._azir,
                             self._live_res, self._bravais, float(gc['energy']),
-                            list(gc.get('intercepts', [0, 0, 0])),
                             float(gc.get('target', 0.0)))
             self._groups.append({
                 'label': gc.get('label', 'T%d' % (gi + 1)),
@@ -509,10 +508,22 @@ class TripSlider(QtWidgets.QMainWindow):
             fs.valueChanged.connect(self._on_slider(slot))
             self._slider_vbox.addWidget(fs)
             self._lat_sliders[slot] = fs
+        # primary hkl — sets the pole the frame is rotated onto, i.e. the origin
+        # of the stereographic projection.  Configuration only: these are NOT in
+        # the fit's free-parameter vector (``_reduced`` = lattice free slots).
+        self._hkl_sliders = []
+        _lim = max(6.0, float(np.max(np.abs(self._hkl))) + 3.0)
+        for i, lab in enumerate(('h', 'k', 'l')):
+            fs = FloatSlider(lab, float(self._hkl[0, i]), -_lim, _lim, '%0.4f')
+            fs.valueChanged.connect(self._on_hkl(i))
+            fs.setToolTip('Primary reflection index — moves the stereographic '
+                          'origin. Configuration only; not refined by Fit.')
+            self._slider_vbox.addWidget(fs)
+            self._hkl_sliders.append(fs)
 
     # ── intersection-group editor ────────────────────────────────────────────────
     _COLS = ['Label', 'Refl 1 (h k l)', 'Refl 2 (h k l)', 'Refl 3 (h k l)',
-             'Energy', 'Intercepts', 'Target']
+             'Energy', 'Target']
 
     def _build_intersections_editor(self):
         box = QtWidgets.QGroupBox('Triple intersections')
@@ -527,9 +538,9 @@ class TripSlider(QtWidgets.QMainWindow):
         self._table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self._table.setToolTip(
             'Each row is one triple intersection: three secondary reflections '
-            'whose Kossel lines should meet.  Reflections and intercepts are '
-            'space-separated integers; energy is keV.  Edits update the panels '
-            'live.')
+            'whose Kossel lines should meet.  Reflections are space-separated '
+            'integers; energy is keV.  The tightest (closest) crossing triple is '
+            'scored automatically.  Edits update the panels live.')
         f = self._table.font(); f.setPointSize(8); self._table.setFont(f)
         self._table.itemChanged.connect(lambda _i: self._table_timer.start())
         self._populate_table()
@@ -576,7 +587,6 @@ class TripSlider(QtWidgets.QMainWindow):
                      self._fmt_vec(refl[0]), self._fmt_vec(refl[1]),
                      self._fmt_vec(refl[2]),
                      '%g' % float(gc['energy']),
-                     self._fmt_vec(gc.get('intercepts', [0, 0, 0])),
                      '%g' % float(gc.get('target', 0.0))]
             for c, txt in enumerate(cells):
                 self._table.setItem(r, c, QtWidgets.QTableWidgetItem(txt))
@@ -594,13 +604,12 @@ class TripSlider(QtWidgets.QMainWindow):
                 reflist = [self._parse_vec(cell(1)), self._parse_vec(cell(2)),
                            self._parse_vec(cell(3))]
                 energy = float(cell(4))
-                intercepts = [int(round(v)) for v in self._parse_vec(cell(5))]
-                target = float(cell(6) or 0.0)
+                target = float(cell(5) or 0.0)
             except ValueError as e:
                 return None, 'row %d: %s' % (r + 1, e)
             groups.append({'label': cell(0) or 'T%d' % (r + 1),
                            'reflist': reflist, 'energy': energy,
-                           'intercepts': intercepts, 'target': target})
+                           'target': target})
         if not groups:
             return None, 'need at least one triple intersection'
         return groups, ''
@@ -622,7 +631,7 @@ class TripSlider(QtWidgets.QMainWindow):
                     {'reflist': [[0, 0, 2], [2, 0, 0], [2, 0, 2]],
                      'energy': self._groups_cfg[0]['energy']
                      if self._groups_cfg else 8.0,
-                     'intercepts': [0, 0, 0], 'target': 0.0})
+                     'target': 0.0})
         template['label'] = 'T%d' % (self._table.rowCount() + 1)
         self._groups_cfg = list(self._groups_cfg) + [template]
         self._populate_table()
@@ -670,6 +679,16 @@ class TripSlider(QtWidgets.QMainWindow):
             # keep symmetry-linked lattice slots visually in step
             self._six = np.array(ts.expand_lattice(self._bravais, self._six),
                                  dtype=float)
+            self._update_timer.start()
+        return handler
+
+    def _on_hkl(self, i):
+        def handler(v):
+            self._hkl[0, i] = float(v)
+            # hkl is the primary reflection stored live on each engine; moving it
+            # re-poles the projection.
+            for g in self._groups:
+                g['tf'].hkl = self._hkl
             self._update_timer.start()
         return handler
 
@@ -861,6 +880,11 @@ class TripSlider(QtWidgets.QMainWindow):
         for slot, fs in self._lat_sliders.items():
             if abs(fs.val - self._six[slot]) > 1e-9:
                 fs.blockSignals(True); fs.setValue(float(self._six[slot]))
+                fs.blockSignals(False)
+        # keep h/k/l readouts in step with programmatic hkl changes (re-index, load)
+        for i, fs in enumerate(getattr(self, '_hkl_sliders', [])):
+            if abs(fs.val - self._hkl[0, i]) > 1e-9:
+                fs.blockSignals(True); fs.setValue(float(self._hkl[0, i]))
                 fs.blockSignals(False)
         reduced = self._reduced()
         total = 0.0
