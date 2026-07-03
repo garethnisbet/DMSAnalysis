@@ -2315,8 +2315,11 @@ class dmsfit_ico_hkl(object):
 def kosscalc(lattice, energy, ref1, ref2, azir, psi, startval, endval, steps):
     '''Kossel-line locus for secondary reflections ``ref2`` (N x 3) about primary
     ``ref1``, swept over azimuth [startval, endval] in ``steps`` points.  Returns
-    an (N*steps) x 5 array of [x, y, z, psi_angle, theta_angle]; the leading 3
-    columns are the (unnormalised) direction, used by the tripfit projection.'''
+    an (N*steps) x 5 array of [x, y, z, psi_angle, theta_angle] grouped by
+    reflection (row block ``i*steps:(i+1)*steps`` is reflection ``i``); the
+    leading 3 columns are the (unnormalised) direction, used by the tripfit
+    projection.  The whole reflection list is handled in one vectorised sweep so
+    a triple needs a single call rather than one per Kossel line.'''
     c, e, h = 299792458, 1.602176487e-19, 6.62606896e-34
     ko = (1e7 * h * c / e) / energy          # wavelength (A); keV2A / energy
     azir = np.array(azir); ref1 = np.array(ref1); ref2 = np.array(ref2)
@@ -2336,16 +2339,33 @@ def kosscalc(lattice, energy, ref1, ref2, azir, psi, startval, endval, steps):
     else:
         ref2c = (bm @ ref2.T).T
     azirangle = (np.arctan2(azirc[0, 0], azirc[0, 1]) * 180 / np.pi)
-    vectnorms = np.linalg.norm(ref2c)
+    ref2c = np.asarray(ref2c)                                    # (N, 3)
+    bl = np.asarray(bragglist).ravel()
+    # Per-reflection Kossel-cone base direction and sweep axis, computed row-wise
+    # so a single call covers the whole reflection list.
+    vectnorms = np.linalg.norm(ref2c, axis=1, keepdims=True)
     v1norm = ref2c / vectnorms * ko
-    perpvects = np.cross(np.roll(v1norm, 1)
-                         * np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1]]), ref2c)
-    v1norms = [v1norm[i1, :] * rotxyz(perpvects[i1, :], 90 - bragglist[i1]).rmat()
-               for i1 in range(ref2.shape[0])]
-    v1 = np.array([[]] * v1norm.shape[1]).T
-    for ang in np.linspace(startval, endval, steps):
-        v1a = v1norms @ rotxyz(ref2c, ang).rmat()
-        v1 = np.vstack([v1, v1a])
+    # np.roll is a no-op on the original np.matrix, so the historical expression
+    # reduces to v1norm @ [[0,-1,0],[1,0,0],[0,0,1]] == [v_y, -v_x, v_z].
+    rolled = np.column_stack((v1norm[:, 1], -v1norm[:, 0], v1norm[:, 2]))
+    perpvects = np.cross(rolled, ref2c)
+    base = np.vstack([np.asarray(np.matrix(v1norm[i])
+                                 * rotxyz(perpvects[i], 90 - bl[i]).rmat())
+                      for i in range(ref2.shape[0])])            # (N, 3)
+    # Rotation matrix for every azimuth about each reflection's own axis, built
+    # in one shot (same entries as rotxyz) and applied with a single einsum
+    # instead of an inner Python loop + per-step vstack.
+    axes = ref2c / np.linalg.norm(ref2c, axis=1, keepdims=True)
+    angs = np.linspace(startval, endval, steps) * np.pi / 180.0
+    ux = axes[:, 0:1]; uy = axes[:, 1:2]; uz = axes[:, 2:3]      # (N, 1)
+    cc = np.cos(angs)[None, :]; ss = np.sin(angs)[None, :]       # (1, steps)
+    e11 = ux**2 + (1 - ux**2)*cc; e12 = ux*uy*(1-cc) - uz*ss; e13 = ux*uz*(1-cc) + uy*ss
+    e21 = ux*uy*(1-cc) + uz*ss; e22 = uy**2 + (1 - uy**2)*cc; e23 = uy*uz*(1-cc) - ux*ss
+    e31 = ux*uz*(1-cc) - uy*ss; e32 = uy*uz*(1-cc) + ux*ss; e33 = uz**2 + (1 - uz**2)*cc
+    rmats = np.stack((np.stack((e11, e12, e13), -1),
+                      np.stack((e21, e22, e23), -1),
+                      np.stack((e31, e32, e33), -1)), -2)        # (N, steps, 3, 3)
+    v1 = np.einsum('ij,isjk->isk', base, rmats).reshape(-1, 3)   # grouped by reflection
     v1 = np.array(v1 @ rotxyz([0, 0, 1], -azirangle).rmat())
     psangles = np.reshape(np.arctan2(v1[:, 0], v1[:, 1]) * 180 / np.pi, (v1.shape[0], 1))
     thangles = np.reshape(np.arctan2(v1[:, 2], np.sqrt(v1[:, 0]**2 + v1[:, 1]**2))
@@ -2417,12 +2437,12 @@ class tripfit(object):
 
     def kosselcalc(self, inputs):
         _lattice = self._lattice_from_reduced(inputs)
-        vr0 = kosscalc(_lattice, self.energy, self.hkl, self.reflist[0, :],
-                       self.azir, self.psi, 0, 360, self.resolution)[:, :3]
-        vr1 = kosscalc(_lattice, self.energy, self.hkl, self.reflist[1, :],
-                       self.azir, self.psi, 0, 360, self.resolution)[:, :3]
-        vr2 = kosscalc(_lattice, self.energy, self.hkl, self.reflist[2, :],
-                       self.azir, self.psi, 0, 360, self.resolution)[:, :3]
+        # One vectorised call for all three Kossel lines; row blocks of length
+        # ``resolution`` come back grouped by reflection.
+        r = self.resolution
+        vr = kosscalc(_lattice, self.energy, self.hkl, self.reflist,
+                      self.azir, self.psi, 0, 360, r)[:, :3]
+        vr0, vr1, vr2 = vr[:r], vr[r:2 * r], vr[2 * r:]
         self.vr0 = np.matrix(vr0 / np.array([np.apply_along_axis(np.linalg.norm, 1, vr0)]).T)
         self.vr1 = np.matrix(vr1 / np.array([np.apply_along_axis(np.linalg.norm, 1, vr1)]).T)
         self.vr2 = np.matrix(vr2 / np.array([np.apply_along_axis(np.linalg.norm, 1, vr2)]).T)
