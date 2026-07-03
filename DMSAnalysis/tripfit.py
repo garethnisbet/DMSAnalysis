@@ -51,7 +51,6 @@ fit    = int(_flags.get('fit', 0))
 
 _geo = cfg['geometry']
 hkl  = np.array([_geo['hkl']], dtype=float)
-psi  = float(_geo['psi'])
 azir = list(_geo['azir'])
 
 _comp      = cfg['computation']
@@ -97,7 +96,7 @@ for gi, gc in enumerate(_groups_cfg):
         raise SystemExit('intersection group %d: reflist must be 3x3' % gi)
     if rr != 0.0:
         reflist = np.round((_R * reflist.T).T)
-    tf = ts.tripfit(hkl, reflist, azir, psi, resolution, bravais,
+    tf = ts.tripfit(hkl, reflist, azir, resolution, bravais,
                     float(gc['energy']), list(gc.get('intercepts', [0, 0, 0])),
                     float(gc.get('target', 0.0)))
     groups.append({'label': gc.get('label', 'T%d' % (gi + 1)),

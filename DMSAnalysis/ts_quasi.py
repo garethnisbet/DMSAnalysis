@@ -2312,7 +2312,7 @@ class dmsfit_ico_hkl(object):
 # Refining the lattice so the three lines meet at a single point (per group)
 # measures those distortions without needing the detector image.
 
-def kosscalc(lattice, energy, ref1, ref2, azir, psi, startval, endval, steps):
+def kosscalc(lattice, energy, ref1, ref2, azir, startval, endval, steps):
     '''Kossel-line locus for secondary reflections ``ref2`` (N x 3) about primary
     ``ref1``, swept over azimuth [startval, endval] in ``steps`` points.  Returns
     an (N*steps) x 5 array of [x, y, z, psi_angle, theta_angle] grouped by
@@ -2401,7 +2401,7 @@ class tripfit(object):
     detector image is needed, only the geometry.
 
     Constructor:
-        tripfit(hkl, reflist, azir, psi, resolution, bravais, energy,
+        tripfit(hkl, reflist, azir, resolution, bravais, energy,
                 kintercepts, target)
 
     ``reflist`` is a 3 x 3 matrix of the three secondary reflections; ``bravais``
@@ -2414,17 +2414,59 @@ class tripfit(object):
     ``fit(reduced)`` returns the scalar residual for a reduced free-parameter
     vector; ``full(reduced)`` returns (intercepts, st0, st1, st2, vr0, vr1, vr2)
     for plotting.'''
-    def __init__(self, hkl, reflist, azir, psi, resolution, bravais, energy,
+    def __init__(self, hkl, reflist, azir, resolution, bravais, energy,
                  kintercepts, target):
         self.hkl = hkl
         self.reflist = np.matrix(reflist)
         self.azir = azir
-        self.psi = psi
         self.resolution = resolution
         self.bravais = bravais
         self.energy = energy
         self.kintercepts = kintercepts
         self.target = target
+        # Branch tracking: each Kossel-line pair crosses at two (or more) points,
+        # and shapely returns them in a geometry-dependent order that reorders as
+        # the lattice varies — so a fixed ``kintercepts`` index does not follow a
+        # single physical crossing and the residual jumps.  ``_anchor`` holds the
+        # last selected point per pair; after the configured index seeds it, each
+        # call picks the crossing nearest the anchor so the branch stays put.
+        self._anchor = None
+
+    def reset_tracking(self):
+        '''Forget the tracked intercept branch so the configured ``kintercepts``
+        index re-seeds it on the next evaluation (call before a fresh fit from a
+        new starting point).'''
+        self._anchor = None
+
+    def _intercepts(self, track=True):
+        '''The three selected pairwise-intersection points (3x2, rows [x, y]),
+        following a consistent branch.  On the first call the configured
+        ``kintercepts`` index chooses each pair's crossing and seeds the anchor;
+        afterwards the crossing nearest the anchor is taken so it cannot flip to
+        the other intersection.  ``track`` updates the anchor to the selected
+        point (interactive use); ``fit`` passes ``track=False`` so every
+        optimiser probe is scored against the same fixed branch.'''
+        pairs = (intersections(self.st0, self.st1),
+                 intersections(self.st0, self.st2),
+                 intersections(self.st1, self.st2))
+        if self._anchor is None:
+            self._anchor = [None, None, None]
+        out = []
+        for i, (x, y, _ea, _eb) in enumerate(pairs):
+            cand = np.column_stack((x, y)) if len(x) else np.empty((0, 2))
+            if len(cand) == 0:
+                raise ValueError('pair %d has no intersection' % i)
+            a = self._anchor[i]
+            if a is None:                     # seed from the configured index
+                k = int(self.kintercepts[i])
+                j = k if 0 <= k < len(cand) else 0
+                self._anchor[i] = cand[j]
+            else:                             # follow the nearest crossing
+                j = int(np.argmin(((cand - a) ** 2).sum(axis=1)))
+                if track:
+                    self._anchor[i] = cand[j]
+            out.append(cand[j])
+        return np.array(out, dtype=float)
 
     def _lattice_from_reduced(self, reduced):
         '''Expand a reduced free-parameter vector into the full constrained
@@ -2441,7 +2483,7 @@ class tripfit(object):
         # ``resolution`` come back grouped by reflection.
         r = self.resolution
         vr = kosscalc(_lattice, self.energy, self.hkl, self.reflist,
-                      self.azir, self.psi, 0, 360, r)[:, :3]
+                      self.azir, 0, 360, r)[:, :3]
         vr0, vr1, vr2 = vr[:r], vr[r:2 * r], vr[2 * r:]
         self.vr0 = np.matrix(vr0 / np.array([np.apply_along_axis(np.linalg.norm, 1, vr0)]).T)
         self.vr1 = np.matrix(vr1 / np.array([np.apply_along_axis(np.linalg.norm, 1, vr1)]).T)
@@ -2453,12 +2495,8 @@ class tripfit(object):
     def fit(self, inputs):
         try:
             self.kosselcalc(inputs)
-            _x1, _y1, ea1, eb1 = intersections(self.st0, self.st1)
-            _x2, _y2, ea2, eb2 = intersections(self.st0, self.st2)
-            _x3, _y3, ea3, eb3 = intersections(self.st1, self.st2)
-            v1 = np.matrix([[_x1[self.kintercepts[0]], _y1[self.kintercepts[0]]]])
-            v2 = np.matrix([[_x2[self.kintercepts[1]], _y2[self.kintercepts[1]]]])
-            v3 = np.matrix([[_x3[self.kintercepts[2]], _y3[self.kintercepts[2]]]])
+            pts = self._intercepts(track=False)   # fixed branch across probes
+            v1 = np.matrix(pts[0]); v2 = np.matrix(pts[1]); v3 = np.matrix(pts[2])
             scal = np.abs(np.linalg.norm(v1) - (v1 / np.linalg.norm(v1) * v2.T)
                           + np.linalg.norm(v2) - (v2 / np.linalg.norm(v2) * v3.T)
                           + np.linalg.norm(v1) - (v1 / np.linalg.norm(v1) * v3.T))
@@ -2470,13 +2508,7 @@ class tripfit(object):
     def full(self, inputs):
         self.kosselcalc(inputs)
         try:
-            _x1, _y1, ea1, eb1 = intersections(self.st0, self.st1)
-            _x2, _y2, ea2, eb2 = intersections(self.st0, self.st2)
-            _x3, _y3, ea3, eb3 = intersections(self.st1, self.st2)
-            intercepts = np.array([[_x1[self.kintercepts[0]], _x2[self.kintercepts[1]],
-                                    _x3[self.kintercepts[2]]],
-                                   [_y1[self.kintercepts[0]], _y2[self.kintercepts[1]],
-                                    _y3[self.kintercepts[2]]]]).T
+            intercepts = self._intercepts(track=True)   # (3, 2), rows [x, y]
         except Exception:
             intercepts = np.zeros((3, 2))
         return intercepts, self.st0, self.st1, self.st2, self.vr0, self.vr1, self.vr2

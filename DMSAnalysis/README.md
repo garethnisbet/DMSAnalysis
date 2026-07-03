@@ -238,7 +238,7 @@ Computes beam vectors tracing a Kossel cone around a single reflection over an a
 
 ---
 
-### `kosscalc(lattice, energy, ref1, ref2, azir, psi, startval, endval, steps)`
+### `kosscalc(lattice, energy, ref1, ref2, azir, startval, endval, steps)`
 Computes Kossel lines for a list of secondary reflections `ref2` relative to a primary reflection `ref1`. Returns an array of `[x, y, z, ψ, θ]` per step.
 
 ---
@@ -329,15 +329,15 @@ small lattice distortions of pseudo-symmetric crystals. Used by the
 
 | Name | Signature | Description |
 |------|-----------|-------------|
-| `kosscalc` | `(lattice, energy, ref1, ref2, azir, psi, start, end, steps)` | Kossel-line locus of secondary reflections `ref2` about primary `ref1`, swept over azimuth; returns `[x,y,z,ψ,θ]` per sample |
+| `kosscalc` | `(lattice, energy, ref1, ref2, azir, start, end, steps)` | Kossel-line locus of secondary reflections `ref2` about primary `ref1`, swept over azimuth; returns `[x,y,z,ψ,θ]` per sample |
 | `stereoproj` | `(vin)` | Stereographic projection of unit vectors (N×3) → 2×N `[x,y]` |
 | `intersections` | `(a, b)` | Intersection points of two closed stereographic loci (uses shapely); returns `(xs, ys, ring_a, ring_b)` |
 
-### `class tripfit(hkl, reflist, azir, psi, resolution, bravais, energy, kintercepts, target)`
+### `class tripfit(hkl, reflist, azir, resolution, bravais, energy, kintercepts, target)`
 Fits a conventional lattice by driving the three Kossel lines of a secondary-reflection triple (`reflist`, 3×3) to a common triple-intersection point.
 
 - `bravais` — one of `CONVENTIONAL_SYSTEMS`; selects the free lattice parameters via `lattice_free_slots` / `expand_lattice` (shared with the image fit, so the packing cannot drift).
-- `kintercepts` — which intersection point of each line pair to score; `target` — desired residual (0 for a perfect triple intersection).
+- `kintercepts` — which intersection point of each line pair to score **at the first evaluation**; it then seeds a tracked branch (`_intercepts`): later evaluations pick the crossing nearest the previously selected one so the selected point cannot flip to the other intersection as the lattice varies (shapely returns the crossings in a geometry-dependent order, so a fixed index would make the residual jump). `full` tracks the branch (updates the anchor, for interactive use); `fit` holds it fixed so every optimiser probe is scored against the same branch. `reset_tracking()` re-seeds from `kintercepts`. `target` — desired residual (0 for a perfect triple intersection).
 
 | Method | Returns | Description |
 |--------|---------|-------------|

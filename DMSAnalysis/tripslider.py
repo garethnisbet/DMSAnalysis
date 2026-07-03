@@ -48,6 +48,21 @@ LATTICE_SPAN = [(0.3, '%0.6f'), (0.3, '%0.6f'), (0.3, '%0.6f'),
 ALGO_METHODS = ['Powell', 'Nelder-Mead', 'COBYLA', 'TNC', 'L-BFGS-B',
                 'GA', 'BHPowell', 'BHCOBYLA', 'BHNelderMead']
 
+# Crystal-type selector entries: (display label, bravais value) — the 7
+# conventional systems, mirroring the conventional subset of slider.py's
+# CRYSTAL_TYPE_CHOICES so both GUIs present the same names.  tripfit is image-
+# free and conventional-only (no icosahedral modes).  The tetragonal/monoclinic
+# unique-axis variants are picked with the separate axis combo, not listed here.
+CRYSTAL_TYPE_CHOICES = [
+    ('Cubic',        'cubic'),
+    ('Tetragonal',   'tetragonal'),
+    ('Orthorhombic', 'orthorhombic'),
+    ('Monoclinic',   'monoclinic'),
+    ('Rhombohedral', 'rhombohedral'),
+    ('Hexagonal',    'hexagonal'),
+    ('Triclinic',    'triclinic'),
+]
+
 
 # ── slider widgets (self-contained, matching the slider workflow theme) ─────────
 class _ValueReadout(QtWidgets.QLineEdit):
@@ -257,7 +272,6 @@ class TripSlider(QtWidgets.QMainWindow):
         self._cfg = cfg
         geo = cfg['geometry']
         self._hkl = np.array([geo['hkl']], dtype=float)
-        self._psi = float(geo['psi'])
         self._azir = list(geo['azir'])
 
         comp = cfg['computation']
@@ -265,6 +279,15 @@ class TripSlider(QtWidgets.QMainWindow):
         if self._bravais not in ts.CONVENTIONAL_SYSTEMS:
             raise SystemExit('computation.bravais must be a conventional system, '
                              'got %r' % self._bravais)
+        # Pseudo-cubic re-indexing (Table 1 of doi:10.1107/S1600576723004120),
+        # mirroring slider.py / fit.py: computation.pseudocubic_transform (1-12,
+        # 1 = identity) selects one of the 12 equivalent indexing matrices,
+        # applied as hkl' = M @ hkl to the primary reflection, the azimuthal
+        # reference and every triple's reflection list.  The stored config values
+        # are the base indexing; the matrix is applied at load (see below).
+        self._pc_idx = int(comp.get('pseudocubic_transform', 1))
+        if not 1 <= self._pc_idx <= len(ts.PSEUDOCUBIC_TRANSFORMS):
+            self._pc_idx = 1
         self._live_res = int(comp.get('live_resolution', 200))
         self._fit_res = int(comp.get('resolution', 1000))
         self._method = comp.get('opt_method', 'Powell')
@@ -277,6 +300,9 @@ class TripSlider(QtWidgets.QMainWindow):
         self._groups_cfg = cfg['intersections']
         if not self._groups_cfg:
             raise SystemExit('config "intersections" must list at least one triple')
+        # apply the configured pseudo-cubic matrix to the base indexing at load
+        if self._pc_idx != 1:
+            self._reindex(ts.pseudocubic_matrix(self._pc_idx))
 
     def _free_slots(self):
         return ts.lattice_free_slots(self._bravais)
@@ -293,7 +319,7 @@ class TripSlider(QtWidgets.QMainWindow):
         self._groups = []
         for gi, gc in enumerate(self._groups_cfg):
             reflist = np.matrix(np.array(gc['reflist'], dtype=float))
-            tf = ts.tripfit(self._hkl, reflist, self._azir, self._psi,
+            tf = ts.tripfit(self._hkl, reflist, self._azir,
                             self._live_res, self._bravais, float(gc['energy']),
                             list(gc.get('intercepts', [0, 0, 0])),
                             float(gc.get('target', 0.0)))
@@ -323,25 +349,51 @@ class TripSlider(QtWidgets.QMainWindow):
         ctrl.setMinimumWidth(320)
         ctrl.setMaximumWidth(430)
 
-        # crystal type
+        # crystal type + unique axis + pseudo-cubic re-indexing (mirrors the
+        # slider.py workflow: display names, and the tetragonal/monoclinic
+        # unique-axis variants chosen from a separate axis combo).
         ct_box = QtWidgets.QGroupBox('Crystal type')
-        ct_l = QtWidgets.QHBoxLayout(ct_box)
-        ct_l.setContentsMargins(4, 2, 4, 2)
+        ct_v = QtWidgets.QVBoxLayout(ct_box)
+        ct_v.setContentsMargins(4, 2, 4, 2)
+        ct_v.setSpacing(2)
+        ct_l = QtWidgets.QHBoxLayout()
         self._crystal_combo = QtWidgets.QComboBox()
-        for name in ts.CONVENTIONAL_SYSTEMS:
-            self._crystal_combo.addItem(name, name)
-        i = self._crystal_combo.findData(self._bravais)
-        if i < 0:
-            self._crystal_combo.insertItem(0, self._bravais, self._bravais); i = 0
-        self._crystal_combo.setCurrentIndex(i)
+        for _disp, _name in CRYSTAL_TYPE_CHOICES:
+            self._crystal_combo.addItem(_disp, _name)
         self._crystal_combo.setToolTip('Crystal system — sets which lattice '
                                        'parameters are free (constrained by '
                                        'symmetry via expand_lattice).')
+        self._axis_combo = QtWidgets.QComboBox()
+        self._axis_combo.setToolTip('Tetragonal: unique axis · Monoclinic: '
+                                    'non-90° angle')
+        self._apply_crystal_combos(self._bravais)   # set both combos from config
         self._crystal_combo.currentIndexChanged.connect(self._on_crystal_changed)
-        ct_l.addWidget(self._crystal_combo)
+        self._axis_combo.currentIndexChanged.connect(self._on_axis_changed)
+        ct_l.addWidget(self._crystal_combo, 1)
+        ct_l.addWidget(self._axis_combo, 1)
+        ct_v.addLayout(ct_l)
+
+        pc_row = QtWidgets.QHBoxLayout()
+        pc_lbl = QtWidgets.QLabel('Pseudo-cubic M')
+        pc_lbl.setToolTip(
+            'Pseudo-cubic re-indexing matrix (Table 1 of Nisbet et al. (2023), '
+            'J. Appl. Cryst. 56, 1046-1050).  Re-indexes the primary hkl, the '
+            'azimuthal reference and every triple’s reflection list as M · hkl '
+            'to test the equivalent indexing choices of a pseudo-cubic crystal '
+            '(1 = identity).  The lattice parameters are left untouched.')
+        self._pc_combo = QtWidgets.QComboBox()
+        for _i in range(1, len(ts.PSEUDOCUBIC_TRANSFORMS) + 1):
+            self._pc_combo.addItem('%2d  %s' % (_i, ts.pseudocubic_label(_i)), _i)
+        _j = self._pc_combo.findData(self._pc_idx)
+        self._pc_combo.setCurrentIndex(_j if _j >= 0 else 0)
+        self._pc_combo.setToolTip(pc_lbl.toolTip())
+        self._pc_combo.currentIndexChanged.connect(self._on_pc_transform_changed)
+        pc_row.addWidget(pc_lbl)
+        pc_row.addWidget(self._pc_combo, 1)
+        ct_v.addLayout(pc_row)
         col.addWidget(ct_box)
 
-        # lattice + psi sliders
+        # lattice sliders
         self._slider_box = QtWidgets.QGroupBox('Lattice / geometry')
         self._slider_vbox = QtWidgets.QVBoxLayout(self._slider_box)
         self._slider_vbox.setSpacing(1)
@@ -457,11 +509,6 @@ class TripSlider(QtWidgets.QMainWindow):
             fs.valueChanged.connect(self._on_slider(slot))
             self._slider_vbox.addWidget(fs)
             self._lat_sliders[slot] = fs
-        # psi (global)
-        self._psi_slider = FloatSlider('ψ', self._psi, self._psi - 180,
-                                       self._psi + 180, '%0.5f')
-        self._psi_slider.valueChanged.connect(self._on_psi)
-        self._slider_vbox.addWidget(self._psi_slider)
 
     # ── intersection-group editor ────────────────────────────────────────────────
     _COLS = ['Label', 'Refl 1 (h k l)', 'Refl 2 (h k l)', 'Refl 3 (h k l)',
@@ -626,20 +673,69 @@ class TripSlider(QtWidgets.QMainWindow):
             self._update_timer.start()
         return handler
 
-    def _on_psi(self, v):
-        self._psi = float(v)
-        for g in self._groups:
-            g['tf'].psi = self._psi
-        self._update_timer.start()
-
     def _on_live_res_changed(self, v):
         self._live_res = int(v)
         for g in self._groups:
             g['tf'].resolution = self._live_res
         self._update_timer.start()
 
-    def _on_crystal_changed(self, _idx=None):
-        name = self._crystal_combo.currentData()
+    # ── crystal type + unique axis (mirrors slider.py's base/axis split) ────────
+    @staticmethod
+    def _split_bravais(b):
+        """Split a bravais value into (base, axis-suffix), e.g. 'tetragonal_a' ->
+        ('tetragonal', '_a').  Only tetragonal/monoclinic have variants."""
+        for base in ('tetragonal', 'monoclinic'):
+            if b == base:
+                return base, ''
+            if b.startswith(base + '_'):
+                return base, b[len(base):]
+        return b, ''
+
+    @staticmethod
+    def _axis_options(base):
+        """(label, suffix) options for the unique-axis combo, per base system."""
+        if base == 'tetragonal':
+            return [('unique c', ''), ('unique a', '_a'), ('unique b', '_b')]
+        if base == 'monoclinic':
+            return [('β ≠ 90', ''), ('α ≠ 90', '_a'), ('γ ≠ 90', '_c')]
+        return []
+
+    def _refresh_axis_combo(self, base, suffix=''):
+        """Repopulate the unique-axis combo for ``base``, selecting ``suffix``;
+        hidden when the base system has no axis choice."""
+        self._axis_combo.blockSignals(True)
+        self._axis_combo.clear()
+        opts = self._axis_options(base)
+        if opts:
+            for _disp, _suf in opts:
+                self._axis_combo.addItem(_disp, _suf)
+            j = self._axis_combo.findData(suffix)
+            self._axis_combo.setCurrentIndex(j if j >= 0 else 0)
+        self._axis_combo.setVisible(bool(opts))
+        self._axis_combo.blockSignals(False)
+
+    def _apply_crystal_combos(self, b):
+        """Set the crystal-type and unique-axis combos to reflect bravais ``b``
+        (no signals emitted)."""
+        base, suffix = self._split_bravais(b)
+        self._crystal_combo.blockSignals(True)
+        i = self._crystal_combo.findData(base)
+        if i < 0:   # a system not in the list — keep it, don't switch
+            self._crystal_combo.insertItem(0, base, base)
+            i = 0
+        self._crystal_combo.setCurrentIndex(i)
+        self._crystal_combo.blockSignals(False)
+        self._refresh_axis_combo(base, suffix)
+
+    def _effective_bravais(self):
+        """Bravais value combining the crystal-type and unique-axis combos."""
+        base = self._crystal_combo.currentData()
+        if base is None:
+            return None
+        suffix = self._axis_combo.currentData() if self._axis_combo.count() else ''
+        return base + (suffix or '')
+
+    def _switch_crystal(self, name):
         if not name or name == self._bravais:
             return
         self._bravais = name
@@ -648,6 +744,54 @@ class TripSlider(QtWidgets.QMainWindow):
         self._rebuild_engines()
         self._redraw()
         self._status.showMessage('Crystal type: %s' % name)
+
+    def _on_crystal_changed(self, _idx=None):
+        base = self._crystal_combo.currentData()
+        if base is None:
+            return
+        self._refresh_axis_combo(base)   # default axis for the new base system
+        eff = self._effective_bravais()
+        if eff:
+            self._switch_crystal(eff)
+
+    def _on_axis_changed(self, _idx=None):
+        eff = self._effective_bravais()
+        if eff:
+            self._switch_crystal(eff)
+
+    # ── pseudo-cubic re-indexing (Table 1, Nisbet et al. 2023) ──────────────────
+    def _reindex(self, R):
+        '''Re-index the primary hkl, azimuthal reference and every triple's
+        reflection list in place by the integer matrix ``R`` (hkl' = R·hkl; for
+        the stored row vectors, ``v' = v @ R.T``).  ``R`` is an orthogonal cubic
+        rotation, so integer indices stay integer.'''
+        R = np.asarray(R, dtype=float)
+        self._hkl = np.round(self._hkl @ R.T)
+        self._azir = [float(v) for v in np.round(R @ np.asarray(self._azir, float))]
+        for gc in self._groups_cfg:
+            refl = np.asarray(gc['reflist'], dtype=float)
+            gc['reflist'] = np.round(refl @ R.T).tolist()
+
+    def _on_pc_transform_changed(self, _idx=None):
+        new = self._pc_combo.currentData()
+        if new is None or new == self._pc_idx:
+            return
+        # flush any pending (debounced) table edits so we re-index what is shown
+        groups, err = self._read_table()
+        if not err:
+            self._groups_cfg = groups
+        # matrices are orthogonal, so the relative re-indexing from the current
+        # setting is R = M_new · M_oldᵀ (same delta rule as slider.py)
+        R = ts.pseudocubic_matrix(new) @ ts.pseudocubic_matrix(self._pc_idx).T
+        self._reindex(R)
+        self._pc_idx = new
+        self._cfg['intersections'] = self._groups_cfg
+        self._cfg.setdefault('computation', {})['pseudocubic_transform'] = new
+        self._populate_table()
+        self._rebuild_engines()
+        self._redraw()
+        self._status.showMessage('Pseudo-cubic transform %d applied: %s'
+                                 % (new, ts.pseudocubic_label(new)))
 
     def _on_load_config(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -663,10 +807,11 @@ class TripSlider(QtWidgets.QMainWindow):
             self._status.showMessage('Load failed: %s' % e)
             return
         # rebuild everything for the new config
-        i = self._crystal_combo.findData(self._bravais)
-        self._crystal_combo.blockSignals(True)
-        self._crystal_combo.setCurrentIndex(i if i >= 0 else 0)
-        self._crystal_combo.blockSignals(False)
+        self._apply_crystal_combos(self._bravais)
+        j = self._pc_combo.findData(self._pc_idx)
+        self._pc_combo.blockSignals(True)
+        self._pc_combo.setCurrentIndex(j if j >= 0 else 0)
+        self._pc_combo.blockSignals(False)
         self._sp_live.setValue(self._live_res)
         self._sp_fit.setValue(self._fit_res)
         self._populate_sliders()
@@ -695,10 +840,13 @@ class TripSlider(QtWidgets.QMainWindow):
         cfg = copy.deepcopy(self._cfg)
         cfg['intersections'] = copy.deepcopy(self._groups_cfg)
         cfg.setdefault('geometry', {})['hkl'] = [float(v) for v in self._hkl.ravel()]
-        cfg['geometry']['psi'] = float(self._psi)
         cfg['geometry']['azir'] = list(self._azir)
         cfg.setdefault('computation', {})
         cfg['computation']['bravais'] = self._bravais
+        # hkl/azir/reflists above are already in the active pseudo-cubic
+        # indexing, so reset the transform to 1 — the consumer must not re-apply
+        # the matrix (mirrors slider.py's export).
+        cfg['computation']['pseudocubic_transform'] = 1
         cfg['computation']['opt_method'] = self._algo_combo.currentText()
         cfg['computation']['resolution'] = int(self._sp_fit.value())
         cfg['computation']['live_resolution'] = int(self._sp_live.value())
@@ -718,7 +866,6 @@ class TripSlider(QtWidgets.QMainWindow):
         total = 0.0
         for g, panel in zip(self._groups, self._panels):
             tf = g['tf']
-            tf.psi = self._psi
             try:
                 interc, st0, st1, st2, _v0, _v1, _v2 = tf.full(reduced)
                 sts = [np.asarray(st0), np.asarray(st1), np.asarray(st2)]
@@ -743,7 +890,6 @@ class TripSlider(QtWidgets.QMainWindow):
         s = 0.0
         for g in self._groups:
             g['tf'].resolution = self._fit_res
-            g['tf'].psi = self._psi
             s += g['tf'].fit(x)
         return s
 

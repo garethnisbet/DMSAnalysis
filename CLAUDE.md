@@ -28,8 +28,13 @@ lattice distortions of pseudo-symmetric crystals (see the pseudo-cubic
 re-indexing note under *Conventional crystals*). `tripslider.py` is its
 interactive pyqtgraph GUI (dark theme, matching `slider.py`): drag the free
 lattice / ψ sliders and watch each triple's Kossel lines and its residual update
-live on a stereographic panel, switch crystal system from a dropdown, and run the
-optimiser in the background with **Fit** / **Stop**. The **Triple intersections**
+live on a stereographic panel, switch crystal system from a dropdown, pick the
+pseudo-cubic re-indexing from the **Pseudo-cubic** dropdown (the 12 Table-1
+matrices, `pseudocubic_transform`, exactly as in `slider.py` — selecting one
+re-indexes the primary hkl, the azimuthal reference and every triple's reflection
+list live as `hkl' = M·hkl`, so you can read off which indexing gives the lowest
+triple-intersection residual), and run the optimiser in the background with
+**Fit** / **Stop**. The **Triple intersections**
 table at the bottom edits the group list at runtime — **Add triple**,
 **Duplicate**, **Remove**, and per-cell editing of each group's label, three
 reflections, energy, intercepts and target; the panels rebuild live (wrapping to
@@ -170,10 +175,10 @@ These directories are immutable run records — do not modify them.
 | Section | Purpose |
 |---------|---------|
 | `flags` | `save`, `fit` — run controls |
-| `geometry` | `hkl` (primary reflection), `psi`, `azir` (azimuthal reference) |
-| `computation` | `bravais` (a `CONVENTIONAL_SYSTEMS` name), `resolution` (Kossel-line sampling for the fit), `opt_method` (`Powell`/`Nelder-Mead`/`COBYLA`/`TNC`/`GA`/`BH*`), `tolerance`, `boundrange` `[lo,hi]` added to the guess for bounds, optional `rr` (azimuthal pre-rotation, deg), `bh_niter`, `de_strategy`, and (GUI only) `live_resolution` for the interactive overlay |
+| `geometry` | `hkl` (primary reflection), `azir` (azimuthal reference) |
+| `computation` | `bravais` (a `CONVENTIONAL_SYSTEMS` name), `resolution` (Kossel-line sampling for the fit), `opt_method` (`Powell`/`Nelder-Mead`/`COBYLA`/`TNC`/`GA`/`BH*`), `tolerance`, `boundrange` `[lo,hi]` added to the guess for bounds, optional `rr` (azimuthal pre-rotation, deg), `bh_niter`, `de_strategy`, `pseudocubic_transform` (1–12, GUI only — the Table-1 pseudo-cubic indexing matrix applied to the base indexing at load, same key/semantics as `fit.py`/`slider.py`; 1 = identity), and (GUI only) `live_resolution` for the interactive overlay |
 | `crystal` | `initial_guess` — full 6-element lattice `[a,b,c,α,β,γ]`; only the crystal system's free slots are refined |
-| `intersections` | list of triples, each `{label, reflist (3×3), energy, intercepts, target}` — the three secondary reflections whose Kossel lines must meet |
+| `intersections` | list of triples, each `{label, reflist (3×3), energy, intercepts, target}` — the three secondary reflections whose Kossel lines must meet. `intercepts` seeds which crossing of each line pair to follow at the first evaluation; the engine then tracks that branch (nearest-crossing) so the selection stays consistent and the residual doesn't jump as the lattice varies during the fit |
 | `display` | `lim`, `dpi` — plot settings |
 
 The lattice constraints reuse `ts_quasi.lattice_free_slots` / `expand_lattice`
