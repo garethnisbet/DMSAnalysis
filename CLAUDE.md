@@ -38,7 +38,13 @@ triple-intersection residual), and run the optimiser in the background with
 table at the bottom edits the group list at runtime — **Add triple**,
 **Duplicate**, **Remove**, and per-cell editing of each group's label, three
 reflections, energy, intercepts and target; the panels rebuild live (wrapping to
-a grid past four groups). It reads and writes the same config schema as
+a grid past four groups). Each row's label cell carries a tick box (`enabled` in
+the config): unticking drops that triple from the fit and the summed residual
+while its panel stays visible, dimmed and titled *(excluded)*, so you can watch a
+triple you are not refining against. **Hide excluded** instead drops the unticked
+panels out of the grid so the remaining ones reflow into the freed space; panels
+keep their zoom across hiding, ticking and add/remove. `tripfit.py` honours the
+same `enabled` flag. It reads and writes the same config schema as
 `tripfit.py`, so a config saved from the GUI runs unchanged in the batch app.
 
 Each app falls back to the example config in `DMSAnalysis/configs/` when no path is given.
@@ -176,9 +182,9 @@ These directories are immutable run records — do not modify them.
 |---------|---------|
 | `flags` | `save`, `fit` — run controls |
 | `geometry` | `hkl` (primary reflection), `azir` (azimuthal reference) |
-| `computation` | `bravais` (a `CONVENTIONAL_SYSTEMS` name), `resolution` (Kossel-line sampling for the fit), `opt_method` (`Powell`/`Nelder-Mead`/`COBYLA`/`TNC`/`GA`/`BH*`), `tolerance`, `boundrange` `[lo,hi]` added to the guess for bounds, optional `rr` (azimuthal pre-rotation, deg), `bh_niter`, `de_strategy`, `pseudocubic_transform` (1–12, GUI only — the Table-1 pseudo-cubic indexing matrix applied to the base indexing at load, same key/semantics as `fit.py`/`slider.py`; 1 = identity), and (GUI only) `live_resolution` for the interactive overlay |
+| `computation` | `bravais` (a `CONVENTIONAL_SYSTEMS` name), `resolution` (Kossel-line sampling for the fit), `opt_method` (any name in `ts_quasi.TRIPFIT_METHODS` — see *Optimiser methods* below), `tolerance`, `boundrange` `[lo,hi]` added to the guess for bounds, optional `rr` (azimuthal pre-rotation, deg), `bh_niter`, `de_strategy`, `fd_step` (finite-difference step for the gradient methods; omit/`null` to use SciPy's default), `pseudocubic_transform` (1–12, GUI only — the Table-1 pseudo-cubic indexing matrix applied to the base indexing at load, same key/semantics as `fit.py`/`slider.py`; 1 = identity), and (GUI only) `live_resolution` for the interactive overlay |
 | `crystal` | `initial_guess` — full 6-element lattice `[a,b,c,α,β,γ]`; only the crystal system's free slots are refined |
-| `intersections` | list of triples, each `{label, reflist (3×3), energy, target}` — the three secondary reflections whose Kossel lines must meet. Which crossing of each line pair to score is chosen automatically: the engine takes the tightest (mutually-closest) triple, so the selection stays consistent and the residual doesn't jump as the lattice varies. (A legacy `intercepts` index vector, if present, is ignored.) |
+| `intersections` | list of triples, each `{label, reflist (3×3), energy, target, enabled}` — the three secondary reflections whose Kossel lines must meet. Which crossing of each line pair to score is chosen automatically: the engine takes the tightest (mutually-closest) triple, so the selection stays consistent and the residual doesn't jump as the lattice varies. `enabled` (default `true`, the GUI's per-row tick box) drops a triple from the objective while still plotting it, dimmed. (A legacy `intercepts` index vector, if present, is ignored.) |
 | `display` | `lim`, `dpi` — plot settings |
 
 The lattice constraints reuse `ts_quasi.lattice_free_slots` / `expand_lattice`
@@ -188,6 +194,53 @@ groups; `fit=0` just evaluates and plots at the initial guess. The engine
 (`ts_quasi.kosscalc`, `stereoproj`, `intersections`, `tripfit`) is ported from
 the standalone `calcms/ts_light.py` so the whole workflow lives in the package.
 See `configs/tripfit_rhombohedral_PMN_PT_example.json`.
+
+### The residual
+
+Per triple, `ts_quasi.tripfit.fit` scores the three pairwise Kossel-line
+crossings `v1, v2, v3` (the tightest triple, picked by `_intercepts`) with
+`ts_quasi.triple_spread` — the summed **squared** pairwise distance
+
+```
+S = |v1-v2|² + |v2-v3|² + |v1-v3|²
+```
+
+and returns `|S - target|`; the app sums that over the enabled triples. `S` is
+the least-squares spread of the three crossings: zero only when the lines meet
+at a point, every term non-negative (so a wide triple cannot score low through
+cancellation), invariant under relabelling the points, and smooth/quadratic at
+the minimum so the gradient methods behave. Being squared, `S` scales as the
+*square* of the miss distance — a residual of 1e-10 means the crossings are
+~1e-5 apart. The same function backs the GUI's live residual
+(`tripslider.residual_from_intercepts`), so the two cannot drift. A failed
+evaluation (e.g. a line pair that does not intersect) scores the flat penalty
+`500`.
+
+> This replaces the original `ts_light.py` expression
+> `Σ(|vᵢ| - v̂ᵢ·vⱼ)`, which summed signed terms inside a single `abs`: it used
+> `|v1|` twice and `|v3|` never, was not invariant under relabelling, and could
+> score a widely-separated triple near zero through cancellation. Residuals
+> from before this change (including those in older `Processing/` snapshots) are
+> **not comparable** to current ones.
+
+### Optimiser methods
+
+`opt_method` accepts any name in `ts_quasi.TRIPFIT_METHODS`, dispatched by the
+shared `ts_quasi.run_tripfit_optimiser` (used by both `tripfit.py` and the GUI,
+so the two cannot drift):
+
+| Family | Methods | Notes |
+|--------|---------|-------|
+| Direct search | `Powell`, `Nelder-Mead`, `COBYLA` | No derivatives; slowest but grind closest to machine precision |
+| Gradient-based | `L-BFGS-B`, `SLSQP`, `TNC`, `BFGS`, `CG` | Finite-difference gradients; typically 1–2 orders of magnitude fewer evaluations |
+| Global | `GA` (differential evolution), `BH<local>` (basin hopping, e.g. `BHPowell`, `BHL-BFGS-B`) | For escaping the local minima the objective does have |
+
+Bounds (from `boundrange`) are passed only to the methods that accept them
+(`L-BFGS-B`, `SLSQP`, `TNC`, and `GA`); the rest run unbounded. Each method is
+given only the SciPy `options` keys it actually understands — note `Powell` takes
+`xtol`/`ftol` but `Nelder-Mead` takes `xatol`/`fatol`, and COBYLA takes neither.
+The legacy name `BHNelderMead` is accepted as an alias for `BHNelder-Mead`
+(`ts_quasi.tripfit_method`); it previously fed SciPy an invalid inner method.
 
 ## Physics context
 

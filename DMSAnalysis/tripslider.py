@@ -25,7 +25,7 @@ import os, sys, json, copy
 os.environ.setdefault('PYQTGRAPH_QT_LIB', 'PyQt5')
 
 import numpy as np
-from scipy.optimize import minimize, differential_evolution, basinhopping
+from shapely.geometry import LineString, box as _shbox
 
 from . import ts_quasi as ts
 
@@ -45,8 +45,13 @@ LATTICE_LABELS = ['a', 'b', 'c', 'α', 'β', 'γ']
 LATTICE_SPAN = [(0.3, '%0.6f'), (0.3, '%0.6f'), (0.3, '%0.6f'),
                 (1.5, '%0.6f'), (1.5, '%0.6f'), (1.5, '%0.6f')]
 
-ALGO_METHODS = ['Powell', 'Nelder-Mead', 'COBYLA', 'TNC', 'L-BFGS-B',
-                'GA', 'BHPowell', 'BHCOBYLA', 'BHNelderMead']
+# Steps across the h/k/l sliders' full span: 3x the FloatSlider default, so one
+# arrow-key press moves the index a third as far.  The readout carries an extra
+# decimal to match (at the ±6 default span a step is ~4e-5, invisible at 4 dp).
+HKL_STEPS = 300000
+HKL_FMT   = '%0.5f'
+
+ALGO_METHODS = list(ts.TRIPFIT_METHODS)
 
 # Crystal-type selector entries: (display label, bravais value) — the 7
 # conventional systems, mirroring the conventional subset of slider.py's
@@ -180,12 +185,8 @@ def residual_from_intercepts(interc, target=0.0):
     interc = np.asarray(interc, dtype=float)
     if interc.shape != (3, 2) or not np.any(interc):
         return 500.0
-    v1, v2, v3 = (np.matrix(interc[0]), np.matrix(interc[1]), np.matrix(interc[2]))
     try:
-        scal = np.abs(np.linalg.norm(v1) - (v1 / np.linalg.norm(v1) * v2.T)
-                      + np.linalg.norm(v2) - (v2 / np.linalg.norm(v2) * v3.T)
-                      + np.linalg.norm(v1) - (v1 / np.linalg.norm(v1) * v3.T))
-        return float(np.abs(np.array(scal)[0][0] - target))
+        return abs(ts.triple_spread(interc) - target)
     except Exception:
         return 500.0
 
@@ -200,7 +201,8 @@ class FitWorker(QtCore.QThread):
     class _Stop(Exception):
         pass
 
-    def __init__(self, objective, x0, method, bounds, tol, niter, strat, parent=None):
+    def __init__(self, objective, x0, method, bounds, tol, niter, strat,
+                 fd_step=ts.TRIPFIT_FD_STEP, parent=None):
         super().__init__(parent)
         self._obj = objective
         self._x0 = np.atleast_1d(np.asarray(x0, dtype=float))
@@ -209,6 +211,7 @@ class FitWorker(QtCore.QThread):
         self._tol = tol
         self._niter = niter
         self._strat = strat
+        self._fd_step = fd_step
         self._stop = False
 
     def request_stop(self):
@@ -224,24 +227,11 @@ class FitWorker(QtCore.QThread):
     def run(self):
         best_x, best_f = self._x0, np.inf
         try:
-            if self._method == 'GA':
-                res = differential_evolution(self._wrapped, self._bounds,
-                                             strategy=self._strat, polish=True)
-                best_x, best_f = res.x, res.fun
-            elif self._method.startswith('BH'):
-                inner = self._method[2:] or 'Powell'
-                res = basinhopping(self._wrapped, self._x0,
-                                   minimizer_kwargs={'method': inner},
-                                   niter=self._niter)
-                best_x, best_f = res.x, res.fun
-            elif self._method == 'TNC':
-                res = minimize(self._wrapped, self._x0, method='TNC',
-                               bounds=self._bounds, tol=self._tol)
-                best_x, best_f = res.x, res.fun
-            else:
-                res = minimize(self._wrapped, self._x0, method=self._method,
-                               tol=self._tol)
-                best_x, best_f = res.x, res.fun
+            res = ts.run_tripfit_optimiser(self._wrapped, self._x0, self._method,
+                                           self._bounds, self._tol,
+                                           niter=self._niter, strat=self._strat,
+                                           fd_step=self._fd_step)
+            best_x, best_f = res.x, res.fun
         except FitWorker._Stop:
             best_x, best_f = self._x0, self._obj(self._x0)
         except Exception as e:
@@ -290,12 +280,14 @@ class TripSlider(QtWidgets.QMainWindow):
             self._pc_idx = 1
         self._live_res = int(comp.get('live_resolution', 200))
         self._fit_res = int(comp.get('resolution', 1000))
-        self._method = comp.get('opt_method', 'Powell')
+        self._method = ts.tripfit_method(comp.get('opt_method', 'Powell'))
         self._tol = float(comp.get('tolerance', 1e-12))
         self._boundrange = comp.get('boundrange', [-0.012, 0.012])
         self._niter = int(comp.get('bh_niter', 50))
         self._strat = ts.DE_Strategy.get(comp.get('de_strategy', 'best1bin'),
                                          'best1bin')
+        _fd = comp.get('fd_step', ts.TRIPFIT_FD_STEP)
+        self._fd_step = None if _fd is None else float(_fd)
         self._six = np.array(cfg['crystal']['initial_guess'], dtype=float)
         self._groups_cfg = cfg['intersections']
         if not self._groups_cfg:
@@ -325,7 +317,7 @@ class TripSlider(QtWidgets.QMainWindow):
             self._groups.append({
                 'label': gc.get('label', 'T%d' % (gi + 1)),
                 'reflist': reflist, 'target': float(gc.get('target', 0.0)),
-                'tf': tf})
+                'enabled': bool(gc.get('enabled', True)), 'tf': tf})
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -460,10 +452,19 @@ class TripSlider(QtWidgets.QMainWindow):
 
         splitter.addWidget(ctrl)
 
-        # right: stereographic panels
-        self._gw = pg.GraphicsLayoutWidget()
-        self._gw.setMinimumWidth(520)
-        splitter.addWidget(self._gw)
+        # right: stereographic panels.  Each panel is its OWN pg.PlotWidget in a
+        # plain Qt QGridLayout — deliberately NOT a shared pg.GraphicsLayoutWidget.
+        # Several setAspectLocked plots inside one GraphicsLayout never converge:
+        # each plot's aspect adjustment re-fires the shared layout's geometry
+        # pass, which resizes the neighbours, which re-fire their aspect lock —
+        # an endless rescaling loop.  Isolated PlotWidgets in a Qt grid don't
+        # share a pyqtgraph layout, so aspect lock stays local and stable.
+        self._panels_host = QtWidgets.QWidget()
+        self._panels_host.setMinimumWidth(520)
+        self._panels_grid = QtWidgets.QGridLayout(self._panels_host)
+        self._panels_grid.setContentsMargins(0, 0, 0, 0)
+        self._panels_grid.setSpacing(4)
+        splitter.addWidget(self._panels_host)
         splitter.setStretchFactor(1, 1)
         self._build_panels()
 
@@ -476,23 +477,82 @@ class TripSlider(QtWidgets.QMainWindow):
                                  % (self._bravais, len(self._groups_cfg)))
         self.resize(1150, 780)
 
+    def _panel_views(self):
+        """{label: (xRange, yRange)} for every panel the user has zoomed or
+        panned.  Keyed off the label each panel was built with — ``_groups_cfg``
+        already holds the *new* list by the time a rebuild runs.  Panels still on
+        autorange are omitted so they keep autoranging after a rebuild."""
+        views = {}
+        for panel in getattr(self, '_panels', []):
+            vb = panel['plot'].getViewBox()
+            if all(vb.autoRangeEnabled()):
+                continue
+            xr, yr = vb.viewRange()
+            views[panel['label']] = (list(xr), list(yr))
+        return views
+
     def _build_panels(self):
         """One stereographic plot per intersection group, with three Kossel-line
-        curves and the three intercept markers."""
-        self._gw.clear()
+        curves and the three intercept markers.  Each group gets an independent
+        pg.PlotWidget (see the layout note in the UI setup) so the aspect-locked
+        panels can't drive each other into a rescaling loop.
+
+        A group's zoom/pan is remembered by label across the rebuild, so adding
+        or removing a triple does not yank the other panels back to autorange.
+        Panels the user never zoomed (still autoranging) are left autoranging."""
+        saved = self._panel_views()
+        # tear down any existing panels (hidden ones are parented, not in the grid)
+        for panel in getattr(self, '_panels', []):
+            w = panel['widget']
+            self._panels_grid.removeWidget(w)
+            w.setParent(None); w.deleteLater()
         self._panels = []
-        ncols = min(max(1, len(self._groups_cfg)), 4)   # wrap wide group counts
         for gi, gc in enumerate(self._groups_cfg):
-            p = self._gw.addPlot(row=gi // ncols, col=gi % ncols)
+            pw = pg.PlotWidget()
+            p = pw.getPlotItem()
             p.setAspectLocked(True)
             p.showGrid(x=True, y=True, alpha=0.15)
             p.setMenuEnabled(False)
-            curves = [p.plot([], [], pen=pg.mkPen(LINE_PENS[k], width=1.5))
+            label = gc.get('label', 'T%d' % (gi + 1))
+            rng = saved.get(label)
+            if rng is not None:
+                p.getViewBox().setRange(xRange=rng[0], yRange=rng[1], padding=0)
+            curves = [p.plot([], [], pen=pg.mkPen(LINE_PENS[k], width=1.5),
+                             connect='finite')
                       for k in range(3)]
             pts = pg.ScatterPlotItem(size=9, pen=pg.mkPen('#ffffff', width=1),
                                      brush=pg.mkBrush('#ffcc33'))
             p.addItem(pts)
-            self._panels.append({'plot': p, 'curves': curves, 'pts': pts})
+            # 'full' holds the un-clipped (x, y) for each curve; the view is
+            # rendered from it via _render_panel, which clips to the visible
+            # rectangle once the user zooms in (see _render_panel).
+            panel = {'plot': p, 'widget': pw, 'curves': curves, 'pts': pts,
+                     'label': label, 'shown': True,
+                     'full': [(np.array([]), np.array([]))] * 3}
+            self._panels.append(panel)
+            # re-clip whenever the user pans/zooms this panel
+            p.getViewBox().sigRangeChanged.connect(
+                lambda *a, _pnl=panel: self._render_panel(_pnl))
+        self._relayout_panels()
+
+    def _relayout_panels(self):
+        """Place the panels that should be on screen into the grid, wrapping past
+        four columns.  With 'Hide excluded' ticked the unticked triples are pulled
+        out of the grid entirely so the remaining panels take the freed space.
+        Widgets are only re-parented into the layout, never rebuilt, so hiding and
+        re-showing a panel keeps its zoom."""
+        hide = (getattr(self, '_chk_hide_excluded', None) is not None
+                and self._chk_hide_excluded.isChecked())
+        for panel, gc in zip(self._panels, self._groups_cfg):
+            panel['shown'] = bool(gc.get('enabled', True)) or not hide
+        shown = [p for p in self._panels if p['shown']]
+        for panel in self._panels:
+            self._panels_grid.removeWidget(panel['widget'])
+        ncols = min(max(1, len(shown)), 4)   # wrap wide group counts
+        for i, panel in enumerate(shown):
+            self._panels_grid.addWidget(panel['widget'], i // ncols, i % ncols)
+        for panel in self._panels:
+            panel['widget'].setVisible(panel['shown'])
 
     def _populate_sliders(self):
         while self._slider_vbox.count():
@@ -514,7 +574,8 @@ class TripSlider(QtWidgets.QMainWindow):
         self._hkl_sliders = []
         _lim = max(6.0, float(np.max(np.abs(self._hkl))) + 3.0)
         for i, lab in enumerate(('h', 'k', 'l')):
-            fs = FloatSlider(lab, float(self._hkl[0, i]), -_lim, _lim, '%0.4f')
+            fs = FloatSlider(lab, float(self._hkl[0, i]), -_lim, _lim, HKL_FMT,
+                             n_steps=HKL_STEPS)
             fs.valueChanged.connect(self._on_hkl(i))
             fs.setToolTip('Primary reflection index — moves the stereographic '
                           'origin. Configuration only; not refined by Fit.')
@@ -540,7 +601,9 @@ class TripSlider(QtWidgets.QMainWindow):
             'Each row is one triple intersection: three secondary reflections '
             'whose Kossel lines should meet.  Reflections are space-separated '
             'integers; energy is keV.  The tightest (closest) crossing triple is '
-            'scored automatically.  Edits update the panels live.')
+            'scored automatically.  Edits update the panels live.  Untick a row '
+            'to drop that triple from the fit and the summed residual — its panel '
+            'stays visible, dimmed, so you can watch it while it is excluded.')
         f = self._table.font(); f.setPointSize(8); self._table.setFont(f)
         self._table.itemChanged.connect(lambda _i: self._table_timer.start())
         self._populate_table()
@@ -563,6 +626,18 @@ class TripSlider(QtWidgets.QMainWindow):
         row.addWidget(btn_dup)
         row.addWidget(btn_del)
         row.addStretch(1)
+        # Unticked triples are dimmed in place by default; hiding them instead
+        # drops them out of the grid so the remaining panels get the space.
+        self._chk_hide_excluded = QtWidgets.QCheckBox('Hide excluded')
+        self._chk_hide_excluded.setChecked(False)
+        self._chk_hide_excluded.setToolTip(
+            'Remove the unticked triples from the panel grid instead of dimming '
+            'them, so the panels still in the fit use the full width. Their zoom '
+            'is kept for when you tick them again.')
+        _fh = self._chk_hide_excluded.font(); _fh.setPointSize(8)
+        self._chk_hide_excluded.setFont(_fh)
+        self._chk_hide_excluded.toggled.connect(self._on_hide_excluded_toggled)
+        row.addWidget(self._chk_hide_excluded)
         v.addLayout(row)
         box.setMaximumHeight(220)
         return box
@@ -590,6 +665,11 @@ class TripSlider(QtWidgets.QMainWindow):
                      '%g' % float(gc.get('target', 0.0))]
             for c, txt in enumerate(cells):
                 self._table.setItem(r, c, QtWidgets.QTableWidgetItem(txt))
+            # the label cell carries the include-in-fit checkbox
+            lbl = self._table.item(r, 0)
+            lbl.setFlags(lbl.flags() | QtCore.Qt.ItemIsUserCheckable)
+            lbl.setCheckState(QtCore.Qt.Checked if gc.get('enabled', True)
+                              else QtCore.Qt.Unchecked)
         self._table.blockSignals(False)
 
     def _read_table(self):
@@ -607,9 +687,12 @@ class TripSlider(QtWidgets.QMainWindow):
                 target = float(cell(5) or 0.0)
             except ValueError as e:
                 return None, 'row %d: %s' % (r + 1, e)
+            lbl = self._table.item(r, 0)
+            enabled = (lbl is None
+                       or lbl.checkState() == QtCore.Qt.Checked)
             groups.append({'label': cell(0) or 'T%d' % (r + 1),
                            'reflist': reflist, 'energy': energy,
-                           'target': target})
+                           'target': target, 'enabled': enabled})
         if not groups:
             return None, 'need at least one triple intersection'
         return groups, ''
@@ -622,7 +705,14 @@ class TripSlider(QtWidgets.QMainWindow):
         self._groups_cfg = groups
         self._cfg['intersections'] = groups
         self._rebuild_engines()
-        self._build_panels()
+        # Panels are per-group only in number: a panel holds no group state, so
+        # rebuild them only when the group count changes.  Editing a cell or
+        # ticking a row reuses the existing panels, which keeps each one's zoom
+        # and pan instead of snapping the view back to autorange.
+        if len(groups) != len(getattr(self, '_panels', [])):
+            self._build_panels()
+        else:
+            self._relayout_panels()   # a tick may have hidden/shown a panel
         self._redraw()
         self._status.showMessage('Applied %d triple intersection(s)' % len(groups))
 
@@ -671,6 +761,13 @@ class TripSlider(QtWidgets.QMainWindow):
         self._groups_cfg = groups
         self._populate_table()
         self._apply_table()
+
+    def _on_hide_excluded_toggled(self, checked):
+        self._relayout_panels()
+        self._redraw()
+        n_off = sum(1 for g in self._groups if not g['enabled'])   # engines exist by now
+        self._status.showMessage(
+            '%s %d excluded triple(s)' % ('Hiding' if checked else 'Showing', n_off))
 
     # ── interactions ────────────────────────────────────────────────────────────
     def _on_slider(self, slot):
@@ -871,8 +968,63 @@ class TripSlider(QtWidgets.QMainWindow):
         cfg['computation']['live_resolution'] = int(self._sp_live.value())
         cfg['computation']['tolerance'] = self._tol
         cfg['computation']['boundrange'] = list(self._boundrange)
+        cfg['computation']['fd_step'] = (None if self._fd_step is None
+                                         else float(self._fd_step))
         cfg.setdefault('crystal', {})['initial_guess'] = [float(v) for v in self._six]
         return cfg
+
+    # ── panel rendering ─────────────────────────────────────────────────────────
+    @staticmethod
+    def _clip_polyline(x, y, xr, yr):
+        """Clip a polyline to the view rectangle, returning NaN-separated
+        segments (drawn with connect='finite').  Zoomed in far enough, the
+        off-screen vertices map to enormous device-pixel coordinates and Qt's
+        raster paint engine silently drops those path segments — so curves
+        vanish at seemingly random zooms.  Clipping keeps every drawn coordinate
+        near the viewport, sidestepping the overflow."""
+        xs = np.asarray(x, dtype=float); ys = np.asarray(y, dtype=float)
+        if xs.size < 2:
+            return xs, ys
+        padx = (xr[1] - xr[0]) * 0.02
+        pady = (yr[1] - yr[0]) * 0.02
+        clipbox = _shbox(xr[0] - padx, yr[0] - pady, xr[1] + padx, yr[1] + pady)
+        try:
+            inter = LineString(np.column_stack([xs, ys])).intersection(clipbox)
+        except Exception:
+            return xs, ys                        # degenerate line — draw as-is
+        if inter.is_empty:
+            return np.array([]), np.array([])
+        ox, oy = [], []
+        for part in getattr(inter, 'geoms', [inter]):
+            coords = np.asarray(getattr(part, 'coords', []))
+            if coords.shape[0] < 2:
+                continue                          # points / empties: nothing to draw
+            if ox:
+                ox.append(np.nan); oy.append(np.nan)
+            ox.extend(coords[:, 0]); oy.extend(coords[:, 1])
+        return np.asarray(ox), np.asarray(oy)
+
+    def _render_panel(self, panel):
+        """Push each curve's data to its plot item, clipped to the view only
+        when the user has zoomed (auto-range off).  While auto-range is on the
+        view frames the whole curve, so coordinates stay small and no clipping
+        is needed — this keeps the normal framing behaviour untouched."""
+        if getattr(self, '_rendering', False):    # guard against auto-range re-entry
+            return
+        vb = panel['plot'].getViewBox()
+        autox, autoy = vb.autoRangeEnabled()
+        self._rendering = True
+        try:
+            if autox or autoy:
+                for cv, (fx, fy) in zip(panel['curves'], panel['full']):
+                    cv.setData(fx, fy)
+            else:
+                (x0, x1), (y0, y1) = vb.viewRange()
+                for cv, (fx, fy) in zip(panel['curves'], panel['full']):
+                    cx, cy = self._clip_polyline(fx, fy, (x0, x1), (y0, y1))
+                    cv.setData(cx, cy)
+        finally:
+            self._rendering = False
 
     # ── live redraw ───────────────────────────────────────────────────────────
     def _redraw(self):
@@ -890,35 +1042,52 @@ class TripSlider(QtWidgets.QMainWindow):
         total = 0.0
         for g, panel in zip(self._groups, self._panels):
             tf = g['tf']
+            # A hidden panel is always an excluded one, so it contributes nothing
+            # to the sum and nobody can see it — skip the Kossel-line solve.
+            if not panel['shown']:
+                continue
+            # excluded triples still draw (dimmed) but do not enter the sum
+            panel['plot'].setOpacity(1.0 if g['enabled'] else 0.35)
             try:
                 interc, st0, st1, st2, _v0, _v1, _v2 = tf.full(reduced)
                 sts = [np.asarray(st0), np.asarray(st1), np.asarray(st2)]
-                for k, cv in enumerate(panel['curves']):
-                    cv.setData(sts[k][:, 0], sts[k][:, 1])
+                panel['full'] = [(sts[k][:, 0], sts[k][:, 1]) for k in range(3)]
+                self._render_panel(panel)
                 interc = np.asarray(interc)
                 panel['pts'].setData(interc[:, 0], interc[:, 1])
                 r = residual_from_intercepts(interc, g['target'])
             except Exception:
+                panel['full'] = [(np.array([]), np.array([]))] * 3
                 for cv in panel['curves']:
                     cv.setData([], [])
                 panel['pts'].setData([], [])
                 r = 500.0
-            total += r
-            panel['plot'].setTitle('%s  ·  res=%.2e'
-                                   % (g['label'], r), size='8pt')
-        self._total_lbl.setText('Σ residual: %.4e' % total)
+            if g['enabled']:
+                total += r
+            panel['plot'].setTitle('%s  ·  res=%.2e%s'
+                                   % (g['label'], r,
+                                      '' if g['enabled'] else '  (excluded)'),
+                                   size='8pt')
+        n_on = sum(1 for g in self._groups if g['enabled'])
+        self._total_lbl.setText('Σ residual: %.4e  (%d/%d)'
+                                % (total, n_on, len(self._groups)))
 
     # ── fitting ─────────────────────────────────────────────────────────────────
     def _fit_objective(self, x):
-        """Combined residual across groups at the FIT resolution."""
+        """Combined residual across the enabled groups at the FIT resolution."""
         s = 0.0
         for g in self._groups:
+            if not g['enabled']:
+                continue
             g['tf'].resolution = self._fit_res
             s += g['tf'].fit(x)
         return s
 
     def _on_fit(self):
         if self._fit_worker is not None:
+            return
+        if not any(g['enabled'] for g in self._groups):
+            self._status.showMessage('Tick at least one triple intersection to fit')
             return
         method = self._algo_combo.currentText()
         self._fit_res = int(self._sp_fit.value())
@@ -931,7 +1100,8 @@ class TripSlider(QtWidgets.QMainWindow):
         self._status.showMessage('Fitting with %s (fit res %d)…'
                                  % (method, self._fit_res))
         self._fit_worker = FitWorker(self._fit_objective, x0, method, bounds,
-                                     self._tol, self._niter, self._strat)
+                                     self._tol, self._niter, self._strat,
+                                     self._fd_step)
         self._fit_worker.progress.connect(
             lambda r: self._status.showMessage('Fitting… current Σ res=%.4e' % r))
         self._fit_worker.done.connect(self._on_fit_done)

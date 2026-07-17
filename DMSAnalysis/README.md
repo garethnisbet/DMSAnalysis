@@ -332,10 +332,12 @@ small lattice distortions of pseudo-symmetric crystals. Used by the
 | `kosscalc` | `(lattice, energy, ref1, ref2, azir, start, end, steps)` | Kossel-line locus of secondary reflections `ref2` about primary `ref1`, swept over azimuth; returns `[x,y,z,ψ,θ]` per sample |
 | `stereoproj` | `(vin)` | Stereographic projection of unit vectors (N×3) → 2×N `[x,y]` |
 | `intersections` | `(a, b)` | Intersection points of two closed stereographic loci (uses shapely); returns `(xs, ys, ring_a, ring_b)` |
+| `triple_spread` | `(pts)` | Residual metric: summed squared pairwise distance of three stereographic points (3×2) |
 
 ### `class tripfit(hkl, reflist, azir, resolution, bravais, energy, target)`
 Fits a conventional lattice by driving the three Kossel lines of a secondary-reflection triple (`reflist`, 3×3) to a common triple-intersection point.
 
+- `hkl` — the primary reflection as a **2-D row**, `np.array([[h, k, l]], dtype=float)` (shape `(1,3)`). A flat 1-D `[h,k,l]` raises inside `kosscalc`, which `fit()` silently turns into the 500 penalty — see *Residual* below.
 - `bravais` — one of `CONVENTIONAL_SYSTEMS`; selects the free lattice parameters via `lattice_free_slots` / `expand_lattice` (shared with the image fit, so the packing cannot drift).
 - Intercept selection is automatic (`_intercepts`): each line pair may cross at several points, so the **tightest (mutually-closest) triple** — one crossing per pair — is scored. This follows the physical triple intersection directly and continuously, with no dependence on shapely's geometry-dependent point ordering, so the selection cannot jump as the lattice varies (and no per-pair intercept index is needed).
 - `target` — desired residual (0 for a perfect triple intersection).
@@ -344,6 +346,76 @@ Fits a conventional lattice by driving the three Kossel lines of a secondary-ref
 |--------|---------|-------------|
 | `fit(reduced)` | `float` | Scalar residual for a reduced free-parameter vector (500 on geometric failure) |
 | `full(reduced)` | tuple | `(intercepts, st0, st1, st2, vr0, vr1, vr2)` for plotting |
+
+#### Residual
+
+`fit()` scores the three pairwise crossings `v1, v2, v3` chosen by `_intercepts`
+with `triple_spread` — the summed **squared** pairwise distance — and returns
+`|S - target|`:
+
+```
+S = |v1-v2|² + |v2-v3|² + |v1-v3|²
+```
+
+`S` is the least-squares spread of the three crossings: zero only when the lines
+meet at a point, every term non-negative (so a widely-separated triple cannot
+score low through cancellation), invariant under relabelling the points, and
+smooth/quadratic at the minimum so the gradient methods behave. Being squared, it
+scales as the **square** of the miss distance — a residual of `1e-10` means the
+crossings sit ~`1e-5` apart.
+
+The GUI's live residual (`tripslider.residual_from_intercepts`) delegates to the
+same function, so the two cannot drift.
+
+> **Failures score 500.** `fit()` wraps everything in a bare `except` and returns
+> a flat `500` for any error — a non-intersecting line pair, but equally a bad
+> argument shape or a numpy warning promoted to an exception. A residual that is
+> an exact multiple of 500 (`n_groups × 500`) almost always means the *caller* is
+> wrong, not the geometry. In particular, do not wrap an optimiser run in
+> `warnings.simplefilter('error')`: the objective legitimately emits numpy
+> RuntimeWarnings, and erroring on them makes every evaluation return 500.
+
+#### Optimiser dispatch
+
+`run_tripfit_optimiser` is the single entry point shared by `tripfit.py` and
+`tripslider.py`, so the batch app and the GUI cannot drift apart.
+
+| Name | Signature | Description |
+|------|-----------|-------------|
+| `run_tripfit_optimiser` | `(objective, x0, method, bounds, tol, niter=100, strat='best1bin', fd_step=None)` | Runs one optimisation, returns the SciPy result |
+| `tripfit_minimizer_options` | `(method, tol, fd_step=None)` | The SciPy `options` dict a given local method actually accepts |
+| `tripfit_method` | `(name)` | Canonical method name, resolving legacy aliases |
+| `TRIPFIT_METHODS` | — | Every accepted `opt_method` name |
+| `GRADIENT_METHODS` / `DIRECT_METHODS` / `BOUNDED_METHODS` / `LOCAL_METHODS` | — | The families below |
+| `TRIPFIT_FD_STEP` | — | Default finite-difference step; `None` = use SciPy's own |
+
+| Family | Methods | Notes |
+|--------|---------|-------|
+| Direct search | `Powell`, `Nelder-Mead`, `COBYLA` | No derivatives; slowest, but grind closest to machine precision |
+| Gradient-based | `L-BFGS-B`, `SLSQP`, `TNC`, `BFGS`, `CG` | Finite-difference gradients; typically 1–2 orders of magnitude fewer evaluations |
+| Global | `GA` (differential evolution), `BH<local>` (basin hopping, e.g. `BHPowell`, `BHL-BFGS-B`) | For escaping local minima |
+
+- **Bounds** (from `boundrange`) are passed only to the methods that accept them — `L-BFGS-B`, `SLSQP`, `TNC`, and `GA`. The rest run unbounded.
+- **Options** are filtered per method, because SciPy only warns (and then ignores) on unknown keys: `Powell` takes `xtol`/`ftol`, `Nelder-Mead` takes `xatol`/`fatol`, COBYLA takes neither.
+- **`fd_step`** (config `computation.fd_step`) overrides the finite-difference step of the gradient methods. Leave it unset: the objective is smooth to near machine precision, and SciPy's default (~`1.5e-8`) measures better than a larger step — widening it to `1e-5` costs ~5 orders of magnitude of final residual.
+- **`BHNelderMead`** is accepted as an alias for `BHNelder-Mead` (it previously fed SciPy an invalid inner method name).
+
+Local methods depend on where they start — the objective does have multiple minima.
+Cross-check a converged cell with `GA` or a `BH*` method before trusting it.
+
+```python
+from DMSAnalysis import ts_quasi as ts
+import numpy as np
+
+tf = ts.tripfit(np.array([[-2., -3., -3.]]),     # (1,3) row — not a flat list
+                np.matrix(reflist_3x3), [1, 1, 1],
+                1000, 'monoclinic', energy, 0.0)
+slots = ts.lattice_free_slots('monoclinic')      # -> [0, 1, 2, 4]
+x0 = np.array([a, b, c, beta])                   # only the free slots
+res = ts.run_tripfit_optimiser(tf.fit, x0, 'SLSQP',
+                               list(zip(x0 - 0.012, x0 + 0.012)), 1e-12)
+print(tf.fit(np.atleast_1d(res.x)))
+```
 
 ---
 

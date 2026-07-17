@@ -25,6 +25,7 @@ from scipy import interpolate
 from collections import OrderedDict
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
+from scipy.optimize import minimize, differential_evolution, basinhopping
 import copy
 #from scipy.optimize import differential_evolution
 from joblib import Parallel, delayed
@@ -2380,6 +2381,22 @@ def stereoproj(vin):
                            vin[:, 1] / (1. - vin[:, 2])), 1).T
 
 
+def triple_spread(pts):
+    '''Scalar spread of three stereographic points ``pts`` (3x2): the summed
+    *squared* pairwise distance |v1-v2|^2 + |v2-v3|^2 + |v1-v3|^2.  Zero only
+    when all three coincide, and every term is non-negative, so a wide triple
+    can never score low through cancellation.
+
+    Squared (rather than plain) distances make this a least-squares objective:
+    smooth and quadratic near the minimum instead of kinked, which is what the
+    gradient-based optimisers need.'''
+    v1, v2, v3 = np.asarray(pts, dtype=float)
+    d12 = v1 - v2
+    d23 = v2 - v3
+    d13 = v1 - v3
+    return float(d12 @ d12 + d23 @ d23 + d13 @ d13)
+
+
 def intersections(a, b):
     '''Intersection points of two closed stereographic loci ``a`` and ``b`` (each
     a sequence of 2D points).  Returns (xs, ys, ring_a, ring_b).'''
@@ -2408,8 +2425,9 @@ class tripfit(object):
     free (via ``lattice_free_slots`` / ``expand_lattice``, shared with the image
     fit so the parameter packing cannot drift).  Each line pair may cross at more
     than one point; the tightest (mutually-closest) triple is scored, so no
-    per-pair intercept index is needed.  ``target`` is the desired residual
-    (0 for a perfect triple intersection).
+    per-pair intercept index is needed.  The score is that triple's summed
+    squared pairwise distance (``triple_spread``).  ``target`` is the desired
+    residual (0 for a perfect triple intersection).
 
     ``fit(reduced)`` returns the scalar residual for a reduced free-parameter
     vector; ``full(reduced)`` returns (intercepts, st0, st1, st2, vr0, vr1, vr2)
@@ -2441,8 +2459,7 @@ class tripfit(object):
         for a in P[0]:
             for b in P[1]:
                 for c in P[2]:
-                    cost = (np.linalg.norm(a - b) + np.linalg.norm(b - c)
-                            + np.linalg.norm(a - c))
+                    cost = triple_spread((a, b, c))
                     if cost < best_cost:
                         best_cost, best = cost, (a, b, c)
         return np.array(best, dtype=float)
@@ -2475,11 +2492,7 @@ class tripfit(object):
         try:
             self.kosselcalc(inputs)
             pts = self._intercepts()              # tightest (closest) triple
-            v1 = np.matrix(pts[0]); v2 = np.matrix(pts[1]); v3 = np.matrix(pts[2])
-            scal = np.abs(np.linalg.norm(v1) - (v1 / np.linalg.norm(v1) * v2.T)
-                          + np.linalg.norm(v2) - (v2 / np.linalg.norm(v2) * v3.T)
-                          + np.linalg.norm(v1) - (v1 / np.linalg.norm(v1) * v3.T))
-            opt = np.abs(np.array(scal)[0][0] - self.target)
+            opt = abs(triple_spread(pts) - self.target)
         except Exception:
             opt = 500
         return opt
@@ -2491,3 +2504,73 @@ class tripfit(object):
         except Exception:
             intercepts = np.zeros((3, 2))
         return intercepts, self.st0, self.st1, self.st2, self.vr0, self.vr1, self.vr2
+
+
+# ── tripfit optimiser dispatch (shared by tripfit.py and tripslider.py) ─────────
+# Gradient-based methods differentiate the objective by finite differences.  The
+# Kossel lines are sampled polylines, but their vertices move smoothly with the
+# lattice, so the objective is smooth down to ~machine precision and SciPy's
+# default step (~1.5e-8) is the best choice: measured against both example
+# configs, enlarging it to 1e-5 costs ~5 orders of magnitude of final residual.
+# TRIPFIT_FD_STEP = None therefore means "leave SciPy's default alone";
+# computation.fd_step can still override it.
+GRADIENT_METHODS = ('L-BFGS-B', 'SLSQP', 'TNC', 'BFGS', 'CG')
+BOUNDED_METHODS = ('L-BFGS-B', 'SLSQP', 'TNC')
+DIRECT_METHODS = ('Powell', 'Nelder-Mead', 'COBYLA')
+LOCAL_METHODS = DIRECT_METHODS + GRADIENT_METHODS
+TRIPFIT_METHODS = (LOCAL_METHODS + ('GA',)
+                   + tuple('BH' + m for m in LOCAL_METHODS))
+TRIPFIT_FD_STEP = None          # None -> use SciPy's own finite-difference step
+# The GUI once offered 'BHNelderMead', which fed SciPy the invalid inner method
+# 'NelderMead'; accept it so an old saved config still loads.
+TRIPFIT_METHOD_ALIASES = {'BHNelderMead': 'BHNelder-Mead'}
+
+
+def tripfit_method(name):
+    '''Canonical tripfit method name, resolving legacy aliases.'''
+    return TRIPFIT_METHOD_ALIASES.get(name, name)
+
+
+def tripfit_minimizer_options(method, tol, fd_step=TRIPFIT_FD_STEP):
+    '''SciPy ``options`` dict for a tripfit local method.  Only passes keys the
+    method actually accepts (SciPy warns on unknown options and ignores them):
+    the tolerance pair each direct-search method understands, and the optional
+    finite-difference step ``eps`` for the gradient methods.'''
+    if method in GRADIENT_METHODS:
+        opts = {} if fd_step is None else {'eps': fd_step}
+        if method in ('L-BFGS-B', 'TNC'):
+            opts['ftol'] = tol
+        return opts
+    if method == 'Powell':
+        return {'xtol': tol, 'ftol': tol}
+    if method == 'Nelder-Mead':
+        return {'xatol': tol, 'fatol': tol}     # NOT xtol/ftol
+    return {}                                   # COBYLA takes neither
+
+
+def run_tripfit_optimiser(objective, x0, method, bounds, tol,
+                          niter=100, strat='best1bin', fd_step=TRIPFIT_FD_STEP):
+    '''Run one tripfit optimisation and return the SciPy result.
+
+    ``method`` is any name in ``TRIPFIT_METHODS``: a local method (direct-search
+    or gradient-based), ``GA`` (differential evolution), or ``BH<local>`` (basin
+    hopping around that local method).  Bounds are passed only to the methods
+    that support them, and each method receives only the SciPy options it
+    understands.'''
+    x0 = np.atleast_1d(np.asarray(x0, dtype=float))
+    method = tripfit_method(method)
+    if method == 'GA':
+        return differential_evolution(objective, bounds, strategy=strat,
+                                      polish=True)
+    if method.startswith('BH'):
+        inner = method[2:] or 'Powell'
+        kwargs = {'method': inner,
+                  'options': tripfit_minimizer_options(inner, tol, fd_step)}
+        if inner in BOUNDED_METHODS:
+            kwargs['bounds'] = bounds
+        return basinhopping(objective, x0, minimizer_kwargs=kwargs, niter=niter)
+    kwargs = {'method': method, 'tol': tol,
+              'options': tripfit_minimizer_options(method, tol, fd_step)}
+    if method in BOUNDED_METHODS:
+        kwargs['bounds'] = bounds
+    return minimize(objective, x0, **kwargs)

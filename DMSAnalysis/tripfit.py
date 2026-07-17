@@ -24,7 +24,6 @@ from time import strftime
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import rc
-from scipy.optimize import minimize, differential_evolution, basinhopping
 
 from . import ts_quasi as ts
 
@@ -62,6 +61,8 @@ boundrange = _comp.get('boundrange', [-0.012, 0.012])
 rr         = float(_comp.get('rr', 0.0))          # azimuthal pre-rotation (deg)
 niter      = int(_comp.get('bh_niter', 50))
 strat      = ts.DE_Strategy.get(_comp.get('de_strategy', 'best1bin'), 'best1bin')
+_fd        = _comp.get('fd_step', ts.TRIPFIT_FD_STEP)
+fd_step    = None if _fd is None else float(_fd)  # gradient-method probe step
 
 if bravais not in ts.CONVENTIONAL_SYSTEMS:
     raise SystemExit(
@@ -99,17 +100,23 @@ for gi, gc in enumerate(_groups_cfg):
     tf = ts.tripfit(hkl, reflist, azir, resolution, bravais,
                     float(gc['energy']), float(gc.get('target', 0.0)))
     groups.append({'label': gc.get('label', 'T%d' % (gi + 1)),
-                   'reflist': reflist, 'tf': tf})
+                   'reflist': reflist, 'tf': tf,
+                   'enabled': bool(gc.get('enabled', True))})
 
 n_groups = len(groups)
+# A group with "enabled": false is plotted (dimmed) but excluded from the
+# objective — the same tick-box the GUI writes into the config.
+fit_groups = [g for g in groups if g['enabled']]
+if not fit_groups:
+    raise SystemExit('config "intersections" has no enabled triple to fit')
 
 
 def combined(x):
-    '''Summed residual across all intersection groups at reduced params ``x``.'''
-    return float(np.sum([g['tf'].fit(x) for g in groups]))
+    '''Summed residual across the enabled intersection groups at reduced ``x``.'''
+    return float(np.sum([g['tf'].fit(x) for g in fit_groups]))
 
 
-objective = groups[0]['tf'].fit if n_groups == 1 else combined
+objective = fit_groups[0]['tf'].fit if len(fit_groups) == 1 else combined
 
 # ── output directory (snapshot on save) ─────────────────────────────────────────
 outpath = os.path.join(os.getcwd(), 'Processing', datestr + '_TripFit') + os.sep
@@ -127,23 +134,20 @@ ub = ig + boundrange[1]
 bounds = list(zip(lb, ub))
 
 if fit:
+    OptMethod = ts.tripfit_method(OptMethod)
+    if OptMethod not in ts.TRIPFIT_METHODS:
+        raise SystemExit('computation.opt_method "%s" is not one of: %s'
+                         % (OptMethod, ', '.join(ts.TRIPFIT_METHODS)))
     if OptMethod == 'GA':
         print('Fitting with Differential Evolution (%s), %s constraints'
               % (strat, bravais))
-        res = differential_evolution(objective, bounds, strategy=strat, polish=True)
     elif OptMethod.startswith('BH'):
-        inner = OptMethod[2:] or 'Powell'
-        print('Fitting with Basin Hopping + %s, %s constraints' % (inner, bravais))
-        res = basinhopping(objective, ig, minimizer_kwargs={'method': inner},
-                           niter=niter)
-    elif OptMethod == 'TNC':
-        print('Fitting with TNC, %s constraints' % bravais)
-        res = minimize(objective, ig, method='TNC', bounds=bounds, tol=tolerance,
-                       options={'xtol': tolerance, 'ftol': tolerance})
+        print('Fitting with Basin Hopping + %s, %s constraints'
+              % (OptMethod[2:] or 'Powell', bravais))
     else:
         print('Fitting with %s, %s constraints' % (OptMethod, bravais))
-        res = minimize(objective, ig, method=OptMethod, tol=tolerance,
-                       options={'xtol': tolerance, 'ftol': tolerance})
+    res = ts.run_tripfit_optimiser(objective, ig, OptMethod, bounds, tolerance,
+                                   niter=niter, strat=strat, fd_step=fd_step)
     xbest = np.atleast_1d(np.asarray(res.x, dtype=float))
     opt = objective(xbest)
 else:
@@ -173,9 +177,9 @@ def _ref_title(reflist):
 
 
 def plotster(ax, interc, r1, r2, r3, alpha=1.0):
-    ax.plot(interc[0, 0], interc[0, 1], 'or')
-    ax.plot(interc[1, 0], interc[1, 1], 'og')
-    ax.plot(interc[2, 0], interc[2, 1], 'ob')
+    ax.plot(interc[0, 0], interc[0, 1], 'or', alpha=alpha)
+    ax.plot(interc[1, 0], interc[1, 1], 'og', alpha=alpha)
+    ax.plot(interc[2, 0], interc[2, 1], 'ob', alpha=alpha)
     ax.plot(r1[:, 0], r1[:, 1], 'r', alpha=alpha)
     ax.plot(r2[:, 0], r2[:, 1], 'g', alpha=alpha)
     ax.plot(r3[:, 0], r3[:, 1], 'b', alpha=alpha)
@@ -185,9 +189,9 @@ fig = plt.figure(figsize=(max(4, 3 * n_groups), 4), facecolor='white', dpi=dpi)
 for gi, g in enumerate(groups):
     interc, st0, st1, st2, vr0, vr1, vr2 = g['full']
     ax = fig.add_subplot(1, n_groups, gi + 1, adjustable='box', aspect=1)
-    plotster(ax, interc, st0, st1, st2, 1)
+    plotster(ax, interc, st0, st1, st2, 1 if g['enabled'] else 0.25)
     ax.set_title(_ref_title(g['reflist']), fontsize=6)
-    ax.set_xlabel(g['label'])
+    ax.set_xlabel(g['label'] if g['enabled'] else '%s (excluded)' % g['label'])
 plt.subplots_adjust(wspace=0.28)
 fig.canvas.manager.set_window_title('TripFit — %s' % bravais)
 
@@ -198,6 +202,9 @@ def saveResult():
         f.write('bravais    = %s\n' % bravais)
         f.write('method     = %s\n' % OptMethod)
         f.write('resolution = %d\n' % resolution)
+        f.write('fitted     = %s\n' % ', '.join(g['label'] for g in fit_groups))
+        f.write('excluded   = %s\n' % ', '.join(g['label'] for g in groups
+                                                if not g['enabled']))
         f.write('reduced_x  = %s\n' % np.array2string(np.atleast_1d(xbest)))
         f.write('lattice    = %s\n' % np.array2string(np.array(lattice_fit)))
         f.write('opt        = %s\n' % opt)
