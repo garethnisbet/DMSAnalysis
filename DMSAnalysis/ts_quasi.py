@@ -864,6 +864,30 @@ AUTO_DOUBLET_SIG = None
 # the integrated curve, so that bound is the width itself).
 ROI_FAIL_PENALTY_FACTOR = 2.0
 
+def centre_residuals(sim_centres, target_centres, fail_penalty):
+    '''Per-ROI centre residuals from already-extracted peak centres.
+
+    The arithmetic behind the image fit's objective, factored out so a caller
+    that has already located the simulated peaks (the slider's live readout,
+    which integrates the simulated image for plotting anyway) can score them
+    without a second imcalc — and, more importantly, cannot drift from what the
+    fit actually minimises.  dmsfit_ico_hkl._centre_residuals is the same
+    function with the peak extraction attached.
+
+    NaN in `target_centres` means no experimental peak was locatable, so that
+    ROI has no target and is dropped; NaN in `sim_centres` means the simulated
+    peak was not locatable, which is a real failure of the current parameters
+    and is charged `fail_penalty`.
+
+    Returns (residual vector, n_sim_failed, n_no_target).'''
+    sim = np.asarray(sim_centres, dtype=float)
+    tgt = np.asarray(target_centres, dtype=float)
+    has_target = ~np.isnan(tgt)
+    sim_failed = has_target & np.isnan(sim)
+    resid = np.where(has_target, sim - tgt, 0.0)
+    resid = np.where(sim_failed, float(fail_penalty), resid)
+    return resid, int(sim_failed.sum()), int((~has_target).sum())
+
 def peakfit(xdata,ydata,method='gauss',sig=None):
     '''Dispatch peak-position extraction by method name: 'centroid' uses the
     centre of mass, anything else uses Gaussian curve fitting (the two-peak
@@ -2332,15 +2356,13 @@ class dmsfit_ico_hkl(object):
 
         Returns (residual vector, n_sim_failed, n_no_target).'''
         self.imcalc(inputs)                       # adding attribute
-        sim = self._simcoeffs()[:, 2]
-        tgt = np.asarray(self.centres, dtype=float)[:, 0]
-        has_target = ~np.isnan(tgt)
-        sim_failed  = has_target & np.isnan(sim)
-        resid = np.where(has_target, sim - tgt, 0.0)
-        resid = np.where(sim_failed, self._roi_fail_penalty(), resid)
-        self.n_sim_failed = int(sim_failed.sum())
-        self.n_no_target  = int((~has_target).sum())
-        return resid, self.n_sim_failed, self.n_no_target
+        resid, n_fail, n_none = centre_residuals(
+            self._simcoeffs()[:, 2],
+            np.asarray(self.centres, dtype=float)[:, 0],
+            self._roi_fail_penalty())
+        self.n_sim_failed = n_fail
+        self.n_no_target  = n_none
+        return resid, n_fail, n_none
 
     def _total_failure_score(self):
         '''Objective value for an evaluation that raised before any ROI could be

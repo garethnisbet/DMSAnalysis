@@ -421,12 +421,77 @@ def param_bounds(reduced):
     span    = PARAM_BOUND_FACTOR * param_steps()
     return list(zip(reduced - span, reduced + span))
 
-def perturbed_starts(x0, steps, n, rng):
-    """Multi-start vectors scattered around x0 by each parameter's own step."""
-    x0 = np.asarray(x0, dtype=float)
-    return [x0] + [x0 + rng.uniform(-1.0, 1.0, x0.shape)
-                   * PARAM_START_FACTOR * steps
-                   for _ in range(n - 1)]
+def perturbed_starts(n, ndim, rng):
+    """Multi-start vectors in scaled coordinates (see ScaledObjective): the
+    guess itself at the origin, plus n-1 points scattered within
+    PARAM_START_FACTOR steps of it."""
+    return [np.zeros(ndim)] + [rng.uniform(-1.0, 1.0, ndim) * PARAM_START_FACTOR
+                               for _ in range(n - 1)]
+
+
+class ScaledObjective:
+    """The objective in units of each parameter's own search step, remembering
+    the best point it ever evaluated.
+
+    **Scaling.** The optimiser sees ``z``, with ``x = anchor + z * steps``, so
+    every parameter is O(1) and one unit of z is one physical search step for
+    all of them.  Nelder-Mead and Powell could be handed a per-parameter
+    simplex / direction set instead, but COBYLA's trust region ``rhobeg`` is a
+    single scalar shared by every coordinate — with raw values spanning
+    ~7 orders of magnitude no scalar can work, so COBYLA ran with an initial
+    trust region of 1.0 that was 1000 steps wide in `a` and 1e4 steps wide in
+    the phason block.  Scaling is the only fix that reaches every method, and
+    it makes `tol` and the bounds mean the same thing across parameters too.
+
+    **Best-point tracking.** Optimisers are not obliged to return the best
+    point they evaluated: COBYLA in particular can terminate on a worse one,
+    which is how 'Fit' could hand back a result worse than the initial guess.
+    Recording the best evaluation makes that impossible for every method.
+    Thread-safe, because the multi-start runs share one tracker across joblib
+    threads.
+    """
+
+    def __init__(self, fn, anchor, steps):
+        self._fn     = fn
+        self.anchor  = np.asarray(anchor, dtype=float)
+        self.steps   = (np.ones_like(self.anchor) if steps is None
+                        else np.asarray(steps, dtype=float))
+        self._lock   = threading.Lock()
+        self.best_f  = np.inf
+        self.best_z  = None
+
+    def to_x(self, z):
+        return self.anchor + np.asarray(z, dtype=float) * self.steps
+
+    def to_z(self, x):
+        return (np.asarray(x, dtype=float) - self.anchor) / self.steps
+
+    def bounds_z(self, bounds):
+        return [tuple(sorted(((lo - a) / s, (hi - a) / s)))
+                for (lo, hi), a, s in zip(bounds, self.anchor, self.steps)]
+
+    def _record(self, f, z):
+        if not np.isfinite(f):
+            return
+        with self._lock:
+            if f < self.best_f:
+                self.best_f = float(f)
+                self.best_z = np.array(z, dtype=float)
+
+    def __call__(self, z):
+        f = self._fn(self.to_x(z))
+        self._record(f, z)
+        return f
+
+    def residuals(self, z, resid_fn):
+        """Vector form for least_squares, tracking the same scalar the other
+        methods minimise so the best-point guard stays comparable."""
+        r = resid_fn(self.to_x(z))
+        self._record(float(np.sum(np.asarray(r) ** 2)), z)
+        return r
+
+    def best_x(self):
+        return None if self.best_z is None else self.to_x(self.best_z)
 
 def initial_simplex(x0, steps):
     """Nelder-Mead starting simplex around x0, one vertex per parameter offset by
@@ -752,8 +817,7 @@ class FitWorker(QtCore.QThread):
         x0       = template[free]                     # free-only start vector
         cur      = self._method
         ev       = self._stop_event
-        # Per-parameter search steps over the free subset; sizes both the
-        # derivative-free simplex/direction set and the multi-start scatter.
+        # Per-parameter search steps over the free subset.
         steps    = None if self._steps is None else self._steps[free]
 
         def _expand(xf):
@@ -762,55 +826,79 @@ class FitWorker(QtCore.QThread):
             full[free] = xf
             return full
 
-        def _fit_checked(xf):
+        # Everything below optimises in scaled coordinates anchored at the
+        # initial guess (z = 0), so every method sees O(1) parameters and one
+        # unit of z is one physical search step.  See ScaledObjective.
+        def _raw(xf):
             if ev.is_set():
                 raise StopIteration('stopped')
             return dms.fit(_expand(xf))
 
+        obj    = ScaledObjective(_raw, x0, steps)
+        z0     = np.zeros(len(x0))
+        zbnds  = obj.bounds_z(bounds)
+        ndim   = len(z0)
+
         def _cb_check(*_a, **_k):
             return ev.is_set()
+
+        def _opts_for(method):
+            """SciPy options in scaled space: only the keys each method accepts,
+            plus the unit-sized starting geometry the derivative-free methods
+            need (their own defaults are relative to each value's magnitude, and
+            at z=0 they collapse to SciPy's 0.00025 fallback)."""
+            o = dict(ts.tripfit_minimizer_options(method, tolerance))
+            if method == 'Nelder-Mead':
+                o['initial_simplex'] = initial_simplex(z0, np.ones(ndim))
+            elif method == 'Powell':
+                o['direc'] = np.eye(ndim)
+            elif method == 'COBYLA':
+                # Single scalar trust region -- correct for every parameter only
+                # because they are now all in step units.
+                o['rhobeg'] = 1.0
+            return o
 
         try:
             from scipy.optimize import (minimize, differential_evolution,
                                         basinhopping, dual_annealing, least_squares)
             from joblib import Parallel, delayed
             if cur == 'GA':
-                res = differential_evolution(_fit_checked, bounds, strategy=strat,
+                res = differential_evolution(obj, zbnds, strategy=strat,
                                              polish=not ev.is_set(), workers=1,
                                              callback=_cb_check)
             elif cur == 'DualAnnealing':
                 # Generalized simulated annealing — global, bounded, derivative-free.
-                # _fit_checked raises StopIteration on stop; the callback is a
+                # The objective raises StopIteration on stop; the callback is a
                 # secondary stop hook (returns True to abort).
                 def _da_cb(x, f, context):
                     return ev.is_set()
-                res = dual_annealing(_fit_checked, bounds, callback=_da_cb)
+                res = dual_annealing(obj, zbnds, callback=_da_cb)
             elif cur == 'LSQ':
                 # Exploit the least-squares structure: optimise the per-ROI centre
                 # residual vector directly with Trust-Region-Reflective + a robust
-                # loss (downweights failed-ROI fallback rows).
-                lo = np.array([b[0] for b in bounds])
-                hi = np.array([b[1] for b in bounds])
-                def _resid(xf):
+                # loss (downweights failed-ROI penalty rows).
+                lo = np.array([b[0] for b in zbnds])
+                hi = np.array([b[1] for b in zbnds])
+                def _raw_resid(xf):
                     if ev.is_set():
                         raise StopIteration('stopped')
                     return dms.residuals(_expand(xf))
-                res = least_squares(_resid, x0, bounds=(lo, hi),
-                                    method='trf', loss='soft_l1',
+                res = least_squares(lambda z: obj.residuals(z, _raw_resid), z0,
+                                    bounds=(lo, hi), method='trf', loss='soft_l1',
                                     xtol=tolerance, ftol=tolerance)
             elif cur in ('L-BFGS-B', 'TNC'):
                 # Bounded finite-difference-gradient locals, multi-started.
                 n = self._n_starts
                 rng = np.random.default_rng(42)
-                starts = perturbed_starts(x0, steps, n, rng) if steps is not None \
-                    else [x0] + [x0 + rng.uniform(-0.5, 0.5, x0.shape)
-                                 for _ in range(n - 1)]
+                starts = perturbed_starts(n, ndim, rng)
                 def _run_one_b(s):
                     if ev.is_set():
                         raise StopIteration('stopped')
                     _d = copy.deepcopy(dms)
-                    return minimize(lambda xf: _d.fit(_expand(xf)), s, method=cur,
-                                    bounds=bounds, tol=tolerance)
+                    _o = ScaledObjective(lambda xf: _d.fit(_expand(xf)), x0, steps)
+                    r = minimize(_o, s, method=cur, bounds=zbnds, tol=tolerance)
+                    obj._record(_o.best_f, _o.best_z)
+                    return r
                 results = Parallel(n_jobs=n, prefer='threads')(
                     delayed(_run_one_b)(s) for s in starts)
                 res = min(results, key=lambda r: r.fun)
@@ -819,47 +907,54 @@ class FitWorker(QtCore.QThread):
                           'BHCOBYLA':     ('COBYLA',      400),
                           'BHNelderMead': ('Nelder-Mead', 400)}
                 method, niter = bh_map[cur]
-                # No initial_simplex here: it is absolute, so one simplex would
-                # be reused at every hop.  The inner Nelder-Mead therefore still
-                # infers its own (magnitude-relative) simplex per hop.
-                res = basinhopping(_fit_checked, x0,
-                                   minimizer_kwargs={
-                                       "method": method,
-                                       "options": ts.tripfit_minimizer_options(
-                                           method, tolerance)},
+                # The inner method's starting geometry is absolute, so it would be
+                # reused unchanged at every hop; in scaled space the defaults are
+                # already the right size, so only the tolerance keys are passed.
+                kwargs = {"method": method,
+                          "options": ts.tripfit_minimizer_options(method, tolerance)}
+                if method == 'COBYLA':
+                    kwargs['options'] = dict(kwargs['options'], rhobeg=1.0)
+                res = basinhopping(obj, z0, minimizer_kwargs=kwargs,
                                    niter=niter, callback=_cb_check)
             else:
                 n = self._n_starts
                 rng = np.random.default_rng(42)
-                starts = perturbed_starts(x0, steps, n, rng) if steps is not None \
-                    else [x0] + [x0 + rng.uniform(-0.5, 0.5, x0.shape)
-                                 for _ in range(n - 1)]
-                # Only the options each method actually accepts — Powell takes
-                # xtol/ftol but Nelder-Mead takes xatol/fatol and COBYLA neither
-                # (SciPy silently warns and ignores the rest).  Shared with the
-                # tripfit optimiser so the two mappings cannot drift.
-                opts = ts.tripfit_minimizer_options(cur, tolerance)
+                starts = perturbed_starts(n, ndim, rng)
+                opts = _opts_for(cur)
                 def _run_one(s):
                     if ev.is_set():
                         raise StopIteration('stopped')
                     _d = copy.deepcopy(dms)
+                    _o = ScaledObjective(lambda xf: _d.fit(_expand(xf)), x0, steps)
                     o = dict(opts)
-                    if steps is not None:
-                        # Size the search by each parameter's physical scale
-                        # rather than by its magnitude (see param_steps).
-                        if cur == 'Nelder-Mead':
-                            o['initial_simplex'] = initial_simplex(s, steps)
-                        elif cur == 'Powell':
-                            o['direc'] = np.diag(steps)
-                    return minimize(lambda xf: _d.fit(_expand(xf)), s, method=cur,
-                                    tol=tolerance, options=o)
+                    if cur == 'Nelder-Mead':
+                        o['initial_simplex'] = initial_simplex(s, np.ones(ndim))
+                    r = minimize(_o, s, method=cur, tol=tolerance, options=o)
+                    obj._record(_o.best_f, _o.best_z)
+                    return r
                 results = Parallel(n_jobs=n, prefer='threads')(
                     delayed(_run_one)(s) for s in starts)
                 res = min(results, key=lambda r: r.fun)
 
             elapsed = time.time() - self._t0
             dms.hkllistrange[2] = numsteps
-            res_full = _expand(np.asarray(res.x, dtype=float))
+
+            # Never hand back a point worse than one already seen — above all,
+            # never worse than the initial guess.  SciPy methods are not
+            # obliged to return their best evaluation (COBYLA notably does not),
+            # so take whichever of the reported result and the tracked best
+            # actually scores lower, re-scored here so the comparison is
+            # against the value the caller will be shown.
+            z_res  = np.asarray(res.x, dtype=float)
+            cand   = [obj.to_x(z_res)]
+            if obj.best_x() is not None:
+                cand.append(obj.best_x())
+            cand.append(x0)                      # the initial guess itself
+            scored = [(dms.fit(_expand(c)), c) for c in cand]
+            best_f, best_x = min(scored, key=lambda t: t[0])
+            rejected = bool(scored[0][0] > best_f)
+
+            res_full = _expand(best_x)
             opt, simim, dmsindex, dataim, inputarray = dms.full(res_full)
             dmslines = [(np.copy(x), np.copy(y)) for x, y in dms.dmslines] \
                 if hasattr(dms, 'dmslines') else []
@@ -868,7 +963,9 @@ class FitWorker(QtCore.QThread):
                 'res_x': res_full,   # full reduced vector (fixed params included)
                 'dmsindex': dmsindex, 'dataim': np.array(dataim),
                 'inputarray': np.array(inputarray),
-                'elapsed': elapsed, 'method': cur})
+                'elapsed': elapsed, 'method': cur,
+                'start_opt': scored[-1][0],       # score at the initial guess
+                'rejected':  rejected})
         except StopIteration:
             self.stopped.emit(time.time() - self._t0)
         except Exception as e:
@@ -1095,6 +1192,11 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._linedatax     = None
         self._linedatay     = None
         self._imcoeffs      = None
+        # Last simulated peak coefficients, so a target-only change (a
+        # right-click centre assignment) can rescore without recomputing
+        # the simulation.  Cleared whenever the curves are discarded.
+        self._last_simcoefs = None
+        self._resid_stale   = False
         self._reflist_fit   = None
         self._reflist2_fit  = None
         self._ref_6d_fit    = None
@@ -1387,12 +1489,38 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._btn_stop.clicked.connect(self._on_stop_fit)
         fitl.addWidget(self._btn_stop, 6, 1)
 
+        # Live residual readout — the same number Fit minimises, recomputed
+        # whenever the simulated curves are redrawn, so dragging a slider shows
+        # its effect on the objective directly instead of by eye.
+        self._lbl_resid = QtWidgets.QLabel('χ² —')
+        self._lbl_resid.setToolTip(
+            'Sum of squared ROI centre residuals at the current parameters — '
+            'exactly what Fit minimises.  Needs built curves.')
+        _f_res = self._lbl_resid.font()
+        _f_res.setPointSize(10)
+        _f_res.setBold(True)
+        self._lbl_resid.setFont(_f_res)
+        self._lbl_resid.setStyleSheet('color: #cccccc')
+        self._lbl_resid.setAlignment(QtCore.Qt.AlignCenter)
+        fitl.addWidget(self._lbl_resid, 7, 0, 1, 2)
+
+        # Best residual reached by a fit this session, to compare the live value
+        # against without having to remember it.
+        self._lbl_resid_best = QtWidgets.QLabel('')
+        _f_best = self._lbl_resid_best.font()
+        _f_best.setPointSize(8)
+        self._lbl_resid_best.setFont(_f_best)
+        self._lbl_resid_best.setStyleSheet('color: #888888')
+        self._lbl_resid_best.setAlignment(QtCore.Qt.AlignCenter)
+        fitl.addWidget(self._lbl_resid_best, 8, 0, 1, 2)
+        self._best_opt = None
+
         btn_wf_export = QtWidgets.QPushButton('Export Fit Config')
         btn_wf_export.setStyleSheet('background: #103018; color: #bfe6c8')
         btn_wf_export.setToolTip('Export a fit.py-compatible workflow config JSON '
                                  'for batch (non-interactive) fitting')
         btn_wf_export.clicked.connect(self._on_export_workflow_json)
-        fitl.addWidget(btn_wf_export, 7, 0, 1, 2)
+        fitl.addWidget(btn_wf_export, 9, 0, 1, 2)
 
         self._btn_save_fit = QtWidgets.QPushButton('Save fit → Processing')
         self._btn_save_fit.setStyleSheet('background: #2a2a10; color: #e6e0bf')
@@ -1401,7 +1529,7 @@ class DMSSlider(QtWidgets.QMainWindow):
                                       'res.x.txt, Result.txt, config + code snapshots)')
         self._btn_save_fit.setEnabled(False)
         self._btn_save_fit.clicked.connect(self._on_save_fit_processing)
-        fitl.addWidget(self._btn_save_fit, 8, 0, 1, 2)
+        fitl.addWidget(self._btn_save_fit, 10, 0, 1, 2)
 
         ctrl_col.addWidget(fit_box)
 
@@ -1929,6 +2057,10 @@ class DMSSlider(QtWidgets.QMainWindow):
         # invalidate them so a stale engine isn't reused.
         self._fit_dms = None
         self._kernel = self._centres = None
+        self._last_simcoefs = None
+        if getattr(self, '_lbl_resid', None) is not None:
+            self._lbl_resid.setText('χ² —')
+            self._lbl_resid.setStyleSheet('color: #cccccc')
         self._reflist_fit = self._reflist2_fit = self._ref_6d_fit = None
         self._last_res_x = None
         self._last_fit_info = None
@@ -2009,6 +2141,10 @@ class DMSSlider(QtWidgets.QMainWindow):
         # Built curves / fit belong to the previous indexing — invalidate them.
         self._fit_dms = None
         self._kernel = self._centres = None
+        self._last_simcoefs = None
+        if getattr(self, '_lbl_resid', None) is not None:
+            self._lbl_resid.setText('χ² —')
+            self._lbl_resid.setStyleSheet('color: #cccccc')
         self._reflist_fit = self._reflist2_fit = self._ref_6d_fit = None
         self._last_res_x = None
         self._last_fit_info = None
@@ -2163,12 +2299,29 @@ class DMSSlider(QtWidgets.QMainWindow):
         if (getattr(self, '_chk_live_curve', None) is None
                 or not self._chk_live_curve.isChecked()
                 or self._fit_dms is None):
+            # Geometry moved but the curves were not recomputed, so the residual
+            # on screen no longer describes the current parameters.  Say so
+            # rather than leaving a stale number looking current.
+            self._mark_residual_stale()
             return
         try:
             self._fit_dms.imcalc(extract_reduced(self.ig))
             self._try_draw_sim_lines()
         except Exception:
             pass
+
+    def _mark_residual_stale(self):
+        """Flag the readout as no longer matching the current geometry."""
+        lbl = getattr(self, '_lbl_resid', None)
+        if lbl is None or self._centres is None:
+            return
+        if getattr(self, '_last_simcoefs', None) is None:
+            return
+        if getattr(self, '_resid_stale', False):
+            return
+        self._resid_stale = True
+        lbl.setText(lbl.text().split('   [')[0] + '   [stale — tick Live Curve]')
+        lbl.setStyleSheet('color: #777777')
 
     def _selected_arcs(self):
         """Checked arcs in list order, with their 6D indices."""
@@ -3227,6 +3380,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._linedatax    = None
         self._linedatay    = None
         self._imcoeffs     = None
+        self._last_simcoefs = None
         self._reflist_fit  = None
         self._reflist2_fit = None
         self._ref_6d_fit   = None
@@ -4019,17 +4173,63 @@ class DMSSlider(QtWidgets.QMainWindow):
                     cl.setValue(val)
 
     def _try_draw_sim_lines(self):
-        if (self._fit_dms is not None and self._fit_dms.imsim is not None
-                and self._sim_curves):
+        if self._fit_dms is not None and self._sim_curves:
             try:
+                if self._fit_dms.imsim is None:
+                    # The residual has to be available as soon as the curves are
+                    # built.  BuildWorker's own imcalc is best-effort, so if it
+                    # did not land there is nothing to score yet — run it here.
+                    self._fit_dms.imcalc(extract_reduced(self.ig))
                 # Same estimator as dmsfit_ico_hkl._simcoeffs, so the sim centre
                 # line drawn here is the one the residual is actually scoring.
                 coefs, ldsx, ldsy, _, _, _ = ts.multiroifit(
                     self._fit_dms.imsim, self._kernel, width, 10,
                     self._peak_method, ts.AUTO_DOUBLET_SIG)
                 self._draw_sim_lines(coefs, ldsx, ldsy)
+                self._update_residual_readout(coefs)
             except Exception:
                 pass
+
+    def _update_residual_readout(self, simcoefs=None):
+        """Refresh the live χ² from peak centres already extracted for plotting.
+
+        Scored with ts.centre_residuals — the same function behind the engine's
+        objective — so the number on screen is the one Fit minimises and the two
+        cannot drift apart.  No extra imcalc: the simulated image was integrated
+        for the curves anyway.
+
+        `simcoefs` omitted reuses the last simulated extraction.  That is the
+        right thing for a change that moves only the *target* — a right-click
+        centre override — where the simulation is untouched and re-running it
+        would be wasted work."""
+        lbl = getattr(self, '_lbl_resid', None)
+        if lbl is None:
+            return
+        if simcoefs is None:
+            simcoefs = getattr(self, '_last_simcoefs', None)
+        else:
+            self._last_simcoefs = np.asarray(simcoefs)
+        if self._centres is None or self._fit_dms is None or simcoefs is None:
+            lbl.setText('χ² —')
+            lbl.setStyleSheet('color: #cccccc')
+            return
+        self._resid_stale = False
+        resid, n_fail, n_none = ts.centre_residuals(
+            np.asarray(simcoefs)[:, 2],
+            np.asarray(self._centres, dtype=float)[:, 0],
+            self._fit_dms._roi_fail_penalty())
+        chi2 = float(np.sum(resid**2))
+        txt = 'χ² = %.6g' % chi2
+        extra = []
+        if n_fail:
+            extra.append('%d ROI missed' % n_fail)
+        if n_none:
+            extra.append('%d no target' % n_none)
+        if extra:
+            txt += '   (%s)' % ', '.join(extra)
+        lbl.setText(txt)
+        # Amber once any ROI is contributing a penalty rather than a real miss.
+        lbl.setStyleSheet('color: #ffaa55' if n_fail else 'color: #cccccc')
 
     def _on_roi_grid_clicked(self, event):
         if not self._roi_plots:
@@ -4075,7 +4275,11 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._centre_override_rois.add(roi_idx)
         if roi_idx < len(self._exp_centre_lines):
             self._exp_centre_lines[roi_idx].setValue(x)
+            self._exp_centre_lines[roi_idx].setVisible(True)
             self._exp_centre_lines[roi_idx].setPen(pg.mkPen('#ffaa00', width=1.5))
+        # Assigning a peak moves the target, so the residual changes even though
+        # the simulation has not: rescore from the cached simulated centres.
+        self._update_residual_readout()
         self._status.setText('Centre override ROI %d: x=%.1f' % (roi_idx, x))
 
     def _on_roi_mouse_moved(self, evt):
@@ -4219,8 +4423,30 @@ class DMSSlider(QtWidgets.QMainWindow):
                 if ridx < self._centres.shape[0]:
                     self._pending_centre_overrides[int(ridx)] = \
                         float(self._centres[ridx, 0])
+        # Track the best residual reached this session so the live readout has
+        # something to be compared against.
+        opt_now = float(result['opt'])
+        if self._best_opt is None or opt_now < self._best_opt:
+            self._best_opt = opt_now
+        if getattr(self, '_lbl_resid_best', None) is not None:
+            self._lbl_resid_best.setText(
+                'best this session: %.6g  [%s]' % (self._best_opt, result['method']))
+
+        start_opt = result.get('start_opt')
         done_msg = 'Fit complete.  χ²=%.4f  t=%.1fs  [%s]' % (
             result['opt'], result['elapsed'], result['method'])
+        if start_opt is not None:
+            if result['opt'] < start_opt:
+                done_msg += '  (was %.4f)' % start_opt
+            else:
+                # The optimiser found nothing better than where it started, so
+                # the guess was kept.  Say so rather than reporting a "fit".
+                done_msg = ('No improvement on the initial guess (χ²=%.4f) — '
+                            'guess kept.  t=%.1fs  [%s]'
+                            % (start_opt, result['elapsed'], result['method']))
+        if result.get('rejected'):
+            print('[fit] %s returned a worse point than one already evaluated; '
+                  'the better point was kept.' % result['method'])
         if not self._on_build_curves(done_status=done_msg, reuse_rois=True,
                                      reuse_exp=True):
             self._status.setText(done_msg)
