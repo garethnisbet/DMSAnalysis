@@ -429,6 +429,19 @@ def perturbed_starts(n, ndim, rng):
                                for _ in range(n - 1)]
 
 
+class FitStopped(Exception):
+    """Raised inside the objective to abort a fit when Stop is pressed.
+
+    Deliberately *not* StopIteration.  joblib consumes the multi-start tasks as
+    a generator, and a StopIteration escaping a task can be absorbed by that
+    generator machinery as a normal end-of-iteration instead of propagating —
+    so the abort is swallowed and the fit appears to ignore Stop.  A dedicated
+    exception cannot be mistaken for anything else.  It must also stay clear of
+    dmsfit_ico_hkl.fit's `except Exception`, so every check runs *before* the
+    objective is called, never inside it.
+    """
+
+
 class ScaledObjective:
     """The objective in units of each parameter's own search step, remembering
     the best point it ever evaluated.
@@ -451,7 +464,7 @@ class ScaledObjective:
     threads.
     """
 
-    def __init__(self, fn, anchor, steps):
+    def __init__(self, fn, anchor, steps, should_stop=None):
         self._fn     = fn
         self.anchor  = np.asarray(anchor, dtype=float)
         self.steps   = (np.ones_like(self.anchor) if steps is None
@@ -459,6 +472,15 @@ class ScaledObjective:
         self._lock   = threading.Lock()
         self.best_f  = np.inf
         self.best_z  = None
+        # Checked on *every* evaluation, which is the only place a running
+        # SciPy method can be interrupted: the multi-start branches used to
+        # test the stop flag only between starts, so Stop did nothing for the
+        # thousands of evaluations inside one Powell/COBYLA/Nelder-Mead run.
+        self._should_stop = should_stop
+
+    def _stop_if_asked(self):
+        if self._should_stop is not None and self._should_stop():
+            raise FitStopped('stopped')
 
     def to_x(self, z):
         return self.anchor + np.asarray(z, dtype=float) * self.steps
@@ -479,6 +501,7 @@ class ScaledObjective:
                 self.best_z = np.array(z, dtype=float)
 
     def __call__(self, z):
+        self._stop_if_asked()
         f = self._fn(self.to_x(z))
         self._record(f, z)
         return f
@@ -486,6 +509,7 @@ class ScaledObjective:
     def residuals(self, z, resid_fn):
         """Vector form for least_squares, tracking the same scalar the other
         methods minimise so the best-point guard stays comparable."""
+        self._stop_if_asked()
         r = resid_fn(self.to_x(z))
         self._record(float(np.sum(np.asarray(r) ** 2)), z)
         return r
@@ -831,10 +855,10 @@ class FitWorker(QtCore.QThread):
         # unit of z is one physical search step.  See ScaledObjective.
         def _raw(xf):
             if ev.is_set():
-                raise StopIteration('stopped')
+                raise FitStopped('stopped')
             return dms.fit(_expand(xf))
 
-        obj    = ScaledObjective(_raw, x0, steps)
+        obj    = ScaledObjective(_raw, x0, steps, should_stop=ev.is_set)
         z0     = np.zeros(len(x0))
         zbnds  = obj.bounds_z(bounds)
         ndim   = len(z0)
@@ -868,7 +892,7 @@ class FitWorker(QtCore.QThread):
                                              callback=_cb_check)
             elif cur == 'DualAnnealing':
                 # Generalized simulated annealing — global, bounded, derivative-free.
-                # The objective raises StopIteration on stop; the callback is a
+                # The objective raises FitStopped on stop; the callback is a
                 # secondary stop hook (returns True to abort).
                 def _da_cb(x, f, context):
                     return ev.is_set()
@@ -881,7 +905,7 @@ class FitWorker(QtCore.QThread):
                 hi = np.array([b[1] for b in zbnds])
                 def _raw_resid(xf):
                     if ev.is_set():
-                        raise StopIteration('stopped')
+                        raise FitStopped('stopped')
                     return dms.residuals(_expand(xf))
                 res = least_squares(lambda z: obj.residuals(z, _raw_resid), z0,
                                     bounds=(lo, hi), method='trf', loss='soft_l1',
@@ -893,9 +917,10 @@ class FitWorker(QtCore.QThread):
                 starts = perturbed_starts(n, ndim, rng)
                 def _run_one_b(s):
                     if ev.is_set():
-                        raise StopIteration('stopped')
+                        raise FitStopped('stopped')
                     _d = copy.deepcopy(dms)
-                    _o = ScaledObjective(lambda xf: _d.fit(_expand(xf)), x0, steps)
+                    _o = ScaledObjective(lambda xf: _d.fit(_expand(xf)), x0,
+                                         steps, should_stop=ev.is_set)
                     r = minimize(_o, s, method=cur, bounds=zbnds, tol=tolerance)
                     obj._record(_o.best_f, _o.best_z)
                     return r
@@ -923,9 +948,10 @@ class FitWorker(QtCore.QThread):
                 opts = _opts_for(cur)
                 def _run_one(s):
                     if ev.is_set():
-                        raise StopIteration('stopped')
+                        raise FitStopped('stopped')
                     _d = copy.deepcopy(dms)
-                    _o = ScaledObjective(lambda xf: _d.fit(_expand(xf)), x0, steps)
+                    _o = ScaledObjective(lambda xf: _d.fit(_expand(xf)), x0,
+                                         steps, should_stop=ev.is_set)
                     o = dict(opts)
                     if cur == 'Nelder-Mead':
                         o['initial_simplex'] = initial_simplex(s, np.ones(ndim))
@@ -966,7 +992,7 @@ class FitWorker(QtCore.QThread):
                 'elapsed': elapsed, 'method': cur,
                 'start_opt': scored[-1][0],       # score at the initial guess
                 'rejected':  rejected})
-        except StopIteration:
+        except (FitStopped, StopIteration):
             self.stopped.emit(time.time() - self._t0)
         except Exception as e:
             self.error.emit(str(e), time.time() - self._t0)
