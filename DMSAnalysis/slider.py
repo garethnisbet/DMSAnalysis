@@ -390,6 +390,30 @@ def param_steps():
     """Search step for each element of the current reduced parameter vector."""
     return PARAM_STEPS_FULL[reduced_slots()]
 
+def roi_reuse_plan(locked, force_rois, force_exp, have_kernel, sel_matches):
+    """Decide what a build may carry over from the previous one.
+
+    Returns (keep_kernel, keep_exp, stale_selection):
+
+    * keep_kernel — pin the existing ROIs instead of generating new ones at the
+      current geometry.  Requested by the ROI lock, or forced by the post-fit
+      rebuild (whose target centres must not move).
+    * keep_exp — additionally carry over the experimental extraction through
+      those ROIs.  Only ever valid alongside keep_kernel and only when nothing
+      feeding it changed; a locked build still re-extracts, because the
+      integration width and peak method apply through pinned ROIs.
+    * stale_selection — ROIs were to be kept but the checked reflections no
+      longer match them.  The kernel has one slot per selected reflection, so
+      it cannot describe a different selection; the caller must rebuild and
+      say so rather than silently moving ROIs the user pinned.
+    """
+    want = bool(locked or force_rois)
+    if not (want and have_kernel):
+        return False, False, False
+    if not sel_matches:
+        return False, False, True
+    return True, bool(force_exp), False
+
 def param_bounds(reduced):
     """Optimiser bounds for the current reduced vector, each parameter given a
     half-width proportional to its own physical search step."""
@@ -864,16 +888,26 @@ class BuildWorker(QtCore.QThread):
     error = QtCore.pyqtSignal(str)
 
     def __init__(self, ig, sel6d, hkl, lattice, thrange, imdata, azir, psi,
-                 px, py, psirange, peak_method, overrides, reuse=None,
-                 parent=None):
+                 px, py, psirange, peak_method, overrides,
+                 reuse_kernel=None, reuse_exp=None, parent=None):
         super().__init__(parent)
-        # Pre-built ROI state to reuse instead of regenerating it: a dict of
-        # kernel / imcoeffs / linedatax / linedatay / centres from an earlier
-        # build.  Used by the post-fit rebuild, which must keep the ROIs (and
-        # therefore the experimental target centres) the fit was scored against
-        # — regenerating them at the refined geometry would move the ROIs and
-        # replace the reference.  None ⇒ build the ROIs from scratch at `ig`.
-        self._reuse       = reuse
+        # Two independent pieces of earlier work that can be carried forward.
+        #
+        # `reuse_kernel` — an existing ROI kernel to keep instead of generating
+        # one at `ig`.  Set by the ROI lock (the user pinning the ROIs so they
+        # stop following the sliders) and by the post-fit rebuild (which must
+        # keep the ROIs the fit was scored against; regenerating them at the
+        # refined geometry would move the reference).
+        #
+        # `reuse_exp` — the experimental extraction (imcoeffs / line data /
+        # centres) through that kernel.  Only valid when nothing feeding it has
+        # changed, i.e. the post-fit rebuild.  Keeping the ROIs does NOT imply
+        # keeping this: the integration width and the peak method still apply
+        # through pinned ROIs, so a locked build re-extracts.
+        #
+        # Either None ⇒ compute that part from scratch.
+        self._reuse_kernel = reuse_kernel
+        self._reuse_exp    = reuse_exp
         self._ig          = np.asarray(ig, dtype=float).copy()
         self._sel6d       = sel6d
         self._hkl         = np.asarray(hkl, dtype=float).copy()
@@ -903,17 +937,8 @@ class BuildWorker(QtCore.QThread):
 
             hkllistrange_fit = [self._thrange[0], self._thrange[1], self._numsteps]
 
-            if self._reuse is not None:
-                # Keep the original ROIs.  The kernel and the image are both
-                # unchanged, so the experimental curves and their peak centres
-                # are identical too — re-integrating them would only burn time
-                # reproducing the same numbers.  Only the simulated side moves,
-                # and that is recomputed by the imcalc below at the new `ig`.
-                kernel    = self._reuse['kernel']
-                imcoeffs  = self._reuse['imcoeffs']
-                linedatax = self._reuse['linedatax']
-                linedatay = self._reuse['linedatay']
-                centres   = np.array(self._reuse['centres'], dtype=float).copy()
+            if self._reuse_kernel is not None:
+                kernel = self._reuse_kernel
             else:
                 hkllist_cur = ts.pilkhlrange(
                     self._lattice, self._hkl, ig[14],
@@ -928,6 +953,17 @@ class BuildWorker(QtCore.QThread):
                     (bravais if CONVENTIONAL else None)
                 )
                 kernel = ts.roibuilder_ico_hkl(builderargs)
+
+            if self._reuse_exp is not None:
+                # Nothing feeding the experimental extraction has changed, so
+                # re-integrating would only burn time reproducing the same
+                # numbers.  Only the simulated side moves, and that is
+                # recomputed by the imcalc below at the new `ig`.
+                imcoeffs  = self._reuse_exp['imcoeffs']
+                linedatax = self._reuse_exp['linedatax']
+                linedatay = self._reuse_exp['linedatay']
+                centres   = np.array(self._reuse_exp['centres'], dtype=float).copy()
+            else:
                 imcoeffs, linedatax, linedatay, _, _, _ = \
                     ts.multiroifit2(self._imdata, kernel, self._width, 0.02,
                                     ts.AUTO_DOUBLET_SIG, self._peak_method)
@@ -1465,6 +1501,21 @@ class DMSSlider(QtWidgets.QMainWindow):
         btn_build.clicked.connect(lambda: self._on_build_curves())
         ctrl_col2.addWidget(btn_build)
         self._btn_build = btn_build
+
+        # Lock ROIs — pin the ROI positions so they stop following the sliders.
+        # Rebuilding then integrates the same ROIs at the current parameters
+        # instead of generating new ones, which is what you want once the ROIs
+        # sit on the lines you mean to fit: the experimental peak centres in
+        # them are the fit's target, so letting them move re-defines the target.
+        self._chk_lock_rois = QtWidgets.QCheckBox('Lock ROIs')
+        self._chk_lock_rois.setChecked(False)
+        self._chk_lock_rois.setToolTip(
+            'Pin the ROIs where they are.  Build curves then re-integrates the '
+            'same ROIs at the current parameters instead of moving them to '
+            'follow the geometry.  Width and peak method still apply through '
+            'them; the reflection selection cannot change while locked.')
+        self._chk_lock_rois.toggled.connect(self._on_lock_rois_toggled)
+        ctrl_col2.addWidget(self._chk_lock_rois)
 
         # Selected arcs list
         arc_box = QtWidgets.QGroupBox('Selected reflections')
@@ -2912,6 +2963,11 @@ class DMSSlider(QtWidgets.QMainWindow):
             # whether "Build curves" had been run, so a restore can rebuild the
             # ROI grid (and re-apply manual_centres) without a manual click
             'curves_built':   self._centres is not None,
+            # ROI lock state.  The kernel itself is not stored, so the restore
+            # below must build the ROIs once at the restored geometry before
+            # the lock has anything to hold — it is re-applied after that build.
+            'rois_locked':    bool(getattr(self, '_chk_lock_rois', None) is not None
+                                   and self._chk_lock_rois.isChecked()),
             'fit_result':     fit_result,
         }
 
@@ -3122,8 +3178,15 @@ class DMSSlider(QtWidgets.QMainWindow):
         # 6. If the session had curves built, rebuild them now so the ROI grid
         #    and the manual centre overrides stashed above come back with it.
         #    Needs an image, so it is skipped if the scan reload above failed.
+        #    The lock is applied *after* this build: it keeps existing ROIs, and
+        #    a restored session has none until this build makes them.  The
+        #    geometry is restored too, so they land where they were.
         if data.get('curves_built') and getattr(self, '_imdata', None) is not None:
             self._on_build_curves()
+        if getattr(self, '_chk_lock_rois', None) is not None:
+            self._suppress = True
+            self._chk_lock_rois.setChecked(bool(data.get('rois_locked', False)))
+            self._suppress = False
 
     def _maybe_restore_session(self):
         """On launch, offer to restore the auto-saved previous session."""
@@ -3725,18 +3788,44 @@ class DMSSlider(QtWidgets.QMainWindow):
                 out.append([int(v) for v in hkl_6d])
         return np.array(out)
 
-    def _on_build_curves(self, done_status=None, reuse_rois=False):
+    def _rois_locked(self):
+        """True when the user has pinned the ROIs (Lock ROIs) and there is a
+        kernel to pin.  The lock is inert before the first build — there is
+        nothing to keep, so the first Build must generate the ROIs."""
+        chk = getattr(self, '_chk_lock_rois', None)
+        return bool(chk is not None and chk.isChecked()
+                    and self._kernel is not None)
+
+    def _on_lock_rois_toggled(self, checked):
+        if self._suppress:
+            return
+        if checked and self._kernel is None:
+            self._status.setText(
+                'Lock ROIs: no ROIs yet — Build curves once, then the lock holds them')
+            return
+        self._status.setText(
+            'ROIs locked — Build curves keeps them in place' if checked
+            else 'ROIs unlocked — Build curves regenerates them at the current geometry')
+
+    def _on_build_curves(self, done_status=None, reuse_rois=False,
+                         reuse_exp=False):
         """Start a background ROI build for the checked reflections at the
         current parameters.  Returns True if a build was started; the result is
         installed later by _on_build_done.  `done_status` overrides the status
         message shown on success (used by the post-fit rebuild).
 
-        With `reuse_rois`, the existing ROIs and the experimental curves
-        extracted through them are kept and only the simulated side is
-        recomputed at the current parameters — the post-fit path, where moving
-        the ROIs would replace the very target centres the fit was scored
-        against.  Falls back to a full rebuild if there are no ROIs yet or the
-        checked reflections no longer match the ones they were built for."""
+        The ROIs are kept in place when the user has locked them, or when
+        `reuse_rois` forces it (the post-fit path, where moving the ROIs would
+        replace the very target centres the fit was scored against).  Keeping
+        the ROIs does not by itself keep the experimental curves extracted
+        through them — the integration width and the peak method still apply —
+        so those are only carried over with `reuse_exp`, which is valid solely
+        when nothing feeding them has changed.
+
+        Both fall back to a full rebuild if there are no ROIs yet or the
+        checked reflections no longer match the ones they were built for; a
+        kernel with the wrong number of ROIs cannot be reused, and that
+        mismatch is reported rather than silently absorbed."""
         if self._fitting:
             self._status.setText('Stop the fit before rebuilding curves')
             return False
@@ -3748,17 +3837,29 @@ class DMSSlider(QtWidgets.QMainWindow):
         if sel6d.shape[0] == 0:
             self._status.setText('Check at least one reflection (click arcs first)')
             return False
-        reuse = None
-        if reuse_rois and self._kernel is not None:
-            if (self._ref_6d_fit is not None
-                    and np.array_equal(np.asarray(sel6d), np.asarray(self._ref_6d_fit))):
-                reuse = {'kernel':    self._kernel,
-                         'imcoeffs':  self._imcoeffs,
+
+        sel_matches = (self._ref_6d_fit is not None
+                       and np.array_equal(np.asarray(sel6d),
+                                          np.asarray(self._ref_6d_fit)))
+        keep_kernel, keep_exp, stale_sel = roi_reuse_plan(
+            self._rois_locked(), reuse_rois, reuse_exp,
+            self._kernel is not None, sel_matches)
+
+        reuse_kernel = self._kernel if keep_kernel else None
+        reuse_exp_d  = ({'imcoeffs':  self._imcoeffs,
                          'linedatax': self._linedatax,
                          'linedatay': self._linedatay,
-                         'centres':   self._centres}
-        self._status.setText('Recomputing simulated curves...' if reuse
-                             else 'Building integrated curves...')
+                         'centres':   self._centres} if keep_exp else None)
+
+        if stale_sel:
+            self._status.setText('Reflection selection changed — ROIs rebuilt '
+                                 '(lock cannot hold across a different selection)')
+        elif reuse_exp_d is not None:
+            self._status.setText('Recomputing simulated curves...')
+        elif reuse_kernel is not None:
+            self._status.setText('Re-integrating the locked ROIs...')
+        else:
+            self._status.setText('Building integrated curves...')
 
         # The overrides are consumed here: the worker applies them to the
         # centres and hands back the resulting override set.  When the ROIs are
@@ -3773,7 +3874,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._build_worker = BuildWorker(
             self.ig, sel6d, self._hkl, self._lattice, self._thrange,
             self._imdata, self._azir, self._psi, self._px, self._py,
-            self._psirange, self._peak_method, overrides, reuse=reuse)
+            self._psirange, self._peak_method, overrides,
+            reuse_kernel=reuse_kernel, reuse_exp=reuse_exp_d)
         self._build_worker.done.connect(self._on_build_done)
         self._build_worker.error.connect(self._on_build_error)
         self._build_worker.start()
@@ -4119,7 +4221,8 @@ class DMSSlider(QtWidgets.QMainWindow):
                         float(self._centres[ridx, 0])
         done_msg = 'Fit complete.  χ²=%.4f  t=%.1fs  [%s]' % (
             result['opt'], result['elapsed'], result['method'])
-        if not self._on_build_curves(done_status=done_msg, reuse_rois=True):
+        if not self._on_build_curves(done_status=done_msg, reuse_rois=True,
+                                     reuse_exp=True):
             self._status.setText(done_msg)
 
     def _on_fit_error(self, msg, elapsed):
