@@ -245,7 +245,7 @@ builderargs=reflist,hkllist,hklint,intensity,psirange,threshold,hkl,detvects,imd
 kernel=ts.roibuilder_ico_hkl(builderargs)
 
 # linedataxc,linedatayc,linedataxcs,linedataycs, centres = ts.multiroigconv(imdata,kernel,width,[0,5,20],3.0, 2.0)
-imcoeffs,linedatax,linedatay, fitpoints, rois, pcov =ts.multiroifit2(imdata,kernel,width,0.02,10.0,peak_method)
+imcoeffs,linedatax,linedatay, fitpoints, rois, pcov =ts.multiroifit2(imdata,kernel,width,0.02,ts.AUTO_DOUBLET_SIG,peak_method)
 # imcoeffs,linedatax,linedatay, fitpoints, rois =ts.multiroimin(imdata,kernel,width,0,0.01)
 centres=np.array([imcoeffs[:,2]]).T
 # linedatax,linedatay, centres, rois = ts.multiroicom(imdata,kernel,width,comwidth)
@@ -329,7 +329,7 @@ dms = ts.dmsfit_ico_hkl(reflist, hkllistrange, hklint, psirange, width, centres,
 
 dms.setCalLattice(initial_guess[:6])
 dms.setLattice(initial_guess[:6])
-dms.setPeakMethod(peak_method)
+dms.setPeakMethod(peak_method, ts.AUTO_DOUBLET_SIG)
 dms.setIGFull(initial_guess)   # full guess for the conventional-crystal branch
 
 
@@ -415,7 +415,10 @@ plt.imshow(imoverlay, cmap=colmap,clim=(colourlim[0], colourlim[1]))
 plt.title('Overlay')
 
 
-imcoeffs,linedatasimx,linedatasimy, fitpointssim, rois2, covmat =ts.multiroifit(simim,kernel,width,10)
+# Same estimator as the residual uses on the simulated ROIs (see AUTO_DOUBLET_SIG);
+# the peak_method was previously dropped here, so the plotted simulated centres
+# could disagree with the ones the fit was scored on.
+imcoeffs,linedatasimx,linedatasimy, fitpointssim, rois2, covmat =ts.multiroifit(simim,kernel,width,10,peak_method,ts.AUTO_DOUBLET_SIG)
 # imcentres=imcoeffs[:,2]
 
 #

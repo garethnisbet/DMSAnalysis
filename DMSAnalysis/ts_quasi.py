@@ -840,6 +840,30 @@ def centroid(xdata,ydata):
     fitpoints=gauss(xdata,sigma,intensity,centre,bg)
     return fitcoeffs, pcov, fitpoints
 
+# `sig` threshold handed to peakfit for the ROI curves: above it, fitgauss1from2
+# treats the curve as a blended doublet, fits two Gaussians and keeps the
+# stronger.  Deliberately None — automatic doublet splitting is DISABLED.
+#
+# A doublet in an experimental ROI comes from multiple phases in the sample,
+# each contributing its own DMS line.  Picking the stronger component is
+# therefore a phase assignment, and the code has no basis for making it: the
+# stronger line is not necessarily the phase being refined.  That call belongs
+# to the user, who sets the centre for such a ROI by right-clicking it in the
+# curve grid (the manual centre override, which survives rebuilds and fits).
+#
+# The simulation is single-phase and produces one line per ROI, so it has no
+# doublet to resolve either way.  Both sides take their `sig` from here — the
+# experimental extraction via multiroifit/multiroifit2, the simulated one via
+# dmsfit_ico_hkl.peaksig — so the target and the value driven onto it are always
+# extracted by the same estimator.
+AUTO_DOUBLET_SIG = None
+
+# Multiple of the ROI width charged as the residual for a ROI whose simulated
+# peak could not be located.  Must be > 1 so that a failure is always worse than
+# the largest miss a located peak can produce (the centre cannot fall outside
+# the integrated curve, so that bound is the width itself).
+ROI_FAIL_PENALTY_FACTOR = 2.0
+
 def peakfit(xdata,ydata,method='gauss',sig=None):
     '''Dispatch peak-position extraction by method name: 'centroid' uses the
     centre of mass, anything else uses Gaussian curve fitting (the two-peak
@@ -1007,7 +1031,7 @@ def msroi2(img, kernel, width):
     v2 = shifted[w_idx, n_idx]                                                 # (M, 2)
     return v1, v2, v
 
-def multiroifit(img,kernel,width,percentileval,method='gauss'):
+def multiroifit(img,kernel,width,percentileval,method='gauss',sig=None):
     v1=np.array([[]]*4).T
     vx=[]
     vy=[]
@@ -1022,10 +1046,10 @@ def multiroifit(img,kernel,width,percentileval,method='gauss'):
         # ydata=ydata[ydata>np.percentile(ydata, percentileval)]
 #         ydata[ydata<np.percentile(ydata, 10)]=np.percentile(ydata, 10)
         try:
-            coef, pcov,fitpoints = peakfit(xdata,ydata,method)
-        except:
+            coef, pcov,fitpoints = peakfit(xdata,ydata,method,sig)
+        except Exception:
             print('Fit not possible for _'+str(i1))
-            coef = np.array([0,0,500,0])
+            coef = np.array([0,0,np.nan,0])   # NaN centre: no usable peak here
             pcov= np.zeros((4,4))
             fitpoints = ydata
         v1=np.vstack([v1,coef])
@@ -1041,9 +1065,9 @@ def _multiroifit2_one(img, kernel_slice, width, sig, idx, method='gauss'):
     ydata = sumvals[:, 0]
     try:
         coef, pcov, fitpoints = peakfit(xdata, ydata, method, sig)
-    except:
+    except Exception:
         print('Fit not possible for _' + str(idx))
-        coef = np.array([0, 0, 500, 0])
+        coef = np.array([0, 0, np.nan, 0])   # NaN centre: no usable peak here
         pcov = np.zeros((4, 4))
         fitpoints = ydata
     return coef, xdata, ydata, fitpoints, roi, pcov
@@ -1974,8 +1998,16 @@ class dmsfit_ico_hkl(object):
         self.a=args[26]
         self.calibration_lattice = [5.43075,5.43075,5.43075,90.0,90.0,90.0]
         # Peak-position method for the simulated ROI curves: 'gauss' (curve fit)
-        # or 'centroid' (centre of mass).  Set via setPeakMethod.
+        # or 'centroid' (centre of mass).  Set via setPeakMethod.  `peaksig` is
+        # the doublet threshold and must match the one the experimental centres
+        # in self.centres were extracted with — see AUTO_DOUBLET_SIG.
         self.peakmethod = 'gauss'
+        self.peaksig = AUTO_DOUBLET_SIG
+        # Failure bookkeeping from the last _centre_residuals call, so a caller
+        # can tell the user which ROIs are contributing nothing (no experimental
+        # target) or contributing a penalty (simulated peak not locatable).
+        self.n_sim_failed = 0
+        self.n_no_target  = 0
         # Full 24-element guess vector — used by the conventional-crystal branch
         # of imcalc to fill the non-refined parameters around the reduced
         # optimiser vector.  Defaults to args[26] (the lattice 'a') in slot 0.
@@ -1990,8 +2022,12 @@ class dmsfit_ico_hkl(object):
         self.ig_full = np.asarray(ig24, dtype=float).copy()
     def setLattice(self, lattice):
         self.lattice = lattice
-    def setPeakMethod(self, method):
+    def setPeakMethod(self, method, sig=AUTO_DOUBLET_SIG):
+        '''Set how peak positions are located in the simulated ROI curves.
+        `sig` must be the value the experimental centres were extracted with,
+        so the residual compares like with like (see AUTO_DOUBLET_SIG).'''
         self.peakmethod = method
+        self.peaksig = sig
     def _simcoeffs(self):
         '''Per-ROI peak coefficients of the current simulated image, using the
         selected peak-position method.  v1[:,2] is the centre per ROI.'''
@@ -2001,10 +2037,13 @@ class dmsfit_ico_hkl(object):
             xdata=np.arange(len(sumvals))
             ydata=sumvals[:,0]
             try:
-                coef, pcov,fitpoints = peakfit(xdata,ydata,self.peakmethod)
+                coef, pcov,fitpoints = peakfit(xdata,ydata,self.peakmethod,self.peaksig)
                 v1=np.vstack([v1,coef])
-            except:
-                v1=np.vstack([v1,[100,100,100,100]])
+            except Exception:
+                # NaN centre, not a plausible-looking pixel index: a fixed
+                # constant here can sit near a real target and read as a good
+                # match.  Converted to an explicit penalty in _centre_residuals.
+                v1=np.vstack([v1,[0,0,np.nan,0]])
         return v1
         
 ###########################
@@ -2266,27 +2305,73 @@ class dmsfit_ico_hkl(object):
         else:
             self.dmslines = []
 
+    def _roi_fail_penalty(self):
+        '''Per-ROI residual charged for a ROI whose simulated peak could not be
+        located.  The centre can only ever lie inside the integrated curve, so
+        the largest residual a *successfully* located peak can produce is the
+        ROI width; charging a multiple of it makes a failure strictly worse
+        than any real miss, so the optimiser is never rewarded for driving
+        lines out of their ROIs.  Scales with the ROI, unlike a bare constant.'''
+        return ROI_FAIL_PENALTY_FACTOR * float(self.width)
+
+    def _centre_residuals(self, inputs):
+        '''Per-ROI centre residuals (simulated centre - target centre), the one
+        primitive behind fit/residuals/full so the three cannot disagree.
+
+        Two failure modes, deliberately treated differently:
+
+        * The **experimental** peak could not be located (NaN in self.centres).
+          That ROI has no target, so it carries no information and is dropped
+          from the residual entirely — scoring it against a made-up number
+          would have the fit chase a value with no physical meaning.  The user
+          can supply one by right-clicking the ROI (manual centre override),
+          which re-includes it.
+        * The **simulated** peak could not be located (NaN from _simcoeffs).
+          That ROI does have a target, and the simulation missing it is a real
+          failure of the current parameters, so it is charged the full penalty.
+
+        Returns (residual vector, n_sim_failed, n_no_target).'''
+        self.imcalc(inputs)                       # adding attribute
+        sim = self._simcoeffs()[:, 2]
+        tgt = np.asarray(self.centres, dtype=float)[:, 0]
+        has_target = ~np.isnan(tgt)
+        sim_failed  = has_target & np.isnan(sim)
+        resid = np.where(has_target, sim - tgt, 0.0)
+        resid = np.where(sim_failed, self._roi_fail_penalty(), resid)
+        self.n_sim_failed = int(sim_failed.sum())
+        self.n_no_target  = int((~has_target).sum())
+        return resid, self.n_sim_failed, self.n_no_target
+
+    def _total_failure_score(self):
+        '''Objective value for an evaluation that raised before any ROI could be
+        scored.  Equivalent to "every scorable ROI failed", so it is always at
+        least as bad as the worst evaluation that did complete — a crash can
+        never look better than a valid geometry.  The old flat 500 could be
+        beaten by a merely mediocre fit, which actively rewarded the optimiser
+        for walking into parameter regions that throw.'''
+        n = 1
+        try:
+            n = max(int(np.sum(~np.isnan(np.asarray(self.centres, dtype=float)[:, 0]))), 1)
+        except Exception:
+            pass
+        return float(n) * self._roi_fail_penalty() ** 2
+
     def fit(self,inputs):
         try:
-            self.imcalc(inputs) # adding attribute
-            v1=self._simcoeffs()
-            result = np.sum((v1[:,2]-self.centres[:,0])**2)
-            return result
-        except:
-            return 500
+            resid, _, _ = self._centre_residuals(inputs)
+            return float(np.sum(resid**2))
+        except Exception:
+            return self._total_failure_score()
 
     def residuals(self,inputs):
-        """Per-ROI centre residuals (fitted Gaussian centre - target centre).
-        This is the vector form of `fit` (which returns np.sum(residuals**2)),
-        for use with scipy.optimize.least_squares.  A robust loss (soft_l1 /
-        huber) then downweights the [100,...] fallback rows produced when a
-        per-ROI Gaussian fit fails."""
+        """Per-ROI centre residual vector, for scipy.optimize.least_squares.
+        `fit` is exactly np.sum(residuals**2).  A robust loss (soft_l1 / huber)
+        then downweights the penalty rows produced by failed ROIs."""
         try:
-            self.imcalc(inputs) # adding attribute
-            v1=self._simcoeffs()
-            return v1[:,2]-self.centres[:,0]
-        except:
-            return np.full(self.centres.shape[0], 100.0)
+            resid, _, _ = self._centre_residuals(inputs)
+            return resid
+        except Exception:
+            return np.full(self.centres.shape[0], self._roi_fail_penalty())
 
     def stats(self,inputs):
         self.imcalc(inputs) # adding attribute
@@ -2296,12 +2381,12 @@ class dmsfit_ico_hkl(object):
 
     def full(self,inputs):
         try:
-            self.imcalc(inputs) # adding attribute
-            v1=self._simcoeffs()
-            result = np.sum((v1[:,2]-self.centres[:,0])**2)
+            resid, _, _ = self._centre_residuals(inputs)
+            result = float(np.sum(resid**2))
             return result,self.imsim, self.dmsindex, self.imdata, self.inputarray
-        except:
-            return 500,np.zeros(self.imdata.shape), np.array([[],[]]), self.imdata, self.inputarray
+        except Exception:
+            return (self._total_failure_score(), np.zeros(self.imdata.shape),
+                    np.array([[],[]]), self.imdata, self.inputarray)
 
 
 # ── Multiple-intersection (Renninger triple-intersection) lattice fitting ───────

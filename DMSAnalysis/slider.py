@@ -355,6 +355,62 @@ def extract_reduced(full_ig):
     """Reduced parameter vector consumed by dmsfit_ico_hkl.imcalc (current mode)."""
     return np.asarray(full_ig, dtype=float)[reduced_slots()]
 
+# ── optimiser search steps ─────────────────────────────────────────────────────
+# A physically sensible search step for each slot of the 24-element guess (the
+# index table in CLAUDE.md).  The optimiser sees the raw physical values, whose
+# scales span ~7 orders of magnitude (detdist ~1e4 px, phason ~1e-3), so the
+# derivative-free methods must not be left to infer a step from each
+# parameter's own magnitude: SciPy's Nelder-Mead builds its initial simplex by
+# perturbing each coordinate by 5% (or 0.00025 when it is zero), which here
+# means a ~480 px jump in detdist and a ~1e-5 nudge on the phason block — at
+# once far too coarse to stay in the basin and far too fine to explore the
+# strain that is being refined.
+PARAM_STEPS_FULL = np.array(
+    [1e-3, 1e-3, 1e-3,      # 0-2    a, b, c                       (Å)
+     1e-2, 1e-2, 1e-2,      # 3-5    alpha, beta, gamma            (deg)
+     5e-2,                  # 6      psicor                        (deg)
+     1e-2, 1e-2, 1e-2,      # 7-9    hcor/chicor, kcor/thcor, lcor
+     1.0,                   # 10     detdist                       (px)
+     5e-2, 5e-2, 5e-2,      # 11-13  detector rotations            (deg)
+     1e-3]                  # 14     energy offset
+    + [1e-4] * 9)           # 15-23  phason strain matrix
+
+# The optimiser bound half-width and the multi-start scatter are expressed as
+# multiples of each parameter's own search step, for the same reason the step
+# table exists: a single absolute number applied to every slot is meaningless
+# across a 7-order-of-magnitude spread.  The old flat +/-1.5 bound was +/-1.5 A
+# on the lattice parameter (absurdly wide, the cell is ~4 A) and +/-1.5 px on a
+# ~1e4 px detector distance (absurdly tight); the old +/-0.5 multi-start scatter
+# likewise moved `a` by half an Angstrom while barely touching detdist, so the
+# extra starts explored nothing useful for the lattice and phason parameters.
+PARAM_BOUND_FACTOR = 100.0   # bounds  = guess +/- 100 steps
+PARAM_START_FACTOR = 10.0    # starts  = guess +/-  10 steps
+
+def param_steps():
+    """Search step for each element of the current reduced parameter vector."""
+    return PARAM_STEPS_FULL[reduced_slots()]
+
+def param_bounds(reduced):
+    """Optimiser bounds for the current reduced vector, each parameter given a
+    half-width proportional to its own physical search step."""
+    reduced = np.asarray(reduced, dtype=float)
+    span    = PARAM_BOUND_FACTOR * param_steps()
+    return list(zip(reduced - span, reduced + span))
+
+def perturbed_starts(x0, steps, n, rng):
+    """Multi-start vectors scattered around x0 by each parameter's own step."""
+    x0 = np.asarray(x0, dtype=float)
+    return [x0] + [x0 + rng.uniform(-1.0, 1.0, x0.shape)
+                   * PARAM_START_FACTOR * steps
+                   for _ in range(n - 1)]
+
+def initial_simplex(x0, steps):
+    """Nelder-Mead starting simplex around x0, one vertex per parameter offset by
+    that parameter's own search step (SciPy's default is 5% of each value)."""
+    sim = np.repeat(np.asarray(x0, dtype=float)[None, :], len(x0) + 1, axis=0)
+    sim[1:] += np.diag(steps)
+    return sim
+
 def reduced_for_engine(dms, full_ig):
     """Reduced parameter vector matched to a specific engine's own mode, so an
     in-flight worker pass on a stale engine can't crash on a length mismatch."""
@@ -643,13 +699,17 @@ class FitWorker(QtCore.QThread):
     stopped = QtCore.pyqtSignal(float)
 
     def __init__(self, dms, reduced, bounds, method, n_starts,
-                 free_idx=None, parent=None):
+                 free_idx=None, steps=None, parent=None):
         super().__init__(parent)
         self._dms        = dms
         self._reduced    = np.asarray(reduced, dtype=float).copy()
         self._bounds     = list(bounds)
         self._method     = method
         self._n_starts   = n_starts
+        # Per-parameter search step over the reduced vector (see param_steps);
+        # sizes the derivative-free methods' initial simplex / direction set.
+        self._steps      = (None if steps is None
+                            else np.asarray(steps, dtype=float).copy())
         # Positions within the reduced vector that the optimiser is allowed to
         # vary; the rest are held at their current value.  None ⇒ all free.
         self._free = (list(range(len(self._reduced))) if free_idx is None
@@ -668,6 +728,9 @@ class FitWorker(QtCore.QThread):
         x0       = template[free]                     # free-only start vector
         cur      = self._method
         ev       = self._stop_event
+        # Per-parameter search steps over the free subset; sizes both the
+        # derivative-free simplex/direction set and the multi-start scatter.
+        steps    = None if self._steps is None else self._steps[free]
 
         def _expand(xf):
             """Scatter a free-only vector back into the full reduced vector."""
@@ -715,9 +778,9 @@ class FitWorker(QtCore.QThread):
                 # Bounded finite-difference-gradient locals, multi-started.
                 n = self._n_starts
                 rng = np.random.default_rng(42)
-                starts = [x0] + [
-                    x0 + rng.uniform(-0.5, 0.5, x0.shape)
-                    for _ in range(n - 1)]
+                starts = perturbed_starts(x0, steps, n, rng) if steps is not None \
+                    else [x0] + [x0 + rng.uniform(-0.5, 0.5, x0.shape)
+                                 for _ in range(n - 1)]
                 def _run_one_b(s):
                     if ev.is_set():
                         raise StopIteration('stopped')
@@ -732,22 +795,40 @@ class FitWorker(QtCore.QThread):
                           'BHCOBYLA':     ('COBYLA',      400),
                           'BHNelderMead': ('Nelder-Mead', 400)}
                 method, niter = bh_map[cur]
+                # No initial_simplex here: it is absolute, so one simplex would
+                # be reused at every hop.  The inner Nelder-Mead therefore still
+                # infers its own (magnitude-relative) simplex per hop.
                 res = basinhopping(_fit_checked, x0,
-                                   minimizer_kwargs={"method": method},
+                                   minimizer_kwargs={
+                                       "method": method,
+                                       "options": ts.tripfit_minimizer_options(
+                                           method, tolerance)},
                                    niter=niter, callback=_cb_check)
             else:
                 n = self._n_starts
                 rng = np.random.default_rng(42)
-                starts = [x0] + [
-                    x0 + rng.uniform(-0.5, 0.5, x0.shape)
-                    for _ in range(n - 1)]
+                starts = perturbed_starts(x0, steps, n, rng) if steps is not None \
+                    else [x0] + [x0 + rng.uniform(-0.5, 0.5, x0.shape)
+                                 for _ in range(n - 1)]
+                # Only the options each method actually accepts — Powell takes
+                # xtol/ftol but Nelder-Mead takes xatol/fatol and COBYLA neither
+                # (SciPy silently warns and ignores the rest).  Shared with the
+                # tripfit optimiser so the two mappings cannot drift.
+                opts = ts.tripfit_minimizer_options(cur, tolerance)
                 def _run_one(s):
                     if ev.is_set():
                         raise StopIteration('stopped')
                     _d = copy.deepcopy(dms)
+                    o = dict(opts)
+                    if steps is not None:
+                        # Size the search by each parameter's physical scale
+                        # rather than by its magnitude (see param_steps).
+                        if cur == 'Nelder-Mead':
+                            o['initial_simplex'] = initial_simplex(s, steps)
+                        elif cur == 'Powell':
+                            o['direc'] = np.diag(steps)
                     return minimize(lambda xf: _d.fit(_expand(xf)), s, method=cur,
-                                    tol=tolerance,
-                                    options={'xtol': tolerance, 'ftol': tolerance})
+                                    tol=tolerance, options=o)
                 results = Parallel(n_jobs=n, prefer='threads')(
                     delayed(_run_one)(s) for s in starts)
                 res = min(results, key=lambda r: r.fun)
@@ -768,6 +849,131 @@ class FitWorker(QtCore.QThread):
             self.stopped.emit(time.time() - self._t0)
         except Exception as e:
             self.error.emit(str(e), time.time() - self._t0)
+            import traceback; traceback.print_exc()
+
+
+# ── ROI-build worker (kernel + curve integration in a background thread) ───────
+
+class BuildWorker(QtCore.QThread):
+    """Runs the ROI integration for the checked reflections off the GUI thread:
+    the hkl scan, the kernel, the per-ROI curve fits and the fit engine.  Every
+    object it touches is either freshly created here or read-only (imdata), so
+    it cannot race the UpdateWorker's engines.  Emits the built state as a dict
+    for the GUI thread to install."""
+    done  = QtCore.pyqtSignal(dict)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, ig, sel6d, hkl, lattice, thrange, imdata, azir, psi,
+                 px, py, psirange, peak_method, overrides, reuse=None,
+                 parent=None):
+        super().__init__(parent)
+        # Pre-built ROI state to reuse instead of regenerating it: a dict of
+        # kernel / imcoeffs / linedatax / linedatay / centres from an earlier
+        # build.  Used by the post-fit rebuild, which must keep the ROIs (and
+        # therefore the experimental target centres) the fit was scored against
+        # — regenerating them at the refined geometry would move the ROIs and
+        # replace the reference.  None ⇒ build the ROIs from scratch at `ig`.
+        self._reuse       = reuse
+        self._ig          = np.asarray(ig, dtype=float).copy()
+        self._sel6d       = sel6d
+        self._hkl         = np.asarray(hkl, dtype=float).copy()
+        self._lattice     = list(lattice)
+        self._thrange     = list(thrange)
+        self._imdata      = imdata           # read-only
+        self._azir        = list(azir)
+        self._psi         = psi
+        self._px          = px
+        self._py          = py
+        self._psirange    = list(psirange)
+        self._peak_method = peak_method
+        self._overrides   = dict(overrides)
+        # Snapshot the globals the GUI can retune (numsteps / width / sigma
+        # spinboxes) so a change mid-build cannot straddle this build.
+        self._numsteps    = numsteps
+        self._width       = width
+        self._simsigma    = simsigma
+
+    def run(self):
+        try:
+            ig      = self._ig
+            sel6d   = self._sel6d
+            rl, rl2 = build_reflist_from_6d(sel6d)
+            reflist_fit  = np.array(rl)
+            reflist2_fit = np.array(rl2)
+
+            hkllistrange_fit = [self._thrange[0], self._thrange[1], self._numsteps]
+
+            if self._reuse is not None:
+                # Keep the original ROIs.  The kernel and the image are both
+                # unchanged, so the experimental curves and their peak centres
+                # are identical too — re-integrating them would only burn time
+                # reproducing the same numbers.  Only the simulated side moves,
+                # and that is recomputed by the imcalc below at the new `ig`.
+                kernel    = self._reuse['kernel']
+                imcoeffs  = self._reuse['imcoeffs']
+                linedatax = self._reuse['linedatax']
+                linedatay = self._reuse['linedatay']
+                centres   = np.array(self._reuse['centres'], dtype=float).copy()
+            else:
+                hkllist_cur = ts.pilkhlrange(
+                    self._lattice, self._hkl, ig[14],
+                    self._thrange[0], self._thrange[1]).hklscan(self._numsteps)
+
+                builderargs = (
+                    reflist_fit, hkllist_cur, hklint, intensity,
+                    self._psirange, threshold, self._hkl, detvects, self._imdata.shape,
+                    self._simsigma, self._azir, self._psi, self._px, self._py, scatv,
+                    ig[10], ig[11], ig[12], ig[13], ig[14],
+                    ig, reflist2_fit, list(ig[15:24]),
+                    (bravais if CONVENTIONAL else None)
+                )
+                kernel = ts.roibuilder_ico_hkl(builderargs)
+                imcoeffs, linedatax, linedatay, _, _, _ = \
+                    ts.multiroifit2(self._imdata, kernel, self._width, 0.02,
+                                    ts.AUTO_DOUBLET_SIG, self._peak_method)
+                centres = np.array([imcoeffs[:, 2]]).T
+            # Re-apply manual centre overrides (restored from a session, or
+            # carried across a post-fit rebuild)
+            override_rois = set()
+            for ridx, xval in self._overrides.items():
+                if 0 <= ridx < centres.shape[0]:
+                    centres[ridx, 0] = xval
+                    override_rois.add(ridx)
+
+            fit_dms = ts.dmsfit_ico_hkl(
+                reflist_fit, list(hkllistrange_fit), hklint,
+                self._psirange, self._width, centres, kernel,
+                self._hkl, detvects, self._imdata, self._simsigma, self._azir,
+                self._psi, self._px, self._py, scatv,
+                bravais, bool(detoptimize), bool(energyopt),
+                ig[10], ig[11], ig[12], ig[13], ig[14],
+                reflist2_fit, list(ig[15:24]), ig[0])
+            fit_dms.setCalLattice(ig[:6].tolist())
+            fit_dms.setLattice(ig[:6].tolist())
+            fit_dms.setPeakMethod(self._peak_method, ts.AUTO_DOUBLET_SIG)
+            if CONVENTIONAL:
+                fit_dms.setIGFull(ig)
+            fit_dms.hkllistrange[2] = numsteps_interactive
+            try:
+                fit_dms.imcalc(extract_reduced(ig))
+            except Exception:
+                pass
+
+            self.done.emit({
+                'reflist_fit':      reflist_fit,
+                'reflist2_fit':     reflist2_fit,
+                'ref_6d_fit':       sel6d,
+                'hkllistrange_fit': hkllistrange_fit,
+                'kernel':           kernel,
+                'imcoeffs':         imcoeffs,
+                'linedatax':        linedatax,
+                'linedatay':        linedatay,
+                'centres':          centres,
+                'override_rois':    override_rois,
+                'fit_dms':          fit_dms,
+            })
+        except Exception as e:
+            self.error.emit(str(e))
             import traceback; traceback.print_exc()
 
 
@@ -842,6 +1048,11 @@ class DMSSlider(QtWidgets.QMainWindow):
         # fit / ROI-build state (populated on demand by "Build curves")
         self._fitting       = False
         self._fit_worker    = None
+        # background ROI build ("Build curves" runs off the GUI thread)
+        self._building      = False
+        self._build_worker  = None
+        self._build_status  = None   # status text to show when the build lands
+        self._build_overrides = {}   # overrides handed to the in-flight build
         self._fit_dms       = None
         self._kernel        = None
         self._centres       = None
@@ -1250,8 +1461,10 @@ class DMSSlider(QtWidgets.QMainWindow):
         btn_build.setStyleSheet('background: #102030; color: #aaccff')
         btn_build.setToolTip('Integrate the ROIs for the checked reflections, '
                              'ready to fit')
-        btn_build.clicked.connect(self._on_build_curves)
+        # lambda: the clicked(checked) argument must not land on done_status
+        btn_build.clicked.connect(lambda: self._on_build_curves())
         ctrl_col2.addWidget(btn_build)
+        self._btn_build = btn_build
 
         # Selected arcs list
         arc_box = QtWidgets.QGroupBox('Selected reflections')
@@ -1300,12 +1513,21 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._chk_live_curve.toggled.connect(self._on_live_curve_toggled)
         arc_box_l.addWidget(self._chk_live_curve)
 
+        # DMS lines: hide the whole overlay (discovery slice + selected arcs +
+        # their labels) to inspect the bare detector image.  Picking still works
+        # while hidden, but any arc it creates stays invisible until re-shown.
         # Labels: draw the hkl indices next to each overlay DMS line.  Off by
         # default (the labels clutter a dense discovery slice).  "Selected only"
         # restricts them to the picked reflections; unchecked labels every drawn
         # line, discovery slice included.
         lbl_row = QtWidgets.QHBoxLayout()
         lbl_row.setSpacing(6)
+        self._chk_dms_lines = QtWidgets.QCheckBox('DMS lines')
+        self._chk_dms_lines.setChecked(True)
+        self._chk_dms_lines.setToolTip('Show the DMS overlay: the discovery slice '
+                                       'and the selected reflection arcs. Uncheck '
+                                       'to see the raw image underneath.')
+        self._chk_dms_lines.toggled.connect(self._on_dms_lines_toggled)
         self._chk_labels = QtWidgets.QCheckBox('Labels')
         self._chk_labels.setChecked(False)
         self._chk_labels.setToolTip('Attach the hkl indices to each overlay DMS '
@@ -1316,11 +1538,12 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._chk_labels_sel_only.setEnabled(False)   # enabled with Labels
         self._chk_labels_sel_only.setToolTip('Label only the selected reflection '
                                              'arcs, not the auto discovery slice.')
-        for _c in (self._chk_labels, self._chk_labels_sel_only):
+        for _c in (self._chk_dms_lines, self._chk_labels, self._chk_labels_sel_only):
             _f = _c.font(); _f.setPointSize(7); _c.setFont(_f)
         self._chk_labels.toggled.connect(self._on_labels_toggled)
         self._chk_labels_sel_only.toggled.connect(
             lambda _=None: self._refresh_overlay_labels())
+        lbl_row.addWidget(self._chk_dms_lines)
         lbl_row.addWidget(self._chk_labels)
         lbl_row.addWidget(self._chk_labels_sel_only)
         lbl_row.addStretch()
@@ -1786,6 +2009,34 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._maybe_update_live_curves()
         self._status.setText('Ready')
 
+    # ── Overlay visibility ─────────────────────────────────────────────────────
+
+    def _dms_lines_shown(self):
+        """True when the DMS overlay is visible (also true before the checkbox
+        exists, so arcs created during construction start out drawn)."""
+        chk = getattr(self, '_chk_dms_lines', None)
+        return True if chk is None else chk.isChecked()
+
+    def _apply_dms_visibility(self):
+        """Show/hide every overlay DMS line: the discovery scatter and each arc.
+        A checked list entry stays the gate for its own arc, so re-showing the
+        overlay does not resurrect arcs the user unchecked.  The red picking
+        crosses are not DMS lines and are left alone."""
+        show = self._dms_lines_shown()
+        self._dms_scatter.setVisible(show)
+        for arc in list(self._pick_items):
+            if id(arc) not in self._arc_to_6d:
+                continue
+            list_item = self._arc_to_list_item.get(id(arc))
+            checked = (list_item is None
+                       or list_item.checkState() == QtCore.Qt.Checked)
+            arc.setVisible(show and checked)
+
+    def _on_dms_lines_toggled(self, checked):
+        self._apply_dms_visibility()
+        self._refresh_overlay_labels()
+        self._status.setText('DMS lines shown' if checked else 'DMS lines hidden')
+
     # ── Overlay hkl labels ─────────────────────────────────────────────────────
 
     @staticmethod
@@ -1812,7 +2063,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         if getattr(self, '_chk_labels', None) is None:
             return
         want = []   # (text, x, y, colour)
-        if self._chk_labels.isChecked():
+        if self._chk_labels.isChecked() and self._dms_lines_shown():
             # Selected reflection arcs (always, when labelling is on).
             for arc in self._sel_order:
                 ref = self._arc_to_6d.get(id(arc))
@@ -2186,7 +2437,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         """Checkbox toggle → rebuild the selected-reflection overlay."""
         arc_item = list_item.data(QtCore.Qt.UserRole)
         if arc_item is not None:
-            arc_item.setVisible(list_item.checkState() == QtCore.Qt.Checked)
+            arc_item.setVisible(self._dms_lines_shown()
+                                and list_item.checkState() == QtCore.Qt.Checked)
         if not getattr(self, '_bulk_select', False):
             self._on_selection_changed()
 
@@ -2421,6 +2673,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         arc._x_data = x_arr   # cached for hit-testing
         arc._y_data = y_arr
         arc._colour = pg.mkColor(colour)
+        arc.setVisible(self._dms_lines_shown())
         self._vb.addItem(arc)
         self._pick_items.append(arc)
         self._arc_to_6d[id(arc)] = hkl_6d.copy()
@@ -2656,6 +2909,9 @@ class DMSSlider(QtWidgets.QMainWindow):
             'ref_6d_checked': ref_6d_checked,
             'manual_centres': manual_centres,
             'peak_method':    self._peak_method,
+            # whether "Build curves" had been run, so a restore can rebuild the
+            # ROI grid (and re-apply manual_centres) without a manual click
+            'curves_built':   self._centres is not None,
             'fit_result':     fit_result,
         }
 
@@ -2862,6 +3118,12 @@ class DMSSlider(QtWidgets.QMainWindow):
         else:
             self._last_res_x = None
             self._last_fit_info = None
+
+        # 6. If the session had curves built, rebuild them now so the ROI grid
+        #    and the manual centre overrides stashed above come back with it.
+        #    Needs an image, so it is skipped if the scan reload above failed.
+        if data.get('curves_built') and getattr(self, '_imdata', None) is not None:
+            self._on_build_curves()
 
     def _maybe_restore_session(self):
         """On launch, offer to restore the auto-saved previous session."""
@@ -3463,78 +3725,100 @@ class DMSSlider(QtWidgets.QMainWindow):
                 out.append([int(v) for v in hkl_6d])
         return np.array(out)
 
-    def _on_build_curves(self):
+    def _on_build_curves(self, done_status=None, reuse_rois=False):
+        """Start a background ROI build for the checked reflections at the
+        current parameters.  Returns True if a build was started; the result is
+        installed later by _on_build_done.  `done_status` overrides the status
+        message shown on success (used by the post-fit rebuild).
+
+        With `reuse_rois`, the existing ROIs and the experimental curves
+        extracted through them are kept and only the simulated side is
+        recomputed at the current parameters — the post-fit path, where moving
+        the ROIs would replace the very target centres the fit was scored
+        against.  Falls back to a full rebuild if there are no ROIs yet or the
+        checked reflections no longer match the ones they were built for."""
         if self._fitting:
             self._status.setText('Stop the fit before rebuilding curves')
-            return
+            return False
+        if self._building:
+            self._status.setText('Already building curves…')
+            return False
         self._sync_ig()
         sel6d = self._checked_ref_6d()
         if sel6d.shape[0] == 0:
             self._status.setText('Check at least one reflection (click arcs first)')
-            return
-        self._status.setText('Building integrated curves...')
-        QtWidgets.QApplication.processEvents()
-        self._worker.idle.wait(timeout=5.0)
+            return False
+        reuse = None
+        if reuse_rois and self._kernel is not None:
+            if (self._ref_6d_fit is not None
+                    and np.array_equal(np.asarray(sel6d), np.asarray(self._ref_6d_fit))):
+                reuse = {'kernel':    self._kernel,
+                         'imcoeffs':  self._imcoeffs,
+                         'linedatax': self._linedatax,
+                         'linedatay': self._linedatay,
+                         'centres':   self._centres}
+        self._status.setText('Recomputing simulated curves...' if reuse
+                             else 'Building integrated curves...')
 
-        try:
-            ig = self.ig
-            rl, rl2 = build_reflist_from_6d(sel6d)
-            self._reflist_fit  = np.array(rl)
-            self._reflist2_fit = np.array(rl2)
-            self._ref_6d_fit   = sel6d
+        # The overrides are consumed here: the worker applies them to the
+        # centres and hands back the resulting override set.  When the ROIs are
+        # reused the centres already carry them, so re-applying is a no-op that
+        # just keeps the override bookkeeping identical on both paths.
+        overrides = dict(self._pending_centre_overrides)
+        self._pending_centre_overrides = {}
+        self._building     = True
+        self._build_status = done_status
+        self._build_overrides = overrides   # put back if the build fails
+        self._btn_build.setEnabled(False)
+        self._build_worker = BuildWorker(
+            self.ig, sel6d, self._hkl, self._lattice, self._thrange,
+            self._imdata, self._azir, self._psi, self._px, self._py,
+            self._psirange, self._peak_method, overrides, reuse=reuse)
+        self._build_worker.done.connect(self._on_build_done)
+        self._build_worker.error.connect(self._on_build_error)
+        self._build_worker.start()
+        return True
 
-            hkllist_cur = ts.pilkhlrange(
-                self._lattice, self._hkl, ig[14],
-                self._thrange[0], self._thrange[1]).hklscan(numsteps)
-            self._hkllistrange_fit = [self._thrange[0], self._thrange[1], numsteps]
+    def _on_build_done(self, res):
+        """Install the state built by BuildWorker (GUI thread)."""
+        self._building = False
+        self._build_overrides = {}
+        self._btn_build.setEnabled(True)
+        self._reflist_fit       = res['reflist_fit']
+        self._reflist2_fit      = res['reflist2_fit']
+        self._ref_6d_fit        = res['ref_6d_fit']
+        self._hkllistrange_fit  = res['hkllistrange_fit']
+        self._kernel            = res['kernel']
+        self._imcoeffs          = res['imcoeffs']
+        self._linedatax         = res['linedatax']
+        self._linedatay         = res['linedatay']
+        self._centres           = res['centres']
+        self._centre_override_rois = res['override_rois']
+        self._fit_dms           = res['fit_dms']
 
-            builderargs = (
-                self._reflist_fit, hkllist_cur, hklint, intensity,
-                self._psirange, threshold, self._hkl, detvects, self._imdata.shape,
-                simsigma, self._azir, self._psi, self._px, self._py, scatv,
-                ig[10], ig[11], ig[12], ig[13], ig[14],
-                ig, self._reflist2_fit, list(ig[15:24]),
-                (bravais if CONVENTIONAL else None)
-            )
-            self._kernel = ts.roibuilder_ico_hkl(builderargs)
-            self._imcoeffs, self._linedatax, self._linedatay, _, _, _ = \
-                ts.multiroifit2(self._imdata, self._kernel, width, 0.02, 10.0,
-                                self._peak_method)
-            self._centres = np.array([self._imcoeffs[:, 2]]).T
-            self._centre_override_rois = set()
-            # Re-apply manual centre overrides restored from a session file
-            if self._pending_centre_overrides:
-                for ridx, xval in self._pending_centre_overrides.items():
-                    if 0 <= ridx < self._centres.shape[0]:
-                        self._centres[ridx, 0] = xval
-                        self._centre_override_rois.add(ridx)
-                self._pending_centre_overrides = {}
+        self._init_line_plot()
+        # ROIs whose experimental peak could not be located have no target and
+        # are excluded from the residual until the user right-clicks a centre.
+        n_no_target = int(np.count_nonzero(np.isnan(self._centres[:, 0]))) \
+            if self._centres is not None else 0
+        note = ('  (%d ROI(s) have no peak — right-click to set a centre)'
+                % n_no_target) if n_no_target else ''
+        if self._build_status:
+            self._status.setText(self._build_status + note)
+        else:
+            self._status.setText('%d reflections, %d ROIs — ready to fit%s' % (
+                self._ref_6d_fit.shape[0], self._kernel.shape[2], note))
+        self._build_status = None
 
-            self._fit_dms = ts.dmsfit_ico_hkl(
-                self._reflist_fit, list(self._hkllistrange_fit), hklint,
-                self._psirange, width, self._centres, self._kernel,
-                self._hkl, detvects, self._imdata, simsigma, self._azir,
-                self._psi, self._px, self._py, scatv,
-                bravais, bool(detoptimize), bool(energyopt),
-                ig[10], ig[11], ig[12], ig[13], ig[14],
-                self._reflist2_fit, list(ig[15:24]), ig[0])
-            self._fit_dms.setCalLattice(ig[:6].tolist())
-            self._fit_dms.setLattice(ig[:6].tolist())
-            self._fit_dms.setPeakMethod(self._peak_method)
-            if CONVENTIONAL:
-                self._fit_dms.setIGFull(ig)
-            self._fit_dms.hkllistrange[2] = numsteps_interactive
-            try:
-                self._fit_dms.imcalc(extract_reduced(ig))
-            except Exception:
-                pass
-
-            self._init_line_plot()
-            self._status.setText('%d reflections, %d ROIs — ready to fit' % (
-                sel6d.shape[0], self._kernel.shape[2]))
-        except Exception as e:
-            self._status.setText('Build failed: %s' % str(e)[:80])
-            import traceback; traceback.print_exc()
+    def _on_build_error(self, msg):
+        self._building = False
+        self._btn_build.setEnabled(True)
+        self._build_status = None
+        # The build consumed the manual centre overrides; hand them back so a
+        # failed build doesn't silently discard them.
+        self._pending_centre_overrides.update(self._build_overrides)
+        self._build_overrides = {}
+        self._status.setText('Build failed: %s' % msg[:80])
 
     # ── ROI integrated-curve grid ────────────────────────────────────────────────
 
@@ -3595,9 +3879,20 @@ class DMSSlider(QtWidgets.QMainWindow):
         for i, cl in enumerate(self._exp_centre_lines):
             overridden = i in self._centre_override_rois
             if overridden and self._centres is not None and i < self._centres.shape[0]:
-                cl.setValue(float(self._centres[i, 0]))
+                val = float(self._centres[i, 0])
             elif not overridden and i < len(self._imcoeffs):
-                cl.setValue(float(self._imcoeffs[i, 2]))
+                val = float(self._imcoeffs[i, 2])
+            else:
+                val = np.nan
+            # A NaN centre means no experimental peak could be located, so this
+            # ROI has no target and is excluded from the residual.  Hide its
+            # centre line rather than feeding NaN to setValue, so it reads as
+            # "needs a right-click" instead of silently sitting somewhere.
+            if np.isnan(val):
+                cl.setVisible(False)
+                continue
+            cl.setVisible(True)
+            cl.setValue(val)
             cl.setPen(pg.mkPen('#ffaa00', width=1.5) if overridden
                       else pg.mkPen('#4488ff', width=1, style=QtCore.Qt.DashLine))
 
@@ -3614,15 +3909,22 @@ class DMSSlider(QtWidgets.QMainWindow):
             curve.setData(ldsx[i], y_sim * yscale + yoffset)
         for i, cl in enumerate(self._sim_centre_lines):
             if i < len(ldscoeffs):
-                cl.setValue(float(ldscoeffs[i, 2]))
+                # NaN = the simulated line could not be located in this ROI;
+                # that ROI is charged the failure penalty in the residual.
+                val = float(ldscoeffs[i, 2])
+                cl.setVisible(not np.isnan(val))
+                if not np.isnan(val):
+                    cl.setValue(val)
 
     def _try_draw_sim_lines(self):
         if (self._fit_dms is not None and self._fit_dms.imsim is not None
                 and self._sim_curves):
             try:
+                # Same estimator as dmsfit_ico_hkl._simcoeffs, so the sim centre
+                # line drawn here is the one the residual is actually scoring.
                 coefs, ldsx, ldsy, _, _, _ = ts.multiroifit(
                     self._fit_dms.imsim, self._kernel, width, 10,
-                    self._peak_method)
+                    self._peak_method, ts.AUTO_DOUBLET_SIG)
                 self._draw_sim_lines(coefs, ldsx, ldsy)
             except Exception:
                 pass
@@ -3696,7 +3998,7 @@ class DMSSlider(QtWidgets.QMainWindow):
             return
         self._peak_method = self._peak_combo.currentData()
         if self._fit_dms is not None:
-            self._fit_dms.setPeakMethod(self._peak_method)
+            self._fit_dms.setPeakMethod(self._peak_method, ts.AUTO_DOUBLET_SIG)
         if self._kernel is not None and not self._fitting:
             self._on_build_curves()
 
@@ -3733,6 +4035,9 @@ class DMSSlider(QtWidgets.QMainWindow):
     def _do_fit(self):
         if self._fitting:
             return
+        if self._building:
+            self._status.setText('Wait for the curve build to finish')
+            return
         if self._fit_dms is None:
             self._status.setText('Build curves before fitting')
             return
@@ -3761,12 +4066,12 @@ class DMSSlider(QtWidgets.QMainWindow):
         if CONVENTIONAL:
             dms.setIGFull(ig)
 
-        bounds = list(zip(reduced - 1.5, reduced + 1.5))
+        bounds = param_bounds(reduced)
         self._worker.idle.wait(timeout=5.0)
 
         self._fit_worker = FitWorker(
             dms, reduced, bounds, self._active_method, n_parallel_starts,
-            free_idx=free)
+            free_idx=free, steps=param_steps())
         self._fit_worker.done.connect(self._on_fit_done)
         self._fit_worker.error.connect(self._on_fit_error)
         self._fit_worker.stopped.connect(self._on_fit_stopped)
@@ -3797,13 +4102,25 @@ class DMSSlider(QtWidgets.QMainWindow):
             'dmsindex':   result.get('dmsindex'),
         }
         self._btn_save_fit.setEnabled(True)
-        self._status.setText('Fit complete.  χ²=%.4f  t=%.1fs  [%s]' % (
-            result['opt'], result['elapsed'], result['method']))
         print('initial_guess = np.array([' +
               ','.join('%.6f' % v for v in inputarray) + '])')
         self._do_update()
-        self._draw_exp_lines()
-        self._try_draw_sim_lines()
+        # Redraw the curves at the refined parameters, keeping the ORIGINAL
+        # ROIs: they and the experimental peak centres extracted through them
+        # are the fixed reference the fit was scored against, so rebuilding
+        # them at the refined geometry would move the target underneath the
+        # result.  Only the simulated curves change.  Manual peak positions
+        # carry across (an explicit "Build curves" still clears them).  The
+        # rebuild is asynchronous; the fit-complete message lands with it.
+        if self._centres is not None:
+            for ridx in self._centre_override_rois:
+                if ridx < self._centres.shape[0]:
+                    self._pending_centre_overrides[int(ridx)] = \
+                        float(self._centres[ridx, 0])
+        done_msg = 'Fit complete.  χ²=%.4f  t=%.1fs  [%s]' % (
+            result['opt'], result['elapsed'], result['method'])
+        if not self._on_build_curves(done_status=done_msg, reuse_rois=True):
+            self._status.setText(done_msg)
 
     def _on_fit_error(self, msg, elapsed):
         self._fitting = False
@@ -3830,6 +4147,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._worker.stop()
         if self._fit_worker and self._fit_worker.isRunning():
             self._fit_worker.wait()
+        if self._build_worker and self._build_worker.isRunning():
+            self._build_worker.wait()
         super().closeEvent(event)
 
 
