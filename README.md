@@ -62,14 +62,23 @@ python -m DMSAnalysis.dat2config scan.dat out.json --datapoint N --datapoint0 M
 ```
 
 Typical flow in the **slider** (image-based):
-1. Refine geometry with the sliders over the detector image.
-2. Click arcs to select reflections; check/uncheck them in the list.
-3. **Build curves** — integrate the ROIs for the checked reflections.
-4. **Fit** — run the optimiser; fitted parameters flow back to the sliders.
+1. **Browse… → Load Scan** — the scan's own lattice, energy, primary `hkl` and
+   `psi` come off the `.dat` and seed the sliders (untick **Seed sliders from
+   .dat** to load the image against the geometry already on screen).
+2. Refine geometry with the sliders over the detector image.
+3. Click arcs to select reflections; check/uncheck them in the list
+   (right-click a line to remove it).
+4. **Build curves** — integrate the ROIs for the checked reflections.
+5. **Fit** — run the optimiser; fitted parameters flow back to the sliders, and
+   the run is written to `Processing/` (see *Output*). Choosing **No Fit
+   (evaluate + save)** from the algorithm list writes that record for the
+   current guess without refining anything.
 
 **Save config** writes the current state (incl. selected reflections) for batch
 runs via `python -m DMSAnalysis.fit`. The config is the single source of truth —
 once the `experiment` block is populated, the apps never read the `.dat` again.
+The three panel dividers and the window geometry are remembered between
+sessions.
 
 Typical flow in the **tripslider** (image-free):
 1. Add or edit triple intersections in the **Triple intersections** table (each
@@ -119,7 +128,7 @@ DMS/                          # repository root
 │   ├── tripfit.py            # image-free multiple-intersection batch lattice fit
 │   ├── tripslider.py         # image-free multiple-intersection GUI
 │   ├── configs/              # example JSON configs
-│   ├── tests/                # self-verification tests (e.g. pseudo-cubic matrices)
+│   ├── tests/                # self-verification tests (geometry, ROI kernels, GUI behaviour)
 │   └── README.md             # library API reference
 └── Processing/               # timestamped run snapshots (created in CWD when save=1)
 ```
@@ -131,7 +140,7 @@ The **image-based** apps (`slider`, `fit`) read a JSON config with these section
 | Section | Purpose |
 |---------|---------|
 | `scan` | `scannum`, `scanpath`, `datapoint`, `datapoint0` — which scan/image to load |
-| `experiment` | `lattice`, `energy`, `energy0`, `azir`, `image_template` — metadata extracted from the `.dat` |
+| `experiment` | `lattice`, `energy`, `energy0`, `azir`, `hkl`, `psi`, `image_template` — metadata extracted from the `.dat` |
 | `geometry` | `hkl`, `psi`, `px_unscaled`, `py_unscaled`, `scatv` — primary reflection and detector origin |
 | `display` | `zoomval`, `colourlim`, `colmap` — image display |
 | `roi` | `width_per_zoom`, `comwidth_per_zoom` — ROI extraction widths |
@@ -152,7 +161,19 @@ schema, and developer notes.
 
 ## Output
 
-With `save=1`, the image fit creates an immutable snapshot under
+Every fit finished in the **slider** writes a run record under
+`Processing/<scannum>_dp<datapoint>_<YYYYMMDD-HHMMSS>_<method>/`:
+
+| File | What it is |
+|------|------------|
+| `Result.txt` | the solution — residual, refined parameters, per-ROI centres — and the recipe to rerun it: starting guess, optimiser, free parameters and their bounds, sampling and peak settings |
+| `IM_<scan>_dp<dp>.png` | the detector image with the simulated DMS lines over it |
+| `PLOT_<scan>_dp<dp>.svg` | the integrated ROI curves, as vector art |
+
+**Save fit snapshot → Processing** writes those three again in a folder of its
+own, plus the code, config and `res.x.txt` for reproducibility.
+
+With `save=1`, the batch image fit creates an immutable snapshot under
 `Processing/YYYYMMDDHHMM_<imnum>_<scannum>_<description>_<fittype>/` containing
 the script, library, config, fit results, and rendered images. `tripfit` writes a
 lighter snapshot under `Processing/YYYYMMDDHHMM_TripFit/` (script, library,
