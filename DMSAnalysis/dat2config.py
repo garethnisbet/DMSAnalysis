@@ -17,8 +17,13 @@ used to pull from the ``.dat``::
         "energy":         <energy at datapoint>,
         "energy0":        <energy at datapoint0>,   # energy/energy0 rescales hkl
         "azir":           [azih, azik, azil],
+        "hkl":            [h, k, l],                # primary reflection at datapoint
+        "psi":            <azimuthal angle, deg>,
         "image_template": "913123-pilatus2M-files/%05d.tif"
     }
+
+``hkl`` and ``psi`` are the as-measured primary reflection and azimuth; they are
+omitted when the ``.dat`` does not carry them.
 
 CLI::
 
@@ -58,6 +63,49 @@ def energy_at(dat_path, datapoint):
     """Return the scan energy (keV) at ``datapoint`` using the same fallback
     chain as :func:`extract_metadata`."""
     return _energy_at(do.load(dat_path), datapoint)
+
+
+def _hkl_at(d, idx):
+    """The primary reflection at scan index ``idx``.
+
+    The scanned ``h``/``k``/``l`` columns are the as-measured indices at each
+    point and are preferred.  Many scans (the fixed-angle energy scans this
+    analysis lives on, for one) carry no such columns, only the single
+    ``metadata`` hkl — the position the scan was set up at, at the metadata
+    energy ``en``.  The diffractometer does not move during those scans, so the
+    indices at ``idx`` are that position scaled by the Bragg energy ratio,
+    ``hkl * E[idx] / en``: on a scan that has both, this reproduces the columns
+    to six decimals.  Returns ``None`` when the file carries no hkl at all."""
+    try:
+        return [float(d.h[idx]), float(d.k[idx]), float(d.l[idx])]
+    except (AttributeError, IndexError, TypeError):
+        pass
+    try:
+        m   = d.metadata
+        hkl = [float(m['h']), float(m['k']), float(m['l'])]
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    try:
+        en_meta = float(m.en)
+        if en_meta > 0:
+            ratio = _energy_at(d, idx) / en_meta
+            hkl   = [v * ratio for v in hkl]
+    except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+        pass
+    return hkl
+
+
+def _psi_of(d, idx):
+    """The azimuthal angle (deg).  Scanned ``psi`` column first, then the
+    metadata value; ``None`` when the file carries neither."""
+    try:
+        return float(d.psi[idx])
+    except (AttributeError, IndexError, TypeError):
+        pass
+    try:
+        return float(d.metadata['psi'])
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
 
 
 def _detector_template(dat_path, scannum):
@@ -116,13 +164,23 @@ def extract_metadata(dat_path, datapoint, datapoint0):
                float(m.alpha1), float(m.alpha2), float(m.alpha3)]
     azir = [float(m['azih']), float(m['azik']), float(m['azil'])]
 
-    return {
+    exp = {
         'lattice':        lattice,
         'energy':         _energy_at(d, datapoint),
         'energy0':        _energy_at(d, datapoint0),
         'azir':           azir,
         'image_template': _detector_template(dat_path, scannum),
     }
+    # The primary reflection and the azimuth as measured.  Both are optional —
+    # a scan that does not carry them simply leaves the key out, and the
+    # consumer keeps whatever it was using.
+    hkl = _hkl_at(d, datapoint)
+    if hkl is not None:
+        exp['hkl'] = hkl
+    psi = _psi_of(d, datapoint)
+    if psi is not None:
+        exp['psi'] = psi
+    return exp
 
 
 def dat_to_config(dat_path, template_cfg_path=None, datapoint=None, datapoint0=None):

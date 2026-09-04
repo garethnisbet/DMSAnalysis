@@ -32,6 +32,45 @@ and **Reset zoom** rescales every panel to its curves and re-enables
 auto-scaling. Left-click still selects a ROI and right-click still assigns its
 centre in either mouse mode.
 
+### Loading a scan: the .dat is the source
+
+A `.dat` measures the lattice, the energy, the primary reflection `h k l` and
+the azimuth `psi`, and `dat2config.extract_metadata` now returns all four (the
+`experiment` block gained `hkl` and `psi`; a scan carrying neither leaves the
+keys out). **Every** scan load in the slider seeds the sliders from them —
+lattice, energy and h/k/l get their values and their slider ranges recentred,
+psi is set — so a new scan needs no config editing: load it, refine from there,
+and **Export workflow JSON** / **Save Session** writes what the .dat said or
+wherever the sliders have since been dragged. The status line names what was
+seeded.
+
+Same scan or not is deliberately *not* part of the decision. The auto-saved
+session restores onto the scan it was saved on, so an explicit **Load Scan** of
+that same .dat would otherwise be a no-op — which is exactly the surprise it
+caused. Prev/Next and a datapoint change seed too.
+
+**Seed sliders from .dat** (in the *Scan* box, on by default) is the off switch,
+for loading a scan's image against the geometry currently on the sliders. Only
+in that branch does hkl follow the energy ratio across a datapoint step
+(`hkl · E[dp]/E[prev]`) instead of the file — running both would apply the ratio
+twice. Session restore forces seeding off: the session's own geometry (now
+including `psi`, which it did not store before) wins over the file's.
+
+`hkl` at a datapoint comes from the scanned `h`/`k`/`l` columns when the scan has
+them. Most scans here (fixed-angle energy scans — 913232, 913123) do not: they
+carry one metadata hkl, recorded at the metadata energy `en`. The diffractometer
+does not move during those, so the indices at a datapoint are that position
+scaled by the Bragg energy ratio, `hkl · E[dp]/en` — on a scan carrying both,
+this reproduces the columns to six decimals (`dat2config._hkl_at`). Without it
+a datapoint step on such a scan would not move hkl at all.
+
+`_do_load_scan(path, dp, dp0, seed_from_metadata=None)` holds this: `None` asks
+the tick box, `True`/`False` force it. It also keeps the module-level `hklint`
+(the integer reference reflection every engine is built from) in step with the
+live hkl — before, a load left it at the value the app started on. Test:
+`DMSAnalysis/tests/test_scan_load_seeding.py`, which drives the real GUI
+headlessly over synthetic `.dat` files.
+
 Missing scan data never stops the slider from opening. If the config's `.dat` or
 its detector image cannot be read (a beamline path that does not exist on this
 machine, data on another disk, …), the app starts on placeholder metadata
@@ -40,7 +79,9 @@ set to put the primary reflection at a 20° Bragg angle) and a blank frame, list
 what was missing in a startup dialog, and lets the user browse to the real file
 with the Scan loader (**Browse…** → **Load**), which replaces all of it. A scan
 whose `.dat` reads but whose image is absent loads too — metadata is applied and
-the blank frame is kept, noted in the status line. `fit.py` (batch) still fails
+the blank frame is kept, noted in the status line. The config's own
+`geometry.hkl` / `geometry.psi` still win at **startup** (a config is a saved
+refinement); only a scan *load* seeds. `fit.py` (batch) still fails
 loudly on missing data.
 
 `tripfit.py` is a separate, image-free batch app: it refines a conventional

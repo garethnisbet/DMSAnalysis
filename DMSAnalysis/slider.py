@@ -1526,13 +1526,31 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._sb_dp.setValue(self._datapoint)
         sbl.addWidget(self._sb_dp, 2, 3)
 
+        # A scan brings its own metadata: lattice, energy, primary hkl and psi
+        # come off the .dat on every load, so loading a scan needs no config
+        # editing.  Unticked, the sliders are left exactly where they are and
+        # only the image / azir / image template change (the old behaviour) —
+        # that is the way to keep a refinement while stepping datapoints.
+        self._chk_seed_dat = QtWidgets.QCheckBox('Seed sliders from .dat')
+        self._chk_seed_dat.setChecked(True)
+        self._chk_seed_dat.setToolTip(
+            'On every scan load — Load Scan, Prev/Next, a datapoint change — '
+            'set the lattice, energy, primary hkl and psi from the .dat (the '
+            'as-measured values at that datapoint), recentring their slider '
+            'ranges.\n\nUntick to keep the current slider state and take only '
+            'the image and azimuthal reference from the scan; hkl then follows '
+            'the energy ratio across a datapoint step, so a refinement survives '
+            'scrubbing through a scan.\n\nA restored session always keeps its '
+            'own geometry, whatever this is set to.')
+        sbl.addWidget(self._chk_seed_dat, 3, 0, 1, 4)
+
         self._lbl_scan_info = QtWidgets.QLabel(
             'E=%.4f keV' % energy)
         f_si = self._lbl_scan_info.font()
         f_si.setFamily('monospace')
         f_si.setPointSize(7)
         self._lbl_scan_info.setFont(f_si)
-        sbl.addWidget(self._lbl_scan_info, 3, 0, 1, 4)
+        sbl.addWidget(self._lbl_scan_info, 4, 0, 1, 4)
 
         ctrl_col.addWidget(scan_box)
 
@@ -3397,6 +3415,15 @@ class DMSSlider(QtWidgets.QMainWindow):
             'scannum':        int(self._scannum),
             'datapoint':      int(self._datapoint),
             'hkl':            self._hkl.tolist(),
+            # azimuthal reference, in the active pseudo-cubic indexing (like hkl
+            # and ref_6d).  Normally re-derived from the .dat on reload, but it
+            # is stored so a session restores identically even when the scan is
+            # missing or its azir differs from the one in use.
+            'azir':           [float(v) for v in self._azir],
+            # azimuth of the sample.  Like azir it is normally scan metadata,
+            # but it is edited by hand in the Config table, so the session
+            # value must win over the .dat's on restore.
+            'psi':            float(self._psi),
             'px':             float(self._px),
             'py':             float(self._py),
             'initial_guess':  self.ig.tolist(),
@@ -3542,7 +3569,9 @@ class DMSSlider(QtWidgets.QMainWindow):
             dp   = int(scan['datapoint'])
             dp0  = int(scan.get('datapoint0', scan['datapoint']))
             try:
-                self._do_load_scan(full, dp, dp0)
+                # Never reseed from the .dat here: every value the seeding
+                # would set is restored from the session below.
+                self._do_load_scan(full, dp, dp0, seed_from_metadata=False)
                 self._pending_scan_path = full
                 self._lbl_scan_path.setText(os.path.basename(full))
                 try:
@@ -3594,6 +3623,26 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._suppress = False
         self.ig[:]   = ig_loaded
         self._hkl[:] = hkl_loaded
+
+        # 2.5 Restore the azimuthal reference and psi.  The scan reload above
+        #     took both from the .dat when it seeded; the session values win so
+        #     a restore is identical even with no scan on disk.  Stored in the active indexing, so no
+        #     pseudo-cubic matrix is applied here.  Both overlay engines cache
+        #     azir, so they are rebuilt — the selected-reflection engine follows
+        #     from _apply_reflections in step 3.
+        azir_loaded = data.get('azir')
+        psi_loaded  = data.get('psi')
+        if psi_loaded is not None:
+            self._psi      = float(psi_loaded)
+            self._psirange = [self._psi - 180, self._psi + 180]
+        if azir_loaded is not None and len(azir_loaded) == 3:
+            self._azir = [float(v) for v in azir_loaded]
+        if (azir_loaded is not None and len(azir_loaded) == 3) or psi_loaded is not None:
+            self._dms_full = make_overlay_dms(
+                self.full_reflist, self.full_reflist2, self._hkl, self._imdata,
+                self._psirange, self._thrange, self._azir, self._psi,
+                self._px, self._py, self.ig)
+            self._rebuild_dms_slice()
 
         # 3. Clear existing arcs / picks, then re-plot the saved reflections
         self._on_clear_picks()
@@ -3873,22 +3922,51 @@ class DMSSlider(QtWidgets.QMainWindow):
         lay.addWidget(btn)
         dlg.exec_()
 
-    def _do_load_scan(self, path, dp, dp0, seed_from_metadata=False):
+    def _do_load_scan(self, path, dp, dp0, seed_from_metadata=None):
+        """Load ``path`` at datapoint ``dp`` (reference ``dp0``).
+
+        ``seed_from_metadata`` decides whether the .dat's own values (lattice,
+        energy, primary hkl, psi) replace the current slider state.  ``None``
+        (the default) means *ask the "Seed sliders from .dat" tick box*, which
+        is on: **any** load — a different scan, Prev/Next, or the same file at
+        another datapoint — brings the file's own numbers in, because that is
+        what loading a scan means.  Untick it to load the image against the
+        current geometry instead; then, and only then, hkl follows the energy
+        ratio across a datapoint step rather than the file.
+
+        Whether the scan is the same one is deliberately *not* part of this: a
+        session restored onto scan N (the auto-saved session does exactly that)
+        would otherwise make an explicit Load of N's own .dat a no-op.
+        Programmatic callers pass True/False to force it — session restore
+        passes False, since it carries its own geometry."""
+        # Every engine built below takes the integer reference reflection from
+        # the module-level `hklint`, so a load that changes hkl must update it.
+        global hklint
         # The converter is the only sanctioned .dat reader.
         exp = dat2config.extract_metadata(path, dp, dp0)
         lat = list(exp['lattice'])
 
-        hkl_ref    = np.array([2.27931876, 3.70249186, 1.29579814])
-        hkl_ref    = hkl_ref * exp['energy'] / exp['energy0']
-        hklint_ref = np.round(hkl_ref)
-
         en_new    = float(exp['energy'])
         azir_new  = list(exp['azir'])
-        # The .dat carries the as-measured azimuthal reference; keep it in the
-        # active pseudo-cubic indexing.
-        if CONVENTIONAL and getattr(self, '_pc_idx', 1) != 1:
-            azir_new = list(ts.pseudocubic_matrix(self._pc_idx)
-                            @ np.asarray(azir_new, dtype=float))
+        # The .dat carries the as-measured azimuthal reference and primary
+        # reflection; keep both in the active pseudo-cubic indexing.
+        _pcm = (ts.pseudocubic_matrix(self._pc_idx)
+                if CONVENTIONAL and getattr(self, '_pc_idx', 1) != 1 else None)
+        if _pcm is not None:
+            azir_new = list(_pcm @ np.asarray(azir_new, dtype=float))
+
+        # The primary reflection as measured at this datapoint.  A scan that
+        # does not carry h/k/l leaves the current reference in place, rescaled
+        # by the energy ratio as before.
+        psi_new = exp.get('psi')
+        if exp.get('hkl') is not None:
+            hkl_ref = np.asarray(exp['hkl'], dtype=float)
+            if _pcm is not None:
+                hkl_ref = np.asarray(_pcm @ hkl_ref, dtype=float).ravel()
+        else:
+            hkl_ref = self._hkl_ref * exp['energy'] / exp['energy0']
+        hkl_ref = np.asarray(hkl_ref, dtype=float).ravel()
+
         scan_dir  = os.path.dirname(os.path.abspath(path)) + os.sep
         basename  = os.path.basename(path)
         m         = re.match(r'^(\d+)\.dat$', basename)
@@ -3910,19 +3988,29 @@ class DMSSlider(QtWidgets.QMainWindow):
 
         imdata_new = np.copy(im_new)
 
-        # Update energy slider range to centre on the new scan energy, but
-        # preserve the user's current slider value if it falls within the new
-        # range.  Do NOT call setValue here – slider-controlled parameters
-        # (energy, h, k, l, psi) must stay exactly as the user left them so
-        # that reloading the same file/dp produces no shift.
-        self._suppress = True
-        self._sliders['energy'].setRange(en_new - 0.5, en_new + 0.5)
-        self._suppress = False
+        # Is this the scan already loaded?  Only the not-seeding branch below
+        # cares: it rescales hkl across a datapoint step of the same scan.
+        same_scan = (snum_new == self._scannum and
+                     os.path.normpath(scan_dir) == os.path.normpath(self._scanpath)
+                     and self._scan_loaded)
+        if seed_from_metadata is None:
+            _chk = getattr(self, '_chk_seed_dat', None)
+            seed_from_metadata = _chk is None or _chk.isChecked()
 
-        # On a fresh load (no active session — e.g. after Clear Session) seed the
-        # lattice and energy sliders straight from the .dat metadata, recentring
-        # their ranges.  Detector/correction sliders are left as-is (they are not
-        # part of the file metadata).
+        # Recentre the energy slider range on the new scan energy so the scan's
+        # own energy is reachable, but do NOT call setValue here — the seed
+        # block below owns the value.  Skipped when not seeding: a range move
+        # clamps the value into it, and a kept slider must be kept exactly.
+        if seed_from_metadata:
+            self._suppress = True
+            self._sliders['energy'].setRange(en_new - 0.5, en_new + 0.5)
+            self._suppress = False
+
+        # Seed the sliders from the .dat: everything the file actually measures
+        # — lattice, energy, primary hkl, psi — replaces the current state and
+        # its slider range is recentred on it.  Detector/correction sliders are
+        # left as-is (they are not part of the file metadata).
+        seeded = []
         if seed_from_metadata:
             self.ig[14] = en_new
             if CONVENTIONAL:
@@ -3930,29 +4018,37 @@ class DMSSlider(QtWidgets.QMainWindow):
             else:
                 self.ig[0] = self.ig[1] = self.ig[2] = float(lat[0])
                 self.ig[3] = self.ig[4] = self.ig[5] = 90.0
+            self._hkl[:] = hkl_ref
+            seeded += ['lattice', 'energy', 'hkl']
             self._suppress = True
             for label, idx, half, *_ in slider_defs:
                 if isinstance(idx, int) and (idx < 6 or idx == 14):
                     v = float(self.ig[idx])
-                    self._sliders[label].setRange(v - half, v + half)
-                    self._sliders[label].setValue(v)
+                elif idx in ('h', 'k', 'l'):
+                    v = float(self._hkl['hkl'.index(idx)])
+                else:
+                    continue
+                self._sliders[label].setRange(v - half, v + half)
+                self._sliders[label].setValue(v)
             self._suppress = False
+            # psi has no slider — it lives in the config table.
+            if psi_new is not None:
+                self._psi = float(psi_new)
+                seeded.append('psi')
 
-        # Read the current slider state into self.ig / self._hkl so the DMS
-        # objects are built with the exact same parameters that were in use
-        # before the load (guarantees same file/dp → no shift).
+        # Read the current slider state into self.ig / self._hkl — the seeded
+        # values just written, or the ones the user left there.
         self._sync_ig()
 
         # ── Energy-rescale hkl on a same-scan datapoint change ───────────────
-        # When the datapoint changes within the same scan and the scan energy
-        # differs, the reciprocal-space indices scale with the energy ratio
-        # (Bragg condition):  hkl = hkl * E[dp] / E[prev_dp], where prev_dp is
-        # whatever was last loaded for this scan.  Reloading the same dp (or a
-        # dp with the same energy) leaves hkl and the sliders untouched, so the
-        # "same file/dp → no shift" guarantee holds.
-        same_scan = (snum_new == self._scannum and
-                     os.path.normpath(scan_dir) == os.path.normpath(self._scanpath))
-        if same_scan and dp != self._datapoint:
+        # Only when NOT seeding: a seeded hkl already *is* the .dat's value at
+        # this datapoint, and rescaling it would apply the energy ratio twice.
+        # Keeping a refined hkl across a datapoint step is the case this serves:
+        # the reciprocal-space indices scale with the energy ratio (Bragg),
+        # hkl = hkl * E[dp] / E[prev_dp], prev_dp being whatever was last loaded
+        # for this scan.  Reloading the same dp (or a dp at the same energy)
+        # leaves hkl and the sliders untouched.
+        if (not seed_from_metadata) and same_scan and dp != self._datapoint:
             try:
                 en_prev = dat2config.energy_at(path, self._datapoint)
             except Exception:
@@ -3991,7 +4087,10 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._azir       = azir_new
         self._imdata     = imdata_new
         self._hkl_ref    = hkl_ref.copy()
-        self._hklint     = hklint_ref.copy()
+        # The integer reference reflection the engines are built from follows the
+        # live primary hkl — seeded from the .dat or kept from the sliders.
+        hklint           = np.round(self._hkl)
+        self._hklint     = hklint.copy()
         self._thrange    = thrange_cur
         self._psirange   = psirange_cur
         self._hkllist    = hkllist_cur
@@ -4043,8 +4142,17 @@ class DMSSlider(QtWidgets.QMainWindow):
             'energy':         float(en_new),
             'energy0':        float(exp['energy0']),
             'azir':           list(azir_new),
+            'hkl':            [float(v) for v in hkl_ref],
             'image_template': imtmpl,
         }
+        if psi_new is not None:
+            self._cfg['experiment']['psi'] = float(psi_new)
+        # Whatever is now live — seeded from the .dat or kept from the sliders —
+        # is what an exported config must carry, so put it in geometry too.
+        self._cfg.setdefault('geometry', {}).update({
+            'hkl': self._hkl.tolist(),
+            'psi': float(self._psi),
+        })
         self._cfgtable.set_config(self._cfg)
 
         # Update UI labels
@@ -4055,7 +4163,12 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._rebuild_selected_engine()   # new image/psi baked into the engine
         self._update_img_scrub_range(dp)  # point the image scrubber at the new scan
         self._do_update()
-        self._status.setText('Loaded scan %d dp=%d  E=%.4f keV' % (snum_new, dp, en_new))
+        self._scan_loaded = True
+        self._status.setText('Loaded scan %d dp=%d  E=%.4f keV%s%s'
+                             % (snum_new, dp, en_new,
+                                ('  ← .dat: ' + ', '.join(seeded)) if seeded
+                                else '  (sliders kept)',
+                                img_note))
 
     # ── Workflow export / launch ───────────────────────────────────────────────
 
