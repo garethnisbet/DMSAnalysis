@@ -71,6 +71,20 @@ live hkl — before, a load left it at the value the app started on. Test:
 `DMSAnalysis/tests/test_scan_load_seeding.py`, which drives the real GUI
 headlessly over synthetic `.dat` files.
 
+### Right-click removes a line; one empty arc used to disarm it
+
+Every selected reflection owns an arc whose on-detector points are cached on the
+item (`_x_data`/`_y_data`) for hit-testing. An arc can hold **no** points — the
+reflection's line is off the plate at the current geometry (a scan load moves
+plenty of them there), or a bulk add created it empty and the overlay pass has
+not traced it yet. `_nearest_arc_at` took `min()` over those arrays unguarded,
+so one empty arc raised `ValueError: zero-size array to reduction operation
+minimum` *inside the mouse-click slot* — and right-click then removed nothing,
+whichever line was clicked. `_nearest_selectable` (middle-click add) had always
+guarded this; the removal path had not. `_on_update_done` now also clears the
+cache when a reflection drops off the plate, so right-click cannot pick an arc
+by where it used to be. Test: `DMSAnalysis/tests/test_arc_picking.py`.
+
 Missing scan data never stops the slider from opening. If the config's `.dat` or
 its detector image cannot be read (a beamline path that does not exist on this
 machine, data on another disk, …), the app starts on placeholder metadata

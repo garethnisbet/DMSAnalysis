@@ -2418,7 +2418,11 @@ class DMSSlider(QtWidgets.QMainWindow):
                 arc.setData(x=x, y=y)
                 arc._x_data, arc._y_data = x, y
             else:
+                # No line for this arc at the current geometry: clear the
+                # hit-test cache with the drawn data, or right-click would pick
+                # an arc by where it used to be.
                 arc.setData(x=[], y=[])
+                arc._x_data = arc._y_data = np.array([])
         self._refresh_overlay_labels()
         self._maybe_update_live_curves()
         self._status.setText(self._ready_text(circle_resid))
@@ -2960,17 +2964,25 @@ class DMSSlider(QtWidgets.QMainWindow):
 
     def _nearest_arc_at(self, scene_pos, threshold=None):
         """Return the arc ScatterPlotItem closest to scene_pos (within a
-        zoom-aware screen-pixel tolerance)."""
+        zoom-aware screen-pixel tolerance).
+
+        An arc can legitimately hold no points — a reflection whose line is off
+        the plate at the current geometry (a scan load moves plenty of them
+        there), or one created empty by a bulk add and not yet traced.  Such an
+        arc must be skipped: `min()` over an empty array raises, and the raise
+        came out of the mouse-click slot, so a single empty arc stopped
+        right-click from removing *any* of them."""
         vb_pos = self._vb.mapSceneToView(scene_pos)
         col, row = vb_pos.x(), vb_pos.y()
         best_arc, best_dist = None, (self._click_tol() if threshold is None else threshold)
         for arc_item in list(self._pick_items):
             if id(arc_item) not in self._arc_to_6d:
                 continue
-            if not hasattr(arc_item, '_x_data'):
+            xd = getattr(arc_item, '_x_data', None)
+            yd = getattr(arc_item, '_y_data', None)
+            if xd is None or yd is None or len(xd) == 0 or len(yd) == 0:
                 continue
-            d = float(np.sqrt((arc_item._x_data - col)**2 +
-                               (arc_item._y_data - row)**2).min())
+            d = float(np.sqrt((xd - col)**2 + (yd - row)**2).min())
             if d < best_dist:
                 best_dist, best_arc = d, arc_item
         return best_arc
