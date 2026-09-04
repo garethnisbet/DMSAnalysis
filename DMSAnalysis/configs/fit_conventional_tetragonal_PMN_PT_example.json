@@ -12,7 +12,6 @@
     "show_centres": 1,
     "show_numbers": 1,
     "axis_off": 0,
-    "autoreflist": 0,
     "detoptimize": 1,
     "energyopt": 0
   },
@@ -80,8 +79,5 @@
       [0, 0, 3]
     ]
   },
-  "manual_centres": {},
-  "paths": {
-    "cif_file": ""
-  }
+  "manual_centres": {}
 }

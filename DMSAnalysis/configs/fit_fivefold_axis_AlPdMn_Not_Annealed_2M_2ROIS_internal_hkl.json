@@ -12,7 +12,6 @@
     "show_centres": 1,
     "show_numbers": 1,
     "axis_off": 0,
-    "autoreflist": 0,
     "detoptimize": 1,
     "energyopt": 0
   },
@@ -104,8 +103,5 @@
     "24": 25.08,
     "25": 22.31,
     "27": 19.5
-  },
-  "paths": {
-    "cif_file": "/home/ndf61257/Python/calcms/cif/PMN-PT_Pm-3m_161999.cif"
   }
 }

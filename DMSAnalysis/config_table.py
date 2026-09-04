@@ -58,7 +58,6 @@ DEFAULT_FIELDS = [
     ('flags.firstplot',              'flags / firstplot',       'bool'),
     ('flags.detoptimize',            'flags / detoptimize',     'bool'),
     ('flags.energyopt',              'flags / energyopt',       'bool'),
-    ('flags.autoreflist',            'flags / autoreflist',     'bool'),
 ]
 
 

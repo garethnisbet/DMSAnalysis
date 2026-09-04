@@ -17,9 +17,6 @@
 # Diamond Light Source, Chilton, Didcot, Oxon, OX11 0DE, U.K.
 import numpy as np
 from numpy import linalg as LA
-#import iotbx.cif
-#from cctbx import sgtbx
-#from cctbx.sgtbx import space_group, space_group_symbols
 from scipy import ndimage
 from collections import OrderedDict
 import matplotlib.pyplot as plt
@@ -731,24 +728,6 @@ class pilkhlrange(object):
         hklempty[:,2]=np.linspace(self.hklr[0,2],self.hklr[1,2],numsteps)
         return hklempty
 
-
-def loadcif(ciffile,energy):
-    wavelength=12.3984187/energy
-    d_min_val = (wavelength/(2*np.sin(np.radians(180)/2)))
-    cf = iotbx.cif.reader(file_path=ciffile).model()
-    cif_block = cf.values()[0]
-    c = iotbx.cif.reader(file_path = ciffile).build_crystal_structures().values()[0]
-    s = c.scatterers()
-    for _s in s:
-        _s.scattering_type = _s.scattering_type.replace('0+', '')
-    sg=c.crystal_symmetry().space_group()
-    c=c.expand_to_p1(append_number_to_labels=False, sites_mod_positive=True)
-    lattice=list(c.crystal_symmetry().unit_cell().parameters())
-    sf = c.structure_factors(True,algorithm='direct',d_min=wavelength/2).f_calc()
-    sfc = list(sf.data())
-    reflist = list(sf.indices())
-    SF=abs(np.array(sfc))**2
-    return SF, np.array(reflist), lattice, c, np.array(sfc)
 
 def dms2px(detv1,detv2,o,v):
     ''' usage dms2px(detector vector 1,detector vector2, sample origin as vector, vectors which will be scaled to intersect detector'''

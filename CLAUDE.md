@@ -164,7 +164,6 @@ Each app reads a JSON config (passed as an argument, or the `configs/` default).
 | `computation` | `numsteps`, `simsigma_per_zoom`, `thrange_delta`, `bravais`, `pseudocubic_transform` (1–12, conventional only), `curve_method` (`sweep`/`circle` — see *DMS curve method*), `opt_method`, `peak_method` (`gauss`/`centroid`), `tolerance` |
 | `crystal` | `lattice2`, `initial_guess_base`, `ref_6d` (quasicrystal 6D reflections) **or** `reflist_hkl` (conventional 3-index reflections) — starting parameters and reference reflections |
 | `manual_centres` | Dict of `"roi_index": pixel_position` overrides for poorly fitted ROI centres |
-| `paths` | `cif_file` — path to CIF file used by `loadcif()` |
 
 ## Initial guess parameter vector (fit script)
 
@@ -533,7 +532,12 @@ This code analyses **X-ray multiple scattering (MS)** in an **icosahedral quasic
 ```
 numpy  scipy  matplotlib  PIL(Pillow)  shapely  imageio  joblib
 PyQt5  pyqtgraph   (for the slider GUI)
-cctbx  (optional, for loadcif)
 ```
 
-`cctbx`/`iotbx` imports are commented out in `ts_quasi.py`; `loadcif()` requires them at runtime only when `autoreflist=1`.
+Every dependency is installable from PyPI; nothing here needs `cctbx`. The
+CIF-driven reflection list (`loadcif`, `flags.autoreflist`, `paths.cif_file`)
+was the only thing that did, and it had been dead code for some time — its
+`iotbx` import was commented out, so calling it raised `NameError`. Reflection
+lists come from `crystal.reflist_hkl` / `crystal.ref_6d`, the depth-based
+generator (`hklgen_3d` / the slider's **Auto reflist**), or the slider's
+**Geo 3-click** identify.

@@ -12,7 +12,6 @@
     "show_centres": 1,
     "show_numbers": 1,
     "axis_off": 0,
-    "autoreflist": 0,
     "detoptimize": 1,
     "energyopt": 0
   },
@@ -316,8 +315,5 @@
     ],
     "tau_approx": 1.6176470588235294
   },
-  "manual_centres": {},
-  "paths": {
-    "cif_file": "/home/ndf61257/Python/calcms/cif/PMN-PT_Pm-3m_161999.cif"
-  }
+  "manual_centres": {}
 }

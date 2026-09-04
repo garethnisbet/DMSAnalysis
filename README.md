@@ -32,7 +32,6 @@ No build step. Clone the repository and run from its root. Requirements:
 ```
 numpy  scipy  matplotlib  Pillow  shapely  imageio  joblib
 PyQt5  pyqtgraph          # for the slider / tripslider GUIs
-cctbx                     # optional, only for loadcif() when autoreflist=1
 ```
 
 ```bash
@@ -147,7 +146,6 @@ The **image-based** apps (`slider`, `fit`) read a JSON config with these section
 | `computation` | `numsteps`, `simsigma_per_zoom`, `thrange_delta`, `bravais`, `pseudocubic_transform` (conventional only), `opt_method`, `tolerance` |
 | `crystal` | `lattice2`, `initial_guess_base` (24-element vector), `ref_6d` (6D) **or** `reflist_hkl` (3-index) — starting parameters |
 | `flags` | `save`, `fit`, `firstplot`, `detoptimize`, `energyopt` — run controls |
-| `paths` | `cif_file` — CIF used by `loadcif()` when `autoreflist=1` |
 
 The **image-free** apps (`tripfit`, `tripslider`) read a lighter, separate schema
 (no `scan`/`roi`/`ref_6d`): `geometry` (`hkl`, `psi`, `azir`), `computation`

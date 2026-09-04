@@ -100,7 +100,7 @@ def write_config(tmpdir):
                                           + [0.0] * 18,
                     'reflist_hkl': [[0, 0, 2], [1, 1, 0]]},
         'flags': {'save': 0, 'fit': 0, 'firstplot': 0, 'detoptimize': 1,
-                  'energyopt': 0, 'autoreflist': 0},
+                  'energyopt': 0},
     }
     path = os.path.join(tmpdir, 'cfg.json')
     with open(path, 'w') as fh:

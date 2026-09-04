@@ -593,7 +593,6 @@ needs it or the strip's two edges come out as zigzags.
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `loadcif(ciffile, energy)` | `(SF, reflist, lattice, crystal, sfc)` | Loads a CIF file via `iotbx` and returns structure factors (requires `cctbx`) |
 | `reducebypsirange(mslist, psirange)` | array | Filters an MS list to a ψ window and merges both ψ solutions into one column |
 | `uniquearray(inarray)` | array | Returns unique rows of a 2D array |
 | `cmap()` | OrderedDict | Maps short colour-map keys to display names |
@@ -606,12 +605,6 @@ needs it or the strip's two edges come out as zigzags.
 ### `class sph2cart(sv)`
 Converts spherical `[θ, φ, R]` coordinates to Cartesian `[x, y, z]`.
 
-### `class allowedref(lattice, prim, spacegroup, energy)` *(deprecated)*
-Filters a reflection list to systematically allowed reflections for space groups 161 and 225.
-
-### `class loader(filename)`
-Loads reflection data from a cctbx-format text file; returns `hkl()` and `F()` arrays.
-
 ---
 
 ## Dependencies
@@ -619,7 +612,7 @@ Loads reflection data from a cctbx-format text file; returns `hkl()` and `F()` a
 ```
 numpy, scipy, matplotlib, PIL (Pillow), shapely, itertools, subprocess, copy
 ```
-Optional (commented out): `iotbx.cif`, `cctbx.sgtbx` — required only for `loadcif()` and `allowedref()`.
+All of them come from PyPI; the module has no `cctbx`/`iotbx` dependency.
 
 ---
 

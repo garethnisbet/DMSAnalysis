@@ -64,7 +64,7 @@ else:
                         'thrange_delta': [-27, 10],
                         'curve_method': 'sweep'},
         'flags':       {'save': 0, 'fit': 0, 'firstplot': 0,
-                        'detoptimize': 1, 'energyopt': 0, 'autoreflist': 0},
+                        'detoptimize': 1, 'energyopt': 0},
     }
 
 scannum    = cfg['scan']['scannum']
@@ -4345,7 +4345,7 @@ class DMSSlider(QtWidgets.QMainWindow):
             cfg = {
                 'flags': {
                     'save': 0, 'fit': 0, 'firstplot': 0,
-                    'detoptimize': 1, 'energyopt': 0, 'autoreflist': 0,
+                    'detoptimize': 1, 'energyopt': 0,
                     'show_centres': 1, 'show_numbers': 1, 'axis_off': 0,
                 },
                 'display': {
@@ -4368,7 +4368,6 @@ class DMSSlider(QtWidgets.QMainWindow):
                     'lattice2': [float(self.ig[0])] * 3 + [90., 90., 90.],
                 },
                 'manual_centres': {},
-                'paths': {'cif_file': ''},
             }
 
         # Collect checked reflections (matches what the fit uses); fall back to

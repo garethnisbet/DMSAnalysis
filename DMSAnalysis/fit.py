@@ -67,7 +67,6 @@ colmap    = cfg["display"]["colmap"]
 #                            set bravais constraints for fitting
 #------------------------------------------------------------------------------
 bravais    = cfg["computation"]["bravais"]
-autoreflist= cfg["flags"]["autoreflist"]
 
 #===============================================================================
 #                               Minimize Method
@@ -107,8 +106,6 @@ simsigma   = cfg["computation"]["simsigma_per_zoom"] * zoomval
 colourmap  = cfg["display"]["colourmap"]
 cmap=ts.cmap()['hot']
 lattice2   = cfg["crystal"]["lattice2"]
-
-cif_file = cfg["paths"]["cif_file"]
 
 if fit:
     fittype = OptMethod
@@ -208,15 +205,6 @@ if CONVENTIONAL:
         # hkl' = M @ hkl for each row  <=>  reflist @ M.T
         reflist = reflist @ ts.pseudocubic_matrix(pc_transform).T
     reflist2 = np.zeros_like(reflist)
-elif autoreflist:
-    mslist=[[np.NAN,np.NAN,np.NAN,np.NAN,np.NAN,np.NAN,np.NAN]]
-    hkllistcorse=ts.pilkhlrange(lattice,hkl,energy,thrange[0],thrange[1]).hklscan(30)
-    SF, reflist, lattice2 , structure, sfc = ts.loadcif(cif_file,energy)
-    for hklval in range(len(hkllistcorse[:,0])):
-        ms=ts.calcms(lattice,hkllistcorse[hklval,:],hklint,reflist,energy,azir)
-        mslist=np.concatenate((mslist,ms.full()),0)
-    mslist=ts.reducebypsirange(mslist,psirange)
-    reflist=np.matrix(ts.uniquearray(mslist[:,0:3]))
 else:
     ref_6d = np.array(cfg["crystal"]["ref_6d"])
 
