@@ -1418,6 +1418,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         root_layout.setSpacing(0)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.setObjectName('main_splitter')
+        self._splitter = splitter
         root_layout.addWidget(splitter)
 
         # ── Image panel (left) ─────────────────────────────────────────────────
@@ -2136,6 +2138,7 @@ class DMSSlider(QtWidgets.QMainWindow):
             slot=self._on_roi_mouse_moved)
         splitter.addWidget(roi_w)
 
+        # Defaults; a saved layout replaces them at the end of this method.
         splitter.setSizes([820, 640, 420])
         self.resize(1900, 880)
 
@@ -2153,6 +2156,11 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._btn_clear.clicked.connect(self._on_clear_picks)
         self._chk_geo.stateChanged.connect(
             lambda s: setattr(self, '_geo_mode', s == QtCore.Qt.Checked))
+
+        # Where the user dragged the panel dividers last time.  Saved on every
+        # drag as well as on exit, so it survives a kill, not just a clean quit.
+        self._restore_layout()
+        splitter.splitterMoved.connect(lambda *_a: self._save_layout())
 
     # ── Update pipeline ────────────────────────────────────────────────────────
 
@@ -3763,6 +3771,84 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._chk_lock_rois.setChecked(bool(data.get('rois_locked', False)))
             self._suppress = False
 
+    # ── Window layout (persisted across sessions) ──────────────────────────────
+
+    def _layout_settings(self):
+        """Qt's own per-user settings store (``~/.config/DMSAnalysis/slider.conf``
+        on Linux).  Separate from the auto-saved session: the layout is how the
+        window is set up, not what is being analysed, so it comes back whether
+        or not the user resumes the previous session."""
+        return QtCore.QSettings('DMSAnalysis', 'slider')
+
+    def _save_layout(self):
+        """Remember the panel dividers and the window itself."""
+        try:
+            st = self._layout_settings()
+            st.setValue('window/geometry', self.saveGeometry())
+            st.setValue('window/state', self.saveState())
+            st.setValue('splitter/main', self._splitter.saveState())
+        except Exception as e:
+            print('Layout save failed:', e)
+
+    def _restore_layout(self):
+        """Put the window and the panel dividers back where they were left.
+
+        The splitter stores absolute pixel sizes, so the window geometry is
+        restored with it — restoring one without the other gives panels that
+        do not match the window they are in.  A geometry that no longer lands
+        on any screen (the display setup changed) is discarded rather than
+        applied, so the window cannot come back invisible."""
+        try:
+            st   = self._layout_settings()
+            geo  = st.value('window/geometry')
+            wst  = st.value('window/state')
+            spl  = st.value('splitter/main')
+            if geo is not None and self.restoreGeometry(geo):
+                if not self._on_a_screen():
+                    self.resize(1900, 880)
+                    self.move(40, 40)
+            if wst is not None:
+                self.restoreState(wst)
+            if spl is not None:
+                self._splitter.restoreState(spl)
+        except Exception as e:
+            print('Layout restore failed:', e)
+
+    def _on_a_screen(self):
+        """True when the window's frame overlaps some screen's available area."""
+        rect = self.frameGeometry()
+        for scr in QtWidgets.QApplication.screens():
+            if scr.availableGeometry().intersects(rect):
+                return True
+        return False
+
+    def _startup_tasks(self):
+        """Run once, just after the event loop starts: offer the previous
+        session, then — if there is still no scan on disk behind the display —
+        tell the user what was missing and offer the file browser."""
+        self._maybe_restore_session()
+        if not self._scan_loaded:
+            self._prompt_missing_scan()
+
+    def _prompt_missing_scan(self):
+        """Report the files that could not be read at startup and offer to
+        browse for a .dat.  The app is fully usable either way — it is just
+        showing placeholder metadata and a blank image until a scan is loaded."""
+        detail = '\n'.join('• %s' % n for n in STARTUP_NOTES) or \
+                 '• No scan data has been loaded.'
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle('Scan data not found')
+        box.setText('The scan files in the config could not be read, so the '
+                    'slider has started on placeholder metadata and a blank '
+                    'image.\n\nBrowse to a .dat file to load real data.')
+        box.setDetailedText(detail)
+        browse = box.addButton('Browse…', QtWidgets.QMessageBox.AcceptRole)
+        box.addButton('Continue', QtWidgets.QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is browse:
+            self._on_browse_scan()
+
     def _maybe_restore_session(self):
         """On launch, offer to restore the auto-saved previous session."""
         if not os.path.exists(SESSION_FILE):
@@ -5323,6 +5409,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._status.setText('Fit stopped after %.1fs' % elapsed)
 
     def closeEvent(self, event):
+        self._save_layout()
         # Auto-save the session so it can be offered for restore next launch.
         try:
             self._write_session(SESSION_FILE, self._session_dict())

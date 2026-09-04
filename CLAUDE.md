@@ -365,6 +365,25 @@ selection in place; exported workflow configs always carry already-re-indexed
 values with `pseudocubic_transform` reset to 1 so the matrix is never applied
 twice.
 
+### The window layout persists
+
+The slider is three panels — detector image | controls | integrated curves —
+divided by one `QSplitter`. Where the dividers are dragged, and the window's own
+geometry, are remembered between sessions in Qt's per-user settings
+(`QSettings('DMSAnalysis', 'slider')` → `~/.config/DMSAnalysis/slider.conf` on
+Linux), not in the auto-saved session: the layout is how the window is set up,
+not what is being analysed, so it comes back whether or not the user resumes the
+previous session. Written on every drag (`splitterMoved`) as well as in
+`closeEvent`, so a killed app does not lose it — which is how a GUI usually ends
+on a beamline.
+
+The splitter stores absolute pixel sizes, so the window geometry is restored
+alongside it; restoring one without the other gives panels that do not match the
+window they are in. A geometry that lands on no attached screen (the display
+setup changed) is discarded rather than applied, so the window cannot come back
+invisible (`_restore_layout` / `_on_a_screen`). Test:
+`DMSAnalysis/tests/test_layout_persistence.py`.
+
 ### Every fit leaves a run record
 
 A completed fit in the slider writes, without being asked,
