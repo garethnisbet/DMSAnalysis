@@ -331,6 +331,34 @@ _PHASON_SLIDER_DEFS = [
     ('a31', 21, 0.05, '%0.7f'), ('a32', 22, 0.05, '%0.7f'), ('a33', 23, 0.05, '%0.7f'),
 ]
 
+# Names of the 24 guess slots, in order (see CLAUDE.md).  Used to write the
+# refined vector out in readable form; the slider labels only cover the slots a
+# given mode exposes, and a run record has to carry all of them.
+IG_SLOT_NAMES = [
+    'a', 'b', 'c', 'alpha', 'beta', 'gamma',
+    'psicor', 'chicor', 'thcor', 'lcor',
+    'detdist', 'dxrot', 'dyrot', 'dzrot', 'energy',
+    'phason a11', 'phason a12', 'phason a13',
+    'phason a21', 'phason a22', 'phason a23',
+    'phason a31', 'phason a32', 'phason a33',
+]
+
+
+def sim_curve_scale(y_exp, y_sim):
+    """(scale, offset) putting a simulated ROI curve on the experimental one's
+    y range.  Only the peak *position* is fitted, so the simulated intensity is
+    matched to the data for display; the plotted panel and the exported SVG
+    share this so they cannot drift."""
+    y_exp = np.asarray(y_exp, dtype=float)
+    y_sim = np.asarray(y_sim, dtype=float)
+    denom = y_sim.max() - y_sim.min()
+    if abs(denom) < 1e-10:
+        denom = 1.0
+    scale  = (y_exp.max() - y_exp.min()) / denom
+    offset = y_exp.min() - (y_sim * scale).min()
+    return scale, offset
+
+
 def build_slider_defs(bravais_, conventional_):
     """Slider list for the active mode: only the symmetry-allowed lattice sliders
     (conventional) or the single 'a' + phason block (quasicrystal), then the
@@ -1319,6 +1347,12 @@ class DMSSlider(QtWidgets.QMainWindow):
         # right-click centre assignment) can rescore without recomputing
         # the simulation.  Cleared whenever the curves are discarded.
         self._last_simcoefs = None
+        self._last_sim_lines = None    # (ldsx, ldsy) as last drawn, for the SVG
+        self._fit_setup      = None    # how the running fit was set up
+        # Set by a finished fit; written out once the post-fit curve rebuild has
+        # landed, so the snapshot holds the refined curves rather than the ones
+        # the fit started from.
+        self._pending_fit_snapshot = None
         self._resid_stale   = False
         self._reflist_fit   = None
         self._reflist2_fit  = None
@@ -1699,11 +1733,14 @@ class DMSSlider(QtWidgets.QMainWindow):
         btn_wf_export.clicked.connect(self._on_export_workflow_json)
         fitl.addWidget(btn_wf_export, 9, 0, 1, 2)
 
-        self._btn_save_fit = QtWidgets.QPushButton('Save fit → Processing')
+        self._btn_save_fit = QtWidgets.QPushButton('Save fit snapshot → Processing')
         self._btn_save_fit.setStyleSheet('background: #2a2a10; color: #e6e0bf')
-        self._btn_save_fit.setToolTip('Write a timestamped Processing/ snapshot of '
-                                      'the last completed fit (overlay PNG, ROI plot, '
-                                      'res.x.txt, Result.txt, config + code snapshots)')
+        self._btn_save_fit.setToolTip(
+            'Write the last completed fit to Processing/<scan>_dp<dp>_<time>/ '
+            'again, with the reproducibility extras.\n\nEvery fit already '
+            'writes its own record there — Result.txt, the DMS overlay PNG and '
+            'the integrated-curve SVG.  This adds the config, the code '
+            'snapshots and res.x.txt, in a folder of its own.')
         self._btn_save_fit.setEnabled(False)
         self._btn_save_fit.clicked.connect(self._on_save_fit_processing)
         fitl.addWidget(self._btn_save_fit, 10, 0, 1, 2)
@@ -4311,74 +4348,300 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._status.setText('Workflow config saved → %s' % os.path.basename(path))
         return path
 
-    def _on_save_fit_processing(self):
-        """Write a timestamped Processing/ snapshot of the last completed fit,
-        mirroring the artifacts produced by the batch fit.py (save=1)."""
-        out = self._last_fit_output
-        if out is None:
-            self._status.setText('Run a fit before saving to Processing')
-            return
+    # ── Fit run record (Processing/<scan>_dp<dp>_<timestamp>/) ─────────────────
 
-        import shutil
+    def _snapshot_dir(self, method=None):
+        """Create and return the run-record directory for the current scan and
+        datapoint:
+        ``Processing/<scannum>_dp<datapoint>_<YYYYMMDD-HHMMSS>_<method>/``.
+
+        Seconds are in the stamp because a fit takes seconds, not minutes — two
+        fits in the same minute must not land in the same folder.  The method
+        comes last, as in fit.py\'s batch directories, so a scan\'s runs still
+        sort chronologically."""
         from time import strftime
-        try:
-            scan    = int(self._scannum)
-            imnum   = int(self._datapoint) + 1
-            fittype = out['method']
-            datestr = strftime('%Y%m%d%H%M')
-            outpath = os.path.join(
-                os.getcwd(), 'Processing',
-                '%s_%d_%d_fivefold_2ROIS_AlPdMn_Not_Annealed_%s'
-                % (datestr, imnum, scan, fittype)) + os.sep
-            os.makedirs(outpath, exist_ok=True)
+        name = '%s_dp%d_%s' % (self._scannum, int(self._datapoint),
+                               strftime('%Y%m%d-%H%M%S'))
+        if method:
+            name += '_%s' % re.sub(r'[^A-Za-z0-9+.-]', '', str(method))
+        path = os.path.join(os.getcwd(), 'Processing', name)
+        os.makedirs(path, exist_ok=True)
+        return path
 
-            # ── code + config snapshots ──────────────────────────────────────
+    def _write_overlay_png(self, path, dmsindex):
+        """The detector image with the simulated DMS lines drawn over it, as
+        fit.py writes it: the frame in blue, the line pixels in yellow."""
+        im3    = np.copy(self._imdata).astype(float)
+        holder = np.zeros((im3.shape[0], im3.shape[1], 3))
+        imr    = np.zeros((im3.shape[0], im3.shape[1]))
+        if (dmsindex is not None and len(dmsindex) == 2
+                and len(np.asarray(dmsindex[0])) > 0):
+            imr[dmsindex] = 255
+        holder[:, :, 0] = imr
+        holder[:, :, 1] = imr
+        clip = colourlim[1]
+        im3[im3 > clip] = clip
+        mx = im3.max() or 1.0
+        holder[:, :, 2] = (255. / mx) * im3
+        imageio.imsave(path, holder.astype(np.uint8))
+
+    def _write_curves_svg(self, path):
+        """The integrated-curve grid as vector art: one panel per ROI, the
+        experimental curve and the simulated one on the same axes with their
+        fitted centres, laid out and coloured as the GUI draws them.
+
+        Built from the arrays the panels were drawn from (via the shared
+        `sim_curve_scale`) rather than by screen-grabbing the widget, so the
+        file is resolution-independent and legible on a white page.  Returns
+        False when there are no curves to draw."""
+        if self._linedatax is None or self._kernel is None:
+            return False
+        # No pyplot: it would pull in a GUI backend alongside the running Qt app.
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_svg import FigureCanvasSVG
+
+        n     = len(self._linedatax)
+        ncols = int(self._cfg.get('display', {}).get('subcellsy', 4))
+        ncols = max(1, min(ncols, n))
+        nrows = int(np.ceil(n / float(ncols)))
+        show_axes = (getattr(self, '_chk_roi_axes', None) is not None
+                     and self._chk_roi_axes.isChecked())
+        show_num  = self._cfg.get('flags', {}).get('show_numbers', 1)
+
+        fig = Figure(figsize=(3.0 * ncols, 2.2 * nrows), dpi=100)
+        FigureCanvasSVG(fig)
+        axes = fig.subplots(nrows, ncols, squeeze=False)
+
+        sim_x, sim_y = self._last_sim_lines or (None, None)
+        simcoefs     = getattr(self, '_last_simcoefs', None)
+        sel_arcs, _  = self._selected_arcs()
+        refnum, roicount = 0, 0
+        for i in range(nrows * ncols):
+            ax = axes[i // ncols][i % ncols]
+            if i >= n:
+                ax.axis('off')
+                continue
+            colour = self._ref_colour(refnum, sel_arcs).name()
+            if self._ref_6d_fit is not None and refnum < len(self._ref_6d_fit):
+                ref_txt = self._ref_label_text(self._ref_6d_fit[refnum])
+                title   = ('%d: %s' % (i, ref_txt)) if show_num else ref_txt
+            else:
+                title = str(i)
+            # Two ROIs per reflection (the line cut in half along itself).
+            cur_refnum = refnum
+            if roicount == 1:
+                refnum += 1
+                roicount = -1
+            roicount += 1
+
+            x_exp = np.asarray(self._linedatax[i], dtype=float)
+            y_exp = np.asarray(self._linedatay[i], dtype=float)
+            ax.plot(x_exp, y_exp, '-', color='#2266cc', linewidth=0.8,
+                    label='experiment')
+            if sim_y is not None and i < len(sim_y):
+                scale, offset = sim_curve_scale(y_exp, sim_y[i])
+                ax.plot(np.asarray(sim_x[i], dtype=float),
+                        np.asarray(sim_y[i], dtype=float) * scale + offset,
+                        '-.', color=colour, linewidth=0.8, label='simulation')
+            # Target (experimental) centre, and the simulated one the residual
+            # is the distance between.
+            tgt = np.nan
+            if self._centres is not None and i < self._centres.shape[0]:
+                tgt = float(self._centres[i, 0])
+            if np.isfinite(tgt):
+                ax.axvline(tgt, color=('#ffaa00' if i in self._centre_override_rois
+                                       else '#2266cc'),
+                           linewidth=0.8, linestyle='--')
+            if simcoefs is not None and i < len(simcoefs):
+                sim_c = float(np.asarray(simcoefs)[i, 2])
+                if np.isfinite(sim_c):
+                    ax.axvline(sim_c, color=colour, linewidth=0.8, linestyle='--')
+            ax.set_title(title, fontsize=7)
+            if show_axes:
+                ax.tick_params(labelsize=5)
+            else:
+                ax.set_xticks([]); ax.set_yticks([])
+            _ = cur_refnum
+        fig.tight_layout()
+        fig.savefig(path, format='svg')
+        return True
+
+    def _write_result_txt(self, path, out):
+        """The solution: what was refined, to what, and against what."""
+        from time import strftime
+        ig    = np.asarray(out['inputarray'], dtype=float)
+        lines = []
+        lines.append('DMS slider fit — %s' % strftime('%Y-%m-%d %H:%M:%S'))
+        lines.append('scan %s   datapoint %d   image %05d'
+                     % (self._scannum, int(self._datapoint),
+                        int(self._datapoint) + 1))
+        lines.append('scan path %s' % self._scanpath)
+        lines.append('crystal %s   pseudo-cubic M %d   curves %s   peaks %s'
+                     % (bravais, int(self._pc_idx), curve_method,
+                        self._peak_method))
+        lines.append('')
+        lines.append('residual  chi2 = %.8g   [%s]   t = %.1f s'
+                     % (out['opt'], out['method'], out.get('elapsed', float('nan'))))
+        if out.get('start_opt') is not None and out.get('method') != 'NoFit':
+            lines.append('          started from chi2 = %.8g' % out['start_opt'])
+        if self._kernel is not None and self._ref_6d_fit is not None:
+            n_no_target = (int(np.count_nonzero(np.isnan(self._centres[:, 0])))
+                           if self._centres is not None else 0)
+            lines.append('scored on %d ROIs over %d reflections'
+                         '   (%d ROI(s) with no experimental peak, excluded)'
+                         % (self._kernel.shape[2], len(self._ref_6d_fit),
+                            n_no_target))
+        lines.append('')
+        lines.append('geometry')
+        lines.append('  hkl        %s' % np.array2string(self._hkl, precision=6))
+        lines.append('  psi        %.6f' % self._psi)
+        lines.append('  azir       %s' % np.array2string(
+            np.asarray(self._azir, dtype=float), precision=6))
+        lines.append('  beam px/py %.3f  %.3f' % (self._px, self._py))
+        lines.append('  scan energy %.6f keV' % self._en_scan)
+        lines.append('')
+
+        # ── how to run it again ───────────────────────────────────────────────
+        setup   = out.get('setup') or {}
+        no_fit  = (out.get('method') == 'NoFit')
+        lines.append('fit setup (rerun with this)')
+        lines.append('  method       %s%s'
+                     % (setup.get('method', out['method']),
+                        '   (no optimiser ran — the guess below was scored as-is)'
+                        if no_fit else ''))
+        if setup:
+            free  = setup.get('free_slots') or []
+            names = ', '.join(IG_SLOT_NAMES[i] if i < len(IG_SLOT_NAMES) else str(i)
+                              for i in free)
+            lines.append('  %s %d of %d slots: %s'
+                         % ('would refine' if no_fit else 'refined     ',
+                            len(free), len(setup.get('all_slots') or []), names))
+            lines.append('  parallel starts %d   points %d   tolerance %g'
+                         % (setup.get('n_parallel_starts', 1),
+                            setup.get('numsteps', 0), setup.get('tolerance', 0.0)))
+            lines.append('  ROI width %g px   peaks %s   curves %s'
+                         % (setup.get('roi_width', float('nan')),
+                            setup.get('peak_method', ''),
+                            setup.get('curve_method', '')))
+            lines.append('  detoptimize %s   energyopt %s'
+                         % (setup.get('detoptimize'), setup.get('energyopt')))
+            if setup.get('bounds'):
+                lines.append('  bounds (free parameters, in optimiser order)')
+                for p_i, slot in enumerate(setup.get('all_slots') or []):
+                    if slot not in free:
+                        continue
+                    lo, hi = setup['bounds'][p_i]
+                    nm = IG_SLOT_NAMES[slot] if slot < len(IG_SLOT_NAMES) else str(slot)
+                    lines.append('    %-12s %14.8f  %14.8f' % (nm, lo, hi))
+            start = np.asarray(setup.get('start_ig'), dtype=float)
+            lines.append('')
+            lines.append('  starting hkl %s   psi %.6f'
+                         % (np.array2string(np.asarray(setup.get('start_hkl'),
+                                                       dtype=float), precision=6),
+                            setup.get('start_psi', float('nan'))))
+            lines.append('  starting guess')
+            lines.append('  initial_guess = np.array([%s])'
+                         % ','.join('%f' % v for v in start))
+            moved = [(IG_SLOT_NAMES[i] if i < len(IG_SLOT_NAMES) else str(i),
+                      start[i], ig[i])
+                     for i in range(min(start.size, ig.size))
+                     if abs(start[i] - ig[i]) > 0]
+            if moved:
+                lines.append('  moved by the fit (start → refined)')
+                for nm, a, b in moved:
+                    lines.append('    %-12s %14.8f → %14.8f  (%+.8f)'
+                                 % (nm, a, b, b - a))
+        else:
+            lines.append('  (setup not recorded — fit run before this was kept)')
+        lines.append('')
+        lines.append('refined parameters')
+        for i, name in enumerate(IG_SLOT_NAMES):
+            if i < ig.size:
+                lines.append('  %-12s %.8f' % (name, ig[i]))
+        lines.append('')
+        lines.append('initial_guess = np.array([%s])'
+                     % ','.join('%f' % v for v in ig))
+        lines.append('')
+        if self._ref_6d_fit is not None:
+            lines.append('reflections (in fit order)')
+            for ref in np.asarray(self._ref_6d_fit):
+                lines.append('  %s' % self._ref_label_text(ref))
+            lines.append('')
+        simcoefs = getattr(self, '_last_simcoefs', None)
+        if simcoefs is not None and self._centres is not None:
+            lines.append('per-ROI centres (target, simulated, residual)')
+            sim = np.asarray(simcoefs)[:, 2]
+            tgt = np.asarray(self._centres, dtype=float)[:, 0]
+            for i in range(min(len(sim), len(tgt))):
+                if np.isnan(tgt[i]):
+                    lines.append('  %3d   no target' % i)
+                elif np.isnan(sim[i]):
+                    lines.append('  %3d   %9.4f   no simulated peak' % (i, tgt[i]))
+                else:
+                    lines.append('  %3d   %9.4f   %9.4f   %+8.4f'
+                                 % (i, tgt[i], sim[i], sim[i] - tgt[i]))
+            lines.append('')
+        with open(path, 'w') as fh:
+            fh.write('\n'.join(lines) + '\n')
+
+    def _write_fit_snapshot(self, out, extras=False):
+        """Write the run record for a completed fit and return its directory.
+
+        Three files, always: the solution (``Result.txt``), the detector image
+        with the DMS lines over it (``IM_*.png``) and the integrated curves
+        (``PLOT_*.svg``).  `extras` adds the reproducibility snapshot the manual
+        save has always written — the code, the config and the raw result
+        vector.  Raises on failure; callers report it."""
+        outpath = self._snapshot_dir(out.get('method'))
+        stem    = '%s_dp%d' % (self._scannum, int(self._datapoint))
+
+        self._write_result_txt(os.path.join(outpath, 'Result.txt'), out)
+        self._write_overlay_png(os.path.join(outpath, 'IM_%s.png' % stem),
+                                out.get('dmsindex'))
+        if not self._write_curves_svg(os.path.join(outpath, 'PLOT_%s.svg' % stem)):
+            print('No integrated curves to export to %s' % outpath)
+
+        if extras:
+            import shutil
             for fname in ('slider.py', 'ts_quasi.py'):
                 src = os.path.join(PKGDIR, fname)
                 if os.path.exists(src):
                     shutil.copy(src, outpath)
-            cfg_snapshot = self._build_workflow_config()
-            with open(os.path.join(outpath, 'config_%d.json' % scan), 'w') as fh:
-                json.dump(cfg_snapshot, fh, indent=2)
-
-            # ── DMS overlay image (IM_<scan>.png), built like fit.py ─────────
-            im3 = np.copy(self._imdata).astype(float)
-            holder = np.zeros((im3.shape[0], im3.shape[1], 3))
-            imr = np.zeros((im3.shape[0], im3.shape[1]))
-            dmsindex = out.get('dmsindex')
-            if (dmsindex is not None and len(dmsindex) == 2
-                    and len(np.asarray(dmsindex[0])) > 0):
-                imr[dmsindex] = 255
-            holder[:, :, 0] = imr
-            holder[:, :, 1] = imr
-            clip = colourlim[1]
-            im3[im3 > clip] = clip
-            mx = im3.max() or 1.0
-            holder[:, :, 2] = (255. / mx) * im3
-            imageio.imsave(os.path.join(outpath, 'IM_%05d.png' % scan),
-                           holder.astype(np.uint8))
-
-            # ── ROI integrated-curve grid (slider's analog of fit.py's plot) ─
-            try:
-                self._roi_grid.grab().save(
-                    os.path.join(outpath, '_PLOT_%05d.png' % scan))
-            except Exception:
-                pass
-
-            # ── result vectors ───────────────────────────────────────────────
+            with open(os.path.join(outpath, 'config_%s.json' % self._scannum),
+                      'w') as fh:
+                json.dump(self._build_workflow_config(), fh, indent=2)
             np.savetxt(os.path.join(outpath, 'res.x.txt'), out['res_x'])
-            inputs = out['inputarray']
-            with open(os.path.join(outpath, 'Result.txt'), 'w') as f:
-                f.write('initial_guess = np.array([')
-                for v in inputs:
-                    f.write('%f,' % v)
-                f.write('])\n')
-                f.write('opt = %s\n' % out['opt'])
-                f.write('method = %s\n' % fittype)
+        return outpath
 
+    def _flush_fit_snapshot(self):
+        """Write the record for the fit that has just finished, if one is
+        waiting.  Called once the post-fit curve rebuild has landed (or failed),
+        so the SVG holds the refined curves."""
+        out = self._pending_fit_snapshot
+        if out is None:
+            return
+        self._pending_fit_snapshot = None
+        try:
+            outpath = self._write_fit_snapshot(out)
+            rel = os.path.join('Processing', os.path.basename(outpath))
+            self._status.setText(self._status.text() + '   → %s' % rel)
+            print('Fit run record written to ' + outpath)
+        except Exception as e:
+            self._status.setText('Fit saved failed: %s' % str(e)[:70])
+            import traceback; traceback.print_exc()
+
+    def _on_save_fit_processing(self):
+        """Write a full Processing/ snapshot of the last completed fit: the
+        three run-record files plus the code, config and result vector."""
+        out = self._last_fit_output
+        if out is None:
+            self._status.setText('Run a fit before saving to Processing')
+            return
+        try:
+            outpath = self._write_fit_snapshot(out, extras=True)
             self._status.setText('Fit saved → %s'
-                                 % os.path.join('Processing', os.path.basename(
-                                     os.path.normpath(outpath))))
+                                 % os.path.join('Processing',
+                                                os.path.basename(outpath)))
             print('Fit results written to ' + outpath)
         except Exception as e:
             self._status.setText('Save failed: %s' % str(e)[:80])
@@ -4527,6 +4790,9 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._status.setText('%d reflections, %d ROIs — ready to fit%s' % (
                 self._ref_6d_fit.shape[0], self._kernel.shape[2], note))
         self._build_status = None
+        # A fit finished and this was its rebuild: the panels now hold the
+        # refined curves, so the run record can be written.
+        self._flush_fit_snapshot()
 
     def _on_build_error(self, msg):
         self._building = False
@@ -4537,6 +4803,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._pending_centre_overrides.update(self._build_overrides)
         self._build_overrides = {}
         self._status.setText('Build failed: %s' % msg[:80])
+        self._flush_fit_snapshot()
 
     # ── ROI integrated-curve grid ────────────────────────────────────────────────
 
@@ -4670,16 +4937,13 @@ class DMSSlider(QtWidgets.QMainWindow):
                       else pg.mkPen('#4488ff', width=1, style=QtCore.Qt.DashLine))
 
     def _draw_sim_lines(self, ldscoeffs, ldsx, ldsy):
+        # Cached for the SVG export, so the file holds the curves on screen.
+        self._last_sim_lines = (list(ldsx), list(ldsy))
         for i, curve in enumerate(self._sim_curves):
             if i >= len(ldsy):
                 break
-            y_exp = self._linedatay[i]; y_sim = ldsy[i]
-            denom = y_sim.max() - y_sim.min()
-            if abs(denom) < 1e-10:
-                denom = 1.0
-            yscale  = (y_exp.max() - y_exp.min()) / denom
-            yoffset = y_exp.min() - (y_sim * yscale).min()
-            curve.setData(ldsx[i], y_sim * yscale + yoffset)
+            yscale, yoffset = sim_curve_scale(self._linedatay[i], ldsy[i])
+            curve.setData(ldsx[i], ldsy[i] * yscale + yoffset)
         for i, cl in enumerate(self._sim_centre_lines):
             if i < len(ldscoeffs):
                 # NaN = the simulated line could not be located in this ROI;
@@ -4912,6 +5176,28 @@ class DMSSlider(QtWidgets.QMainWindow):
             dms.setIGFull(ig)
 
         bounds = param_bounds(reduced)
+        # Everything needed to set this run up again: where it started, which
+        # parameters were free, and what the optimiser was given.  Captured here
+        # rather than reconstructed afterwards — the sliders hold the *refined*
+        # values by the time the fit reports back.
+        self._fit_setup = {
+            'start_ig':    np.array(ig, dtype=float),
+            'start_hkl':   self._hkl.copy(),
+            'start_psi':   float(self._psi),
+            'method':      self._active_method,
+            'free_slots':  [int(slots[p]) for p in free],
+            'all_slots':   [int(v) for v in slots],
+            'bounds':      [(float(lo), float(hi)) for lo, hi in bounds],
+            'n_parallel_starts': int(n_parallel_starts),
+            'numsteps':    int(numsteps),
+            'tolerance':   float(tolerance),
+            'peak_method': self._peak_method,
+            'curve_method': curve_method,
+            'roi_width':   float(self._kernel_width if self._kernel is not None
+                                 else width),
+            'detoptimize': bool(detoptimize),
+            'energyopt':   bool(energyopt),
+        }
         self._worker.idle.wait(timeout=5.0)
 
         self._fit_worker = FitWorker(
@@ -4938,14 +5224,22 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._last_fit_info = {'opt': float(result['opt']),
                                'elapsed': float(result['elapsed']),
                                'method': result['method']}
-        # Keep the full fit output so it can be written to Processing/ on request
+        # Keep the full fit output: written out automatically below, and again
+        # by the manual "Save fit" button.
         self._last_fit_output = {
             'opt':        float(result['opt']),
             'method':     result['method'],
+            'elapsed':    float(result['elapsed']),
+            'start_opt':  result.get('start_opt'),
             'res_x':      np.array(result.get('res_x', inputarray), dtype=float),
             'inputarray': np.array(inputarray, dtype=float),
             'dmsindex':   result.get('dmsindex'),
+            'setup':      getattr(self, '_fit_setup', None),
         }
+        # Every completed fit leaves a run record. It is written after the
+        # post-fit curve rebuild below, so the exported curves are the refined
+        # ones; if no rebuild starts, it is written here instead.
+        self._pending_fit_snapshot = self._last_fit_output
         self._btn_save_fit.setEnabled(True)
         print('initial_guess = np.array([' +
               ','.join('%.6f' % v for v in inputarray) + '])')
@@ -4989,6 +5283,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         if not self._on_build_curves(done_status=done_msg, reuse_rois=True,
                                      reuse_exp=True):
             self._status.setText(done_msg)
+            self._flush_fit_snapshot()
 
     def _on_fit_error(self, msg, elapsed):
         self._fitting = False

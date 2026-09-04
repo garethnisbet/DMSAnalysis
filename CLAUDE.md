@@ -365,6 +365,45 @@ selection in place; exported workflow configs always carry already-re-indexed
 values with `pseudocubic_transform` reset to 1 so the matrix is never applied
 twice.
 
+### Every fit leaves a run record
+
+A completed fit in the slider writes, without being asked,
+
+```
+Processing/<scannum>_dp<datapoint>_<YYYYMMDD-HHMMSS>/
+    Result.txt              # the solution, and the recipe to rerun it
+    IM_<scan>_dp<dp>.png    # the detector image with the DMS lines over it
+    PLOT_<scan>_dp<dp>.svg  # the integrated ROI curves, as vector art
+```
+
+Seconds are in the stamp because a fit takes seconds: two fits in one minute
+must not share a folder. The record is written *after* the post-fit curve
+rebuild lands (`_flush_fit_snapshot`, called from `_on_build_done`), so the
+curves in the SVG are the refined ones, not the ones the fit started from; if
+that rebuild never starts or fails, it is written immediately instead. The
+status line gains `→ Processing/<folder>`.
+
+`Result.txt` carries what the fit *did* and what it was *given*: the residual,
+method and elapsed time; the geometry (hkl, psi, azir, beam centre, scan
+energy); all 24 refined slots by name (`IG_SLOT_NAMES`) plus a paste-ready
+`initial_guess = np.array([…])`; the per-ROI target/simulated centres and their
+residuals; and a **fit setup** block — the starting guess, which slots were
+free, their bounds, the optimiser, parallel starts, points, tolerance, ROI
+width, peak and curve methods — so the run can be set up again. That block is
+captured in `_do_fit` at launch (`self._fit_setup`), not reconstructed
+afterwards: by the time the fit reports back the sliders hold the *refined*
+values, so the starting point is no longer on screen anywhere.
+
+The SVG is drawn with matplotlib (`Figure` + `FigureCanvasSVG` directly — no
+pyplot, which would pull a second GUI backend into the running Qt app) from the
+same arrays the on-screen panels hold, sharing `sim_curve_scale` with
+`_draw_sim_lines` so the exported curves cannot drift from the drawn ones.
+
+**Save fit snapshot → Processing** writes the same three files again in a folder
+of its own, plus the reproducibility extras the manual save always had:
+`slider.py`, `ts_quasi.py`, `config_<scan>.json` and `res.x.txt`. Test:
+`DMSAnalysis/tests/test_fit_snapshot.py`.
+
 ## Processing output
 
 When `save=1`, the script creates a timestamped directory under `Processing/`:
