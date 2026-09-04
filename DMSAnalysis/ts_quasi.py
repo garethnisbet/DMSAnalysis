@@ -21,7 +21,6 @@ from numpy import linalg as LA
 #from cctbx import sgtbx
 #from cctbx.sgtbx import space_group, space_group_symbols
 from scipy import ndimage
-from scipy import interpolate
 from collections import OrderedDict
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
@@ -921,6 +920,71 @@ def cmap():
                     ('ocean','Ocean (green-blue-white)'),('NCD','NCD'),
                     ('rainbow','Rainbow (blue-green-yellow-red)'),('afm','AFM hot (black-red-yellow-white)')])
 
+def roi_dedupe_path(pts):
+    '''Drop repeat visits to a pixel, keeping the path in first-seen order.
+
+    The engine walks both psi solutions of a reflection and concatenates them.
+    In many geometries the two trace the *same* detector line, so the raw index
+    is that line twice over: the path then looks like two pieces (or, once
+    ordered by a detector axis, like one line with every pixel doubled).  One
+    visit per pixel is what a ROI is built from.'''
+    pts = np.asarray(pts)
+    if len(pts) < 2:
+        return pts
+    w = int(pts[:, 1].max()) + 1
+    key = pts[:, 0].astype(np.int64) * w + pts[:, 1].astype(np.int64)
+    _, first = np.unique(key, return_index=True)
+    return pts[np.sort(first)]
+
+
+def roi_split_runs(pts, min_pts=4, gap_factor=6.0, gap_floor=4.0):
+    '''Cut one reflection's on-detector locus into its continuous pieces.
+
+    `pts` is the pixel path in *scan order* (as `dmscalc_ico_hkl.roiindex`
+    returns it), so consecutive entries are consecutive samples of the same
+    line — except where the locus leaves the physical region or the detector and
+    comes back, or where the second psi branch starts (the engine concatenates
+    both branches).  Those show up as a jump far larger than the sampling step,
+    and are the cuts made here.  Returns a list of index arrays, longest first.
+
+    The threshold is 6x the median step, floored at 4 px so a densely sampled
+    line whose median step is a fraction of a pixel is not chopped at every
+    slight unevenness.'''
+    pts = np.asarray(pts, dtype=float)
+    if len(pts) < 2:
+        return [np.arange(len(pts))] if len(pts) >= min_pts else []
+    d  = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    nz = d[d > 0]
+    thr = max(gap_factor * float(np.median(nz)), gap_floor) if nz.size else gap_floor
+    runs = np.split(np.arange(len(pts)), np.flatnonzero(d > thr) + 1)
+    runs = [r for r in runs if len(r) >= min_pts]
+    return sorted(runs, key=len, reverse=True)
+
+
+def roi_rasterise(path, imshape):
+    '''Binary image of a pixel path, consecutive points joined by a straight
+    segment so the gaps between scan samples are filled.  Points off the image
+    are dropped (the caller's line may run past the plate edge).'''
+    im = np.zeros(imshape)
+    p = np.asarray(path, dtype=float)
+    if len(p) == 0:
+        return im
+    if len(p) == 1:
+        rr, cc = p[:, 0], p[:, 1]
+    else:
+        a, b = p[:-1], p[1:]
+        steps = np.maximum(np.abs(b - a).max(axis=1), 1).astype(int)
+        rr = np.concatenate([np.linspace(a[i, 0], b[i, 0], steps[i] + 1)
+                             for i in range(len(a))])
+        cc = np.concatenate([np.linspace(a[i, 1], b[i, 1], steps[i] + 1)
+                             for i in range(len(a))])
+    r = np.round(rr).astype(int)
+    c = np.round(cc).astype(int)
+    ok = (r >= 0) & (r < imshape[0]) & (c >= 0) & (c < imshape[1])
+    im[r[ok], c[ok]] = 1
+    return im
+
+
 def roibuilder_ico_hkl(args):
     #builderargs=reflist,hkllist,hklint,1,psirange,100,hkl,detvects,imdata.shape,simsigma,azir,psi,px,py,scatv,detdistancepx,rotx,roty,rotz,energy,ig,reflist2,mtrx2
     #                ref,hkllist,hklint,1,psirange,100,hkl,detvects,emptyim,     simsigma,azir,psi,px,py,scatv,detdistancepx,rotx,roty,rotz,energy,   reflist2,mtrx2
@@ -954,54 +1018,59 @@ def roibuilder_ico_hkl(args):
     crystal_system = args[23] if len(args) > 23 else None
 
     numrefs=reflist.shape[0]
+    reflist2_arr=np.asarray(reflist2)
     kernelstack=np.zeros((imshape[0],imshape[1],numrefs*2))
     keep=np.array([[]]*1).T
     for i1 in range(0,numrefs,1):
         ref=reflist[i1,:]
+        # The perpendicular component of *this* reflection, not the whole list.
+        # PhasonDistoArray broadcasts v1 + pm@v2 over v2's rows, so handing it
+        # all N of them built every ROI from N loci (N copies of the same curve
+        # in a conventional crystal, where the perpendicular component is zero;
+        # N slightly different ones for a quasicrystal, each carrying another
+        # reflection's phason shift).  Everything downstream then worked on an
+        # N-fold path.
+        ref2=reflist2_arr[i1:i1+1,:] if reflist2_arr.ndim == 2 else reflist2_arr
         emptyim=np.zeros(imshape)
-        dmsroi = dmscalc_ico_hkl([ref],hkllist,hklint,1,psirange,100,hkl,detvects,emptyim,simsigma,azir,psi,px,py,scatv,detdistancepx,rotx,roty,rotz,energy,reflist2,mtrx2)
+        dmsroi = dmscalc_ico_hkl([ref],hkllist,hklint,1,psirange,100,hkl,detvects,emptyim,simsigma,azir,psi,px,py,scatv,detdistancepx,rotx,roty,rotz,energy,ref2,mtrx2)
         dmsroi.crystal_system = crystal_system
 
         roiindex=dmsroi.roiindex(ig)
 
-        roi1=np.zeros(imshape)
-        roi2=np.zeros(imshape)
-        if roiindex.size>8:
-#         roiindex=np.array([np.where(roi>0)[0],np.where(roi>0)[1]]).T
-            # Choose sorting direction
-            if abs(roiindex[:,0].min()-roiindex[:,0].max())>abs(roiindex[:,1].min()-roiindex[:,1].max()):
-                roiindex=roiindex[np.argsort(roiindex[:,0],0),:]
-            else:
-                roiindex=roiindex[np.argsort(roiindex[:,1],0),:]
-            x1=roiindex[:int(len(roiindex)/2),0]
-            y1=roiindex[:int(len(roiindex)/2),1]
-            x2=roiindex[int(len(roiindex)/2):,0]
-            y2=roiindex[int(len(roiindex)/2):,1]
-    #         if np.mean(np.gradient(roiindex[0]))>np.mean(np.gradient(roiindex[1])):
-            if abs(x1.min()-x1.max())>abs(y1.min()-y1.max()):
-                f = interpolate.interp1d(x1, y1)
-                x1interp=range(x1.min()+1,x1.max()-1)
-                y1interp=f(x1interp).astype(int)
-                f2 = interpolate.interp1d(x2, y2)
-                x2interp=range(x2.min()+1,x2.max()-1)
-                y2interp=f2(x2interp).astype(int)
-                roi1[x1interp,y1interp]=1
-                roi2[x2interp,y2interp]=1
+        # Two ROIs per reflection: the locus is cut in half *along itself* and
+        # each half becomes a kernel plane.  A rigid shift of the line moves both
+        # halves the same way and a rotation moves them oppositely, which is
+        # where the fit's sensitivity to the line's orientation comes from.
+        #
+        # The halves are taken along the path in scan order, on the longest
+        # continuous run of it.  The locus is not always one tidy curve: it can
+        # leave the physical region or the detector and come back, and the engine
+        # concatenates both psi branches, so a reflection's index can hold several
+        # far-apart pieces.  Ordering those by a detector axis and cutting at the
+        # median (what this did before) interleaves them, and joining the result
+        # up drew ROIs with tails shooting hundreds of pixels across the plate —
+        # into which msroi then integrated whatever they crossed, and from which
+        # it took a meaningless perpendicular direction.  Cutting on the gaps
+        # first and keeping one connected arc is what makes a ROI a strip along
+        # a line.
+        roiindex = roi_dedupe_path(roiindex)
+        runs = roi_split_runs(roiindex)
+        if runs:
+            run = runs[0]
+            if len(runs) > 1:
+                print('ROI %d: locus is in %d pieces on the detector; using the '
+                      'longest (%d of %d points).'
+                      % (i1, len(runs), len(run), len(roiindex)))
+            half = len(run) // 2
+            roi1 = roi_rasterise(roiindex[run[:half]], imshape)
+            roi2 = roi_rasterise(roiindex[run[half:]], imshape)
+            if roi1.any() and roi2.any():
                 kernelstack[:,:,(i1*2)]=roi1
                 kernelstack[:,:,(i1*2)+1]=roi2
+                keep=np.vstack([keep,(i1*2)])
+                keep=np.vstack([keep,(i1*2)+1])
             else:
-                f = interpolate.interp1d(y1, x1)
-                y1interp=range(y1.min()+1,y1.max()-1)
-                x1interp=f(y1interp).astype(int)
-                f2 = interpolate.interp1d(y2, x2)
-                y2interp=range(y2.min()+1,y2.max()-1)
-                x2interp=f2(y2interp).astype(int)
-                roi1[x1interp,y1interp]=1
-                roi2[x2interp,y2interp]=1
-                kernelstack[:,:,(i1*2)]=roi1
-                kernelstack[:,:,(i1*2)+1]=roi2
-            keep=np.vstack([keep,(i1*2)])
-            keep=np.vstack([keep,(i1*2)+1])
+                print('ROI '+str(i1)+' removed because a half is off the detector.')
         else:
             print('ROI '+str(i1)+' removed because lines miss the detector.')
 #     keep=uniquearray(keep) # clean duplicates
@@ -1054,6 +1123,93 @@ def msroi2(img, kernel, width):
     w_idx, n_idx = np.where(valid)
     v2 = shifted[w_idx, n_idx]                                                 # (M, 2)
     return v1, v2, v
+
+
+def roi_walk_path(vs):
+    '''Put a kernel plane's pixels back into path order by walking them.
+
+    `np.where` returns them row by row, which for anything but a steep straight
+    line is not the order the line goes in.  Sorting by the dominant detector
+    axis fixes the easy cases but not a curved arc, which doubles back in that
+    axis and comes out as a zigzag.  Walking 8-connected neighbours from an end
+    of the path follows any shape.  A pixel with no unvisited neighbour ends a
+    leg; the walk then jumps to the nearest unvisited pixel and carries on, so
+    every pixel is ordered even if the kernel is not one connected piece.'''
+    vs = np.asarray(vs, dtype=int)
+    n = len(vs)
+    if n < 3:
+        return vs
+    pos = {(int(r), int(c)): i for i, (r, c) in enumerate(vs)}
+    nbrs = [[] for _ in range(n)]
+    for (r, c), i in pos.items():
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr or dc:
+                    j = pos.get((r + dr, c + dc))
+                    if j is not None:
+                        nbrs[i].append(j)
+    # Start from an end of the path (fewest neighbours); a closed loop has none,
+    # and any pixel will do there.
+    start = int(np.argmin([len(b) for b in nbrs]))
+    seen = np.zeros(n, bool)
+    order = []
+    cur = start
+    while cur is not None:
+        order.append(cur)
+        seen[cur] = True
+        nxt = next((j for j in nbrs[cur] if not seen[j]), None)
+        if nxt is None:
+            left = np.flatnonzero(~seen)
+            if len(left) == 0:
+                break
+            d = np.linalg.norm(vs[left] - vs[cur], axis=1)
+            nxt = int(left[np.argmin(d)])
+        cur = nxt
+    return vs[order]
+
+
+def roi_outline(kernel, width):
+    '''Closed (rows, cols) outline of the strip `msroi` integrates for one ROI.
+
+    `roibuilder_ico_hkl` lays a one-pixel-wide path along half of a DMS line;
+    `msroi` then sums the image along that path at every perpendicular offset in
+    `[-width/2, width/2)`, so the region actually integrated is that path swept
+    sideways.  This returns its boundary, for drawing the ROI on the detector
+    image.
+
+    The perpendicular direction is taken exactly as `msroi` takes it (one fixed
+    direction per ROI, from the first and last kernel pixel in row-major order),
+    so the drawn box is the region the curve came from and not an idealisation of
+    it.  The path is put back into walk order first (`roi_walk_path`), without
+    which a curved arc's two edges are drawn as zigzags.'''
+    kernel = np.asarray(kernel)
+    vs_idx = np.where(kernel > 0)
+    if len(vs_idx[0]) < 2:
+        return np.array([]), np.array([])
+    dv = np.array([[vs_idx[0][-1] - vs_idx[0][0], vs_idx[1][-1] - vs_idx[1][0]]],
+                  dtype=float)
+    v = (dv @ np.array([[0, 1], [-1, 0]])).flatten()
+    nv = np.linalg.norm(v)
+    if nv == 0:
+        return np.array([]), np.array([])
+    v = v / nv
+    vs = roi_walk_path(np.stack([vs_idx[0], vs_idx[1]], axis=1)).astype(float)
+
+    irange = np.arange(int(np.round(-width / 2.0)), int(np.round(width / 2.0)))
+    if irange.size == 0:
+        irange = np.array([0])
+    e1 = vs + irange[0] * v
+    e2 = vs + irange[-1] * v
+    # Down the first edge, back up the second, closed: one polyline the caller
+    # can hand straight to a plot item.
+    ring = np.concatenate([e1, e2[::-1], e1[:1]])
+    # Deliberately not clipped to the image.  A ROI whose strip overhangs the
+    # plate edge is integrated only up to the border (msroi drops the offsets
+    # that fall outside), but clamping the outline there would fold both edges
+    # onto the border and stop it being a simple polygon; the overhang is at
+    # most half the width, so it is left visible instead.
+    return ring[:, 0], ring[:, 1]
+
 
 def multiroifit(img,kernel,width,percentileval,method='gauss',sig=None):
     v1=np.array([[]]*4).T
@@ -1893,16 +2049,29 @@ class dmscalc_ico_hkl(object):
 
         b1      = brag1_all[:,np.newaxis]
         orighk  = ko * np.cos(b1 * np.pi/180)
-        sin_arg = np.clip(
-            (ko*np.sin(-b1*np.pi/180) + realvecthkl[:,:,2]) / ko, -1.0, 1.0
-        )
+        # Physical-solution mask, exactly as dmsfit_ico_hkl.imcalc computes it.
+        # Without it the clamps below turn every *non*-physical step into a
+        # solution rather than dropping it: |sin| > 1 gets clipped to the
+        # horizon, and a negative discriminant (no Ewald intersection) gets
+        # clamped to zero, which makes ia1 = ia2 = a degenerate angle.  Those
+        # invented points project to a perfectly smooth curve somewhere else on
+        # the detector, so the ROI builder — the one caller of this engine —
+        # could lay a ROI along a line that does not exist and that the overlay
+        # (which uses the fit engine) never draws.  On the TestExample session
+        # reflection [-1 1 1] drew a vertical arc and got a horizontal ROI 835 px
+        # away, built entirely from these.
+        raw_sin = (ko*np.sin(-b1*np.pi/180) + realvecthkl[:,:,2]) / ko
+        valid   = np.abs(raw_sin) <= 1.0                                  # physical Ewald condition
+        sin_arg = np.clip(raw_sin, -1.0, 1.0)
         rewl     = ko * np.cos(np.arcsin(sin_arg))
         rhk      = np.sqrt(realvecthkl[:,:,0]**2 + realvecthkl[:,:,1]**2)
         rhkangle = np.arctan2(realvecthkl[:,:,0], realvecthkl[:,:,1]) * 180/np.pi
 
         numer  = orighk**2 - rhk**2 + rewl**2
         half_n = numer / (2*orighk)
-        xint   = np.sqrt(np.maximum(rewl**2 - half_n**2, 0))
+        disc   = rewl**2 - half_n**2
+        valid &= disc >= 0                                                 # real intersection exists
+        xint   = np.sqrt(np.maximum(disc, 0))
 
         ia1 = np.arctan2( xint, half_n - orighk) * 180/np.pi
         ia2 = np.arctan2(-xint, half_n - orighk) * 180/np.pi
@@ -1919,11 +2088,17 @@ class dmscalc_ico_hkl(object):
         flat[:,:,4]   = psi2
         flat[:,:,5]   = brag1_all[:,np.newaxis]
         flat[:,:,6]   = energy
+        flat[~valid, 3:5] = np.nan                                        # kill non-physical solutions
         vecs1=psith2v(self.psi-mslist[:,3]-psicorrection,mslist[:,5]+thetacorrection)
         vecs2=psith2v(self.psi-mslist[:,4]-psicorrection,mslist[:,5]+thetacorrection)
         vecs=np.concatenate((vecs1,vecs2),0)
         centralv=-psith2v(0,thb)*detdistancepx
         prepxvec=dms2px(detvs[0,:],detvs[1,:],centralv,vecs)
+        # Drop the NaN rows before the integer cast, as the fit engine does.
+        # Casting NaN to int is undefined (it lands on INT_MIN here, and warns),
+        # and leaving it to the range filters below to remove is one platform
+        # away from being wrong.
+        prepxvec = prepxvec[~np.isnan(np.asarray(prepxvec)).any(axis=1)]
         pxvec=np.array(np.round(prepxvec*irmat).astype(int)) #build reverse matrix for detector
         imsim=np.zeros(np.shape(self.imdata))
         self.vecs = vecs
@@ -1968,6 +2143,414 @@ class dmscalc_ico_hkl(object):
         return self.ms.getref()
     def vecs(self,inputs):
         return self.vecs
+# ── DMS curves as the circles they analytically are ───────────────────────────
+# A DMS (Kossel) line comes from one secondary reflection: the doubly-diffracted
+# radiation leaves the sample along a *cone* of directions, all satisfying that
+# plane's diffraction condition (k_out.Ghat = |G|/2 for the exit wavevector).  A
+# cone of unit vectors is a circle on the sphere, so each locus is *exactly* a
+# circle in exit-direction space — the theta-scan of `imcalc` only samples it.
+#
+# That gives a second way to compute the same curves: run the scan coarsely, fit
+# the circle each continuous run lies on (three points determine it; the fit is
+# exact, not an approximation), and re-sample the arc at whatever resolution the
+# detector deserves.  `numsteps` then only decides how precisely the *ends* of
+# each arc are located, not how smooth the curve is, so a fraction of the points
+# gives a better line.  Ported from the sibling ReciprocalSpaceVisualisation
+# project (`dms_compute.py`), which does the same thing in reciprocal space.
+#
+# Measured against this engine the circle is exact to ~1e-15 (both lattice modes,
+# any psi, with or without phason strain or a chi correction) provided each run
+# is cut where the geometry changes — see `dms_split_runs`.  The one real
+# exception is a non-zero theta correction, which offsets the exit polar angle
+# *after* the azimuth was solved at the uncorrected angle and so shears the locus
+# slightly off-plane: first order in thetacor, ~2e-4 rad at 1 deg.  Every helper
+# below returns its worst deviation so a caller can report that rather than hide
+# it.
+
+DMS_CURVE_METHODS = ('sweep', 'circle')
+
+# Fit deviation (in exit-direction units, i.e. radians of arc) past which a run
+# is not accepted as a circle and the sampled points are drawn instead.  1e-3 is
+# ~3 px at a typical 3000 px detector distance — far above the ~1e-15 a genuine
+# arc achieves and above the theta-correction shear, but small enough that a run
+# straddling a geometry change can never be drawn as a bogus circle.
+DMS_CIRCLE_TOL = 1e-3
+
+
+def dms_curve_method(name):
+    '''Normalise a DMS curve-method name to one of `DMS_CURVE_METHODS`.
+
+    'sweep'  — the sampled theta-scan points are the curve (the original).
+    'circle' — each continuous run is reduced to the circle it lies on and
+               re-sampled at detector resolution.'''
+    key = str(name or 'sweep').strip().lower()
+    if key in ('circle', 'circles', 'analytic', 'analytical'):
+        return 'circle'
+    if key in ('sweep', 'sampled', 'scan', 'theta-sweep'):
+        return 'sweep'
+    raise ValueError('unknown DMS curve method %r (expected one of %s)'
+                     % (name, ', '.join(DMS_CURVE_METHODS)))
+
+
+def dms_plane_basis(n):
+    '''Deterministic in-plane axis for a circle of normal `n` (n x xhat, falling
+    back to n x yhat when n is along xhat).  The arc angles are measured in this
+    basis, so every producer and consumer of an arc must derive it the same way.
+    Accepts a single normal or an (N,3) stack.'''
+    n = np.atleast_2d(np.asarray(n, dtype=float))
+    u = np.stack([np.zeros(len(n)), n[:, 2], -n[:, 1]], axis=1)
+    small = (u * u).sum(1) < 1e-18
+    if small.any():
+        u[small] = np.stack([-n[small, 2], np.zeros(int(small.sum())), n[small, 0]],
+                            axis=1)
+    return u / np.linalg.norm(u, axis=1, keepdims=True)
+
+
+def dms_split_runs(pts, idx, seg=None, gap_factor=6.0, min_pts=1):
+    '''Split one reflection's sampled sweep into the continuous arcs it contains,
+    returning a list of index arrays into `pts`.
+
+    A DMS locus is not one connected sweep.  Three things break it, and all three
+    have to be cut or a circle gets fitted across the join:
+
+    * the Ewald construction drops out wherever the intersection is non-physical,
+      leaving gaps in the scan (`idx`, the surviving scan-step numbers);
+    * a large jump between consecutive surviving points, i.e. the locus leaving
+      and re-entering the physical region between two steps;
+    * a change of `seg`, an arbitrary per-point label for "the geometry the scan
+      is in".  `imcalc` passes the sign of the scan vector along the primary:
+      a theta range spanning zero (the slider's default [thb-27, thb+10] does
+      whenever thb < 27 deg) reverses the scan vector, which re-aligns the
+      crystal and puts the rest of the sweep on a *different* circle.  Without
+      this cut such a run fits a circle wrong by ~0.2 rad instead of ~1e-15.'''
+    pts = np.asarray(pts, dtype=float)
+    idx = np.asarray(idx)
+    if len(pts) < min_pts:
+        return []
+    d  = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    nz = d[d > 0]
+    brk = (d > gap_factor * np.median(nz)) if nz.size else np.zeros(len(d), bool)
+    brk |= (np.diff(idx) != 1)
+    if seg is not None:
+        brk |= (np.diff(np.asarray(seg)) != 0)
+    runs = np.split(np.arange(len(pts)), np.flatnonzero(brk) + 1)
+    return [r for r in runs if len(r) >= min_pts]
+
+
+def dms_fit_arcs(P, runs):
+    '''Fit the circle every run lies on, in one batched pass.
+
+    `P` is an (M,3) array of points and `runs` a list of index arrays into it,
+    each in sweep order.  Returns `(centres, radii, normals, a0, a1, resid)`:
+    the arc runs a0 -> a1 the way the sweep traversed it (angles measured in the
+    `dms_plane_basis` frame of its normal, unwrapped within the run so an arc of
+    any length has an unambiguous span), and `resid` is the run's worst deviation
+    from the fitted circle — radial or out-of-plane, whichever is larger.
+
+    Batched rather than one fit per run because a discovery slice holds hundreds
+    of runs and the per-call numpy overhead of a scalar fit dominates everything
+    else.  Each quantity is a `reduceat` over the concatenated runs followed by a
+    batched 3x3 `eigh` / `solve`.'''
+    lens = np.array([len(r) for r in runs])
+    offs = np.concatenate([[0], np.cumsum(lens)[:-1]])
+    rid  = np.repeat(np.arange(len(runs)), lens)
+    Q    = np.asarray(P, dtype=float)[np.concatenate(runs)]
+
+    c0 = np.add.reduceat(Q, offs, axis=0) / lens[:, None]
+    # Scatter matrix per run: sum p(x)p - n.c(x)c.  Its least eigenvector is the
+    # plane normal.
+    S = (np.add.reduceat(Q[:, :, None] * Q[:, None, :], offs, axis=0)
+         - lens[:, None, None] * c0[:, :, None] * c0[:, None, :])
+    n = np.linalg.eigh(S)[1][:, :, 0]
+    u = dms_plane_basis(n)
+    v = np.cross(n, u)
+
+    X = Q - c0[rid]
+    x = np.einsum('ij,ij->i', X, u[rid])
+    y = np.einsum('ij,ij->i', X, v[rid])
+    b = x * x + y * y
+    red = lambda a: np.add.reduceat(a, offs)
+    # 3x3 normal equations of |p|^2 = 2.cx.x + 2.cy.y + (r^2 - |c|^2), per run.
+    AtA = np.empty((len(runs), 3, 3))
+    AtA[:, 0, 0] = red(4 * x * x); AtA[:, 0, 1] = AtA[:, 1, 0] = red(4 * x * y)
+    AtA[:, 1, 1] = red(4 * y * y); AtA[:, 0, 2] = AtA[:, 2, 0] = red(2 * x)
+    AtA[:, 1, 2] = AtA[:, 2, 1] = red(2 * y); AtA[:, 2, 2] = lens
+    Atb = np.stack([red(2 * x * b), red(2 * y * b), red(b)], axis=1)
+    # A degenerate run (collinear points) has a singular normal matrix, which
+    # would take the whole batch down with a LinAlgError; leave those NaN and let
+    # the residual check reject them.
+    sol = np.full((len(runs), 3), np.nan)
+    det = np.linalg.det(AtA)
+    solvable = np.isfinite(det) & (np.abs(det) > 0)
+    if solvable.any():
+        # b as a stack of column vectors: numpy >= 2 reads a bare 2-D b as one
+        # matrix.
+        sol[solvable] = np.linalg.solve(AtA[solvable],
+                                        Atb[solvable][:, :, None])[:, :, 0]
+    cx, cy = sol[:, 0], sol[:, 1]
+    with np.errstate(invalid='ignore'):
+        r = np.sqrt(np.maximum(sol[:, 2] + cx * cx + cy * cy, 0.0))
+
+    dx, dy = x - cx[rid], y - cy[rid]
+    resid = np.maximum(
+        np.maximum.reduceat(np.abs(np.sqrt(dx * dx + dy * dy) - r[rid]), offs),
+        np.maximum.reduceat(np.abs(np.einsum('ij,ij->i', X, n[rid])), offs))
+
+    # Unwrap the angle within each run (never across a run boundary), so a0 -> a1
+    # spans the arc the way the sweep traversed it, for arcs of any length.
+    ang = np.arctan2(dy, dx)
+    d = np.diff(ang, prepend=ang[0])
+    d = (d + np.pi) % (2 * np.pi) - np.pi
+    d[offs] = 0.0
+    cum = np.cumsum(d)
+    a0 = ang[offs]
+    a1 = a0 + (cum[offs + lens - 1] - cum[offs])
+    return c0 + cx[:, None] * u + cy[:, None] * v, r, n, a0, a1, resid
+
+
+def dms_arc_points(centres, radii, normals, a0, a1, counts):
+    '''Tessellate arcs: `counts[i]` points along arc `i`, from a0 to a1.
+
+    Returns `(points, counts)` with the points of every arc concatenated in
+    order, so the caller can project them all in one pass and split them again
+    with the counts.'''
+    counts = np.maximum(np.asarray(counts, dtype=int), 2)
+    total  = int(counts.sum())
+    offs   = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    aid    = np.repeat(np.arange(len(counts)), counts)
+    t      = (np.arange(total) - np.repeat(offs, counts)) / (np.repeat(counts, counts) - 1.0)
+    ang    = np.repeat(a0, counts) + t * np.repeat(np.asarray(a1) - np.asarray(a0), counts)
+    u = dms_plane_basis(normals)
+    v = np.cross(normals, u)
+    pts = (np.asarray(centres)[aid]
+           + (np.asarray(radii)[aid] * np.cos(ang))[:, None] * u[aid]
+           + (np.asarray(radii)[aid] * np.sin(ang))[:, None] * v[aid])
+    return pts, counts
+
+
+def _on_image_length(r0, c0, r1, c1, shape):
+    '''Length of the part of each segment (r0,c0)->(r1,c1) inside the image.
+
+    Liang-Barsky clipping, vectorised.  Testing the *endpoints* instead is not
+    enough: a locus can cross the whole plate between two coarse samples, and
+    both ends being off the image would score that stretch zero — precisely the
+    fast-moving curve that most needs the points.  The result is capped at the
+    image diagonal, which also disposes of the infinities the gnomonic
+    projection produces where a locus grazes the detector plane.'''
+    H, W = float(shape[0]), float(shape[1])
+    dr, dc = r1 - r0, c1 - c0
+    t0 = np.zeros_like(dr); t1 = np.ones_like(dr)
+    inside = np.ones(dr.shape, dtype=bool)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        for p, q in ((-dr, r0), (dr, H - r0), (-dc, c0), (dc, W - c0)):
+            par = (p == 0)
+            inside &= ~(par & (q < 0))
+            t = np.where(par, 0.0, q / p)
+            t0 = np.where(~par & (p < 0), np.maximum(t0, t), t0)
+            t1 = np.where(~par & (p > 0), np.minimum(t1, t), t1)
+        out = np.hypot(dr, dc) * np.clip(t1 - t0, 0.0, None)
+    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.where(inside, np.minimum(out, np.hypot(H, W)), 0.0)
+
+
+def dms_arc_points_even(centres, radii, normals, a0, a1, project,
+                        spacing_px=0.5, min_points=32, max_points=4000,
+                        shape=None, probe=256):
+    '''Tessellate arcs at even *pixel* spacing along the projected curve.
+
+    Spreading points evenly in *angle* is the obvious thing and the wrong one:
+    the projection to the detector is far from uniform, so an arc that crosses
+    the plate quickly at one end comes out sampled several pixels apart there
+    while the rest of it is sampled many times per pixel.  Closing the sparse
+    part by raising the count alone costs an order of magnitude more points than
+    the curve needs (76k to close a 2 px gap, in the case that prompted this).
+
+    So the arc is measured first at a coarse `probe` resolution, its projected
+    on-image path length is accumulated, and the final angles are placed at even
+    intervals of *that* — which is one `searchsorted` over all arcs at once, not
+    a loop.  Points the projection sends off the image accumulate no length, so
+    they cost nothing and the budget goes where the curve can be seen.
+
+    The probe runs **twice**: most of an arc is usually off the image, so a
+    single pass spends its resolution where nothing is drawn and leaves the
+    visible window coarse (3 px gaps at probe=256 in the case that prompted
+    this; 1024 fixes it at 35% more cost). The first pass only locates the
+    window; the second re-probes *that*, which buys the resolution of a
+    ~10x finer probe for the price of one more coarse one.
+
+    Returns `(pts, counts)` like `dms_arc_points`.'''
+    n_arcs = len(radii)
+    if n_arcs == 0:
+        return np.empty((0, 3)), np.empty(0, int)
+    spacing_px = max(spacing_px, 1e-3)
+    probe = max(int(probe), 8)
+    a0 = np.asarray(a0, dtype=float); a1 = np.asarray(a1, dtype=float)
+
+    def _measure(lo, hi, n, sel=None):
+        """Projected on-image length of each probe segment over [lo, hi].
+
+        `sel` restricts the work to a subset of the arcs — most of a scene's
+        arcs never reach the plate, and probing those is the single largest
+        cost in this whole path."""
+        idx = slice(None) if sel is None else sel
+        m = n_arcs if sel is None else len(np.atleast_1d(sel))
+        pp, _ = dms_arc_points(np.asarray(centres)[idx], np.asarray(radii)[idx],
+                               np.asarray(normals)[idx], lo, hi, np.full(m, n))
+        rows, cols = project(pp)
+        rows = np.asarray(rows, dtype=float).reshape(m, n)
+        cols = np.asarray(cols, dtype=float).reshape(m, n)
+        if shape is None:
+            seg = np.hypot(np.diff(rows, axis=1), np.diff(cols, axis=1))
+        else:
+            seg = _on_image_length(rows[:, :-1], cols[:, :-1],
+                                   rows[:, 1:],  cols[:, 1:], shape)
+        return np.nan_to_num(seg, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Pass 1: narrow each arc to the angular window that reaches the image, plus
+    # one probe step of margin either side.  A quarter of the resolution is
+    # plenty to *find* the window — `_on_image_length` measures the chord, so a
+    # crossing between two samples is still detected, not missed.
+    coarse = max(probe // 4, 8)
+    seg = _measure(a0, a1, coarse)
+    hit = seg > 0
+    vis = hit.any(1)
+    step = 1.0 / (coarse - 1.0)
+    f0 = np.clip(np.argmax(hit, axis=1) * step - step, 0.0, 1.0)
+    f1 = np.clip((coarse - 1 - np.argmax(hit[:, ::-1], axis=1)) * step + step,
+                 0.0, 1.0)
+    span = a1 - a0
+    a0 = np.where(vis, a0 + f0 * span, a0)
+    a1 = np.where(vis, a0 + (f1 - f0) * span, a1)
+
+    # Pass 2: the measurement the point placement is made from — run only on the
+    # arcs that reach the image.  The rest carry zero length and fall through to
+    # a uniform tessellation of `min_points` below, which is all an invisible
+    # arc needs.
+    seg = np.zeros((n_arcs, probe - 1))
+    if vis.any():
+        seen = np.flatnonzero(vis)
+        seg[seen] = _measure(a0[seen], a1[seen], probe, seen)
+    cum = np.concatenate([np.zeros((n_arcs, 1)), np.cumsum(seg, axis=1)], axis=1)
+    length = cum[:, -1]
+
+    counts = np.clip(np.ceil(length / spacing_px),
+                     min_points, max_points).astype(int)
+    offs   = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    total  = int(counts.sum())
+    t = ((np.arange(total) - np.repeat(offs, counts))
+         / (np.repeat(counts, counts) - 1.0))
+
+    # Invert the cumulative length, every arc in one pass: offsetting arc i's
+    # curve by i*big makes the concatenation globally monotonic, so a single
+    # searchsorted brackets every target in its own arc.
+    big  = float(length.max()) * 2.0 + 1.0
+    base = (np.arange(n_arcs) * big)
+    j = np.searchsorted(cum.ravel() + np.repeat(base, probe),
+                        t * np.repeat(length, counts) + np.repeat(base, counts))
+    lo = np.repeat(np.arange(n_arcs) * probe, counts) + 1
+    j  = np.clip(j, lo, lo + (probe - 2))
+    flat = cum.ravel()
+    c0, c1 = flat[j - 1], flat[j]
+    w = np.where(c1 > c0,
+                 (t * np.repeat(length, counts) - c0) / np.maximum(c1 - c0, 1e-12),
+                 0.0)
+    # probe index within the arc, as a fraction of the span
+    frac = ((j - lo + w) / (probe - 1.0))
+    # An arc the probe never saw on the image has no length to spread points
+    # along; keep it uniform in angle rather than collapsing it to a point, since
+    # a fast locus can cross the image between two probe samples.
+    frac = np.where(np.repeat(length, counts) > 0, frac, t)
+
+    ang = np.repeat(a0, counts) + frac * np.repeat(np.asarray(a1) - np.asarray(a0),
+                                                   counts)
+    aid = np.repeat(np.arange(n_arcs), counts)
+    u = dms_plane_basis(normals)
+    v = np.cross(normals, u)
+    pts = (np.asarray(centres)[aid]
+           + (np.asarray(radii)[aid] * np.cos(ang))[:, None] * u[aid]
+           + (np.asarray(radii)[aid] * np.sin(ang))[:, None] * v[aid])
+    return pts, counts
+
+
+def dms_circle_curves(vecs, n_steps, n_refs, project, segment=None, shape=None,
+                      spacing_px=0.5, min_points=32, max_points=4000,
+                      min_fit_pts=4, tol=DMS_CIRCLE_TOL):
+    '''Per-reflection DMS curves built from the circles the sweep lies on.
+
+    `vecs` is the engine's full exit-direction array — the two solution branches
+    stacked, each `n_steps * n_refs + 1` rows with a leading sentinel, ordered
+    step-major then reflection (exactly what `imcalc` builds).  `project` maps an
+    (N,3) block of directions to float `(rows, cols)` detector pixels; it is
+    called here on the sampled points, to size each arc's tessellation from the
+    pixel path it actually covers.  `shape` is the image `(rows, cols)`, used
+    only for that sizing (points off it are not worth resolving).
+
+    Returns `(pts, counts, owner, resid, fallback)`:
+      pts       (M,3) tessellated arc points, all arcs concatenated
+      counts    points per arc
+      owner     reflection index per arc
+      resid     worst circle-fit deviation over the accepted arcs (rad)
+      fallback  list of (reflection index, point array) for runs kept as the
+                points the sweep sampled — too short to fit a circle to, or a
+                fit the tolerance rejected.  Every sampled point ends up in one
+                or the other, so switching method can never lose a curve.'''
+    vecs = np.asarray(vecs, dtype=float)
+    half = n_steps * n_refs + 1
+    empty = (np.empty((0, 3)), np.empty(0, int), np.empty(0, int))
+    if n_steps < 1 or n_refs < 1 or vecs.shape[0] < 2 * half:
+        return empty + (0.0, [])
+    seg = None if segment is None else np.asarray(segment).ravel()
+
+    owner, pts_all, fallback = [], [], []
+    for b in (0, 1):
+        blk = vecs[b * half:(b + 1) * half][1:].reshape(n_steps, n_refs, 3)
+        for j in range(n_refs):
+            p  = blk[:, j, :]
+            idx = np.flatnonzero(np.isfinite(p).all(axis=1))
+            if idx.size == 0:
+                continue
+            pp = p[idx]
+            for run in dms_split_runs(pp, idx,
+                                      None if seg is None else seg[idx]):
+                if len(run) < min_fit_pts:
+                    # Too few points to determine a circle from — a locus that
+                    # only survives a step or two of this scan.  Kept as sampled
+                    # rather than dropped: at a coarse scan these are exactly the
+                    # fast-moving loci, and losing them would make the analytic
+                    # method show *less* than the sweep it is meant to reproduce.
+                    fallback.append((j, pp[run]))
+                    continue
+                owner.append(j)
+                pts_all.append(pp[run])
+    if not pts_all:
+        return empty + (0.0, fallback)
+
+    P     = np.concatenate(pts_all)
+    lens  = np.array([len(p) for p in pts_all])
+    offs  = np.concatenate([[0], np.cumsum(lens)[:-1]])
+    runs  = [np.arange(o, o + l) for o, l in zip(offs, lens)]
+    owner = np.asarray(owner, dtype=int)
+
+    c, r, n, a0, a1, resid = dms_fit_arcs(P, runs)
+
+    # How finely to re-sample each arc: from the pixel path its own sampled
+    # points cover, so an arc that crosses the detector gets sub-pixel spacing
+    # and one that barely grazes it does not pay for points it cannot show.
+    good = np.isfinite(r) & (r > 0) & np.isfinite(resid) & (resid <= tol)
+    fallback += [(int(owner[i]), P[runs[i]]) for i in np.flatnonzero(~good)]
+    worst = float(np.max(resid[good])) if good.any() else 0.0
+    if not good.any():
+        return empty + (worst, fallback)
+
+    # Re-sampled at even pixel spacing along the projected curve, so the budget
+    # goes where the curve is visible and no part of it is left coarse.
+    pts, counts = dms_arc_points_even(
+        c[good], r[good], n[good], a0[good], a1[good], project,
+        spacing_px=spacing_px, min_points=min_points, max_points=max_points,
+        shape=shape)
+    return pts, counts, owner[good], worst, fallback
+
+
 def _fit_roi_gauss(imsim, kernel_slice, width):
     sumvals, roi = msroi(imsim, kernel_slice, width)
     xdata = np.arange(len(sumvals))
@@ -2027,6 +2610,18 @@ class dmsfit_ico_hkl(object):
         # in self.centres were extracted with — see AUTO_DOUBLET_SIG.
         self.peakmethod = 'gauss'
         self.peaksig = AUTO_DOUBLET_SIG
+        # How the DMS curves are computed from the theta scan: 'sweep' (the
+        # sampled points are the curve) or 'circle' (each continuous run is
+        # reduced to the circle it analytically lies on and re-sampled at
+        # detector resolution).  See the DMS_CURVE_METHODS section above and
+        # setCurveMethod.  `circle_residual` is the worst deviation of any run
+        # from its fitted circle in the last imcalc (radians of arc; None in
+        # sweep mode), so a caller can report when the analytic form has stopped
+        # being exact instead of hiding it.
+        self.curvemethod    = 'sweep'
+        self.curvespacing   = 0.5      # target pixel spacing of a tessellated arc
+        self.curvemaxpoints = 4000     # cap on the points spent on one arc
+        self.circle_residual = None
         # Failure bookkeeping from the last _centre_residuals call, so a caller
         # can tell the user which ROIs are contributing nothing (no experimental
         # target) or contributing a penalty (simulated peak not locatable).
@@ -2046,6 +2641,23 @@ class dmsfit_ico_hkl(object):
         self.ig_full = np.asarray(ig24, dtype=float).copy()
     def setLattice(self, lattice):
         self.lattice = lattice
+    def setCurveMethod(self, method, spacing_px=None, max_points=None):
+        '''Choose how the DMS curves are computed from the theta scan.
+
+        'sweep'  — the sampled scan points are the curve (the original path):
+                   `hkllistrange[2]` sets both where each arc ends *and* how
+                   smooth it is, so a coarse scan gives faceted lines.
+        'circle' — each continuous run is reduced to the circle it exactly lies
+                   on and re-sampled at `spacing_px` pixel spacing (capped at
+                   `max_points` per arc).  The scan then only locates the *ends*
+                   of each arc, so it can be run far coarser for the same — in
+                   fact smoother — curves and simulated image.'''
+        self.curvemethod = dms_curve_method(method)
+        if spacing_px is not None:
+            self.curvespacing = float(spacing_px)
+        if max_points is not None:
+            self.curvemaxpoints = int(max_points)
+
     def setPeakMethod(self, method, sig=AUTO_DOUBLET_SIG):
         '''Set how peak positions are located in the simulated ROI curves.
         `sig` must be the value the experimental centres were extracted with,
@@ -2283,9 +2895,51 @@ class dmsfit_ico_hkl(object):
         vecs2=psith2v(self.psi-mslist[:,4]-psicorrection,mslist[:,5]+thetacorrection)
         vecs=np.concatenate((vecs1,vecs2),0)
         centralv=-psith2v(0,thb)*detdistancepx
+
+        def _to_pixels(v):
+            '''Exit-direction vectors -> float (row, col) detector pixels.  The
+            one map both curve methods project through, so an analytic curve and
+            the sampled one it was fitted to cannot land a pixel apart.'''
+            pre = dms2px(detvs[0,:], detvs[1,:], centralv, np.asarray(v, dtype=float))
+            pv  = np.asarray(np.round(pre * irmat), dtype=float)
+            return (float(self.px) + pv[:,0],
+                    float(self.py) + (pv[:,2] if self.scatv == 1 else -pv[:,2]))
+
+        # ── Curve method: the sampled sweep, or the circles it lies on ────────
+        self.curvemethod = dms_curve_method(getattr(self, 'curvemethod', 'sweep'))
+        arcs = None
+        self.circle_residual = None
+        if self.curvemethod == 'circle' and N_steps > 0 and N_refs > 0:
+            # Where the scan vector reverses (any theta range spanning zero) the
+            # crystal alignment flips and the sweep continues on a *different*
+            # circle, so the runs are cut on the sign of the scan vector along
+            # the primary.  Without that cut a straddling run fits a circle
+            # wrong by ~0.2 rad instead of ~1e-15.
+            seg = (np.asarray(hkllist, dtype=float)
+                   @ np.asarray(hkl, dtype=float)) >= 0
+            # Deliberately not guarded: a fit is scored on the simulated image,
+            # so quietly dropping back to the sweep for one evaluation would move
+            # the objective's footing mid-run.  Either every evaluation uses the
+            # circles or the caller sees the failure.
+            arcs = dms_circle_curves(
+                vecs, N_steps, N_refs, _to_pixels, seg,
+                shape=np.shape(self.imdata),
+                spacing_px=self.curvespacing,
+                max_points=self.curvemaxpoints)
+            self.circle_residual = arcs[3]
+
         prepxvec=dms2px(detvs[0,:],detvs[1,:],centralv,vecs)
-        valid_px = ~np.isnan(prepxvec).any(axis=1)
-        pxvec=np.array(np.round(prepxvec[valid_px]*irmat).astype(int))
+        if arcs is None:
+            index_src = prepxvec
+        else:
+            # The simulated image is drawn from the same points as the curves:
+            # the tessellated arcs, plus any run whose circle was rejected (kept
+            # as sampled, so no reflection silently loses its line).
+            arc_pts = [arcs[0]] + [p for _, p in arcs[4]]
+            index_src = dms2px(detvs[0,:], detvs[1,:], centralv,
+                               np.concatenate(arc_pts) if arc_pts else np.empty((0,3)))
+        valid_px = ~np.isnan(index_src).any(axis=1)
+        pxvec=np.array(np.round(index_src[valid_px]*irmat).astype(int))
         imsim=np.zeros(np.shape(self.imdata))
         pxv2d=np.array(pxvec[:,[0,2]])
         self.bragg = thb
@@ -2299,8 +2953,25 @@ class dmsfit_ico_hkl(object):
         pxv2d=pxv2d[np.where(pxv2d[:,0]< imsim.shape[0])]
         pxv2d=pxv2d[np.where(pxv2d[:,1]>-1)]
         pxv2d=pxv2d[np.where(pxv2d[:,1]< imsim.shape[1])]
+        if arcs is not None and pxv2d.shape[0]:
+            # The arcs are deliberately over-sampled (~2 points per pixel) so no
+            # pixel of a line can be skipped; collapsing the duplicates leaves
+            # the index — and the overlay scatter drawn from it — the size the
+            # sampled path produces, for an identical simulated image.  Packed
+            # into one integer per pixel first: np.unique(axis=0) on the pairs
+            # sorts a structured view and costs an order of magnitude more than
+            # everything else here put together.
+            w_im = int(imsim.shape[1])
+            key = np.unique(pxv2d[:,0].astype(np.int64) * w_im + pxv2d[:,1])
+            pxv2d = np.stack([key // w_im, key % w_im], axis=1)
         self.dmsindex=tuple([pxv2d[:,0],pxv2d[:,1]])
-        self.inputarray = np.array([a,b,c,alpha,beta,gamma,psicorrection,h_correction,k_correction,l_correction,detdistancepx,detxrot,detyrot,detzrot,energy,self.a11,self.a12,self.a13,self.a21,self.a22,self.a23,self.a31,self.a32,self.a33])
+        # Slots 7/8 carry the chi / theta corrections (they were formerly
+        # hcor/kcor — see the branches above, every one of which reads them from
+        # the guess and holds h/k/l_correction at zero).  Writing the h/k
+        # corrections here instead zeroed the two refined values on the way out,
+        # so a fit's own result, read back through inputarray, described a
+        # geometry the fit had never evaluated.
+        self.inputarray = np.array([a,b,c,alpha,beta,gamma,psicorrection,chicorrection,thetacorrection,l_correction,detdistancepx,detxrot,detyrot,detzrot,energy,self.a11,self.a12,self.a13,self.a21,self.a22,self.a23,self.a31,self.a32,self.a33])
         imsim[self.dmsindex]=1
         if self.simsigma != 0:
             self.imsim=ndimage.convolve(imsim,makekernel('gauss',15,self.simsigma))
@@ -2308,7 +2979,10 @@ class dmsfit_ico_hkl(object):
             self.imsim=imsim
 
         # ── Per-reflection line data for visualisation ────────────────────────
-        if N_steps > 0 and N_refs > 0:
+        if arcs is not None:
+            self.dmslines = self._arc_dmslines(arcs, N_refs, _to_pixels,
+                                               imsim.shape)
+        elif N_steps > 0 and N_refs > 0:
             n_half = N_steps * N_refs + 1
             def _prepx_lines(pp_half):
                 px = np.asarray(np.round(pp_half[1:] * irmat), dtype=float)  # (N_steps*N_refs, 3)
@@ -2328,6 +3002,40 @@ class dmsfit_ico_hkl(object):
             ]
         else:
             self.dmslines = []
+
+    def _arc_dmslines(self, arcs, n_refs, to_pixels, shape):
+        '''Per-reflection (x=cols, y=rows) overlay lines from tessellated arcs.
+
+        Same contract as the sweep path: one entry per reflection, arcs within a
+        reflection separated by a NaN, and any point off the image NaN'd, so a
+        consumer cannot tell which method produced the curve apart from its
+        smoothness.'''
+        pts, counts, owner, _, fall = arcs
+        segs = [[] for _ in range(n_refs)]
+        blocks = [pts] + [p for _, p in fall]
+        lens   = list(counts) + [len(p) for _, p in fall]
+        owners = list(owner)   + [j for j, _ in fall]
+        if not len(lens):
+            return [(np.array([]), np.array([])) for _ in range(n_refs)]
+        rows, cols = to_pixels(np.concatenate(blocks))
+        h_im, w_im = shape
+        oob = ((rows < 0) | (rows >= h_im) | (cols < 0) | (cols >= w_im)
+               | np.isnan(rows) | np.isnan(cols))
+        rows = np.where(oob, np.nan, rows); cols = np.where(oob, np.nan, cols)
+        start = 0
+        for j, ln in zip(owners, lens):
+            segs[j].append((cols[start:start + ln], rows[start:start + ln]))
+            start += ln
+        nan = np.array([np.nan])
+        out = []
+        for s in segs:
+            if not s:
+                out.append((np.array([]), np.array([])))
+                continue
+            xs = [v for pair in s for v in (pair[0], nan)][:-1]
+            ys = [v for pair in s for v in (pair[1], nan)][:-1]
+            out.append((np.concatenate(xs), np.concatenate(ys)))
+        return out
 
     def _roi_fail_penalty(self):
         '''Per-ROI residual charged for a ROI whose simulated peak could not be

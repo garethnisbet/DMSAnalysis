@@ -76,6 +76,12 @@ OptMethod = cfg["computation"]["opt_method"]
 # Peak-position method for the raw and simulated ROI curves:
 # 'gauss' (Gaussian curve fit) or 'centroid' (centre of mass).
 peak_method = cfg["computation"].get("peak_method", "gauss")
+# How the DMS curves are computed from the hkl scan: 'sweep' (the sampled scan
+# points are the curve) or 'circle' (each continuous run reduced to the circle it
+# analytically lies on, re-sampled at detector resolution).  Same key and same
+# names as the slider, so a config exported from the GUI fits on the curves the
+# GUI was showing.
+curve_method = ts.dms_curve_method(cfg["computation"].get("curve_method", "sweep"))
 # OptMethod = ts.minimizers['Nelder-Mead']
 # OptMethod = ts.minimizers['Differential Evolution']
 # OptMethod = ts.minimizers['CG']
@@ -330,6 +336,7 @@ dms = ts.dmsfit_ico_hkl(reflist, hkllistrange, hklint, psirange, width, centres,
 dms.setCalLattice(initial_guess[:6])
 dms.setLattice(initial_guess[:6])
 dms.setPeakMethod(peak_method, ts.AUTO_DOUBLET_SIG)
+dms.setCurveMethod(curve_method)
 dms.setIGFull(initial_guess)   # full guess for the conventional-crystal branch
 
 

@@ -304,6 +304,83 @@ Extends `dmscalc` with crystal-system-aware parameter unpacking and Gaussian-pea
 
 ---
 
+---
+
+## DMS curves: the sampled sweep, or the circles they are
+
+A DMS (Kossel) line comes from **one secondary reflection**: the doubly-diffracted
+radiation leaves the sample along a **cone** of directions, all satisfying that
+plane's diffraction condition (`k_out·Ĝ = |G|/2`). A cone of unit vectors is a
+circle on the sphere, so each locus is **exactly a circle** in exit-direction
+space — the θ-scan of `imcalc` only samples it. That gives a second way to
+compute the same curves, ported from the sibling `ReciprocalSpaceVisualisation`
+viewer (`dms_compute.py`), which does it in reciprocal space:
+
+| `curve_method` | What `imcalc` draws | What `numsteps` buys |
+|----------------|---------------------|----------------------|
+| `'sweep'` (default) | the sampled scan points, joined | both the smoothness of the curve *and* where it ends |
+| `'circle'` | each continuous run reduced to the circle it lies on, re-sampled at ~0.5 px spacing | only where each arc **ends** — the curve between the ends is exact at any resolution |
+
+So circle mode can be run far coarser: at 100 points it reproduces a 4000-point
+sweep to a few pixels, and its simulated image has no sampling gaps to blur over.
+Set it with `dmsfit_ico_hkl.setCurveMethod(...)`, from `computation.curve_method`
+in a config (`fit.py`), or from the **Curves** combo in the slider's *Fit* box.
+
+**Cost.** The sweep still runs (it is what locates the arc ends), so at the same
+`numsteps` circle mode is 2.5–5x *slower* — it only pays off if `numsteps` comes
+down with it. Measured on 40 conventional reflections over a 1200x1200 detector
+(worst gap = furthest a 4000-point sweep point falls from the drawn curve):
+
+| | ms | worst gap | | ms | worst gap |
+|---|---|---|---|---|---|
+| `sweep` @ 100 | 4.4 | 107 px | `circle` @ 100 | 20.0 | 1.0 px |
+| `sweep` @ 250 | 6.7 | 39 px | `circle` @ 250 | 22.7 | 1.0 px |
+| `sweep` @ 1000 | 17.8 | 19 px | `circle` @ 1000 | 43.6 | 1.0 px |
+| `sweep` @ 4000 | 72.0 | — | | | |
+
+1.0 px is the engine's whole-pixel rounding, i.e. the floor. `numsteps` still
+sets how precisely each arc's *ends* are located, so it cannot go arbitrarily
+low: a run needs 4 surviving points before a circle can be fitted to it, and a
+locus that a coarse scan catches only once or twice is kept as those points. On
+the icosahedral fixture, which has fewer and shorter on-image arcs, `circle` @
+100 is 11 ms and 8 px (the ends), reaching 1.4 px by 1000 points.
+
+Measured against this engine the circle is exact to ~1e-13 rad in both lattice
+modes, at any ψ, with or without phason strain or a χ correction. Two caveats,
+both handled rather than hidden:
+
+- **A θ range spanning zero** (the slider's default `[θ_B-27, θ_B+10]` does
+  whenever θ_B < 27°) reverses the scan vector mid-sweep, which re-aligns the
+  crystal and puts the rest of the sweep on a *different* circle.
+  `dms_split_runs` cuts the runs there; without that cut such a run fits a circle
+  wrong by ~0.2 rad.
+- **A θ correction** offsets the exit polar angle *after* the azimuth was solved
+  at the uncorrected angle, shearing the locus slightly off-plane — first order
+  in θcor, ~2e-4 rad at 1° (sub-pixel at a 3000 px detector distance). Each
+  `imcalc` leaves the worst deviation of any run in `circle_residual` (radians;
+  `None` in sweep mode), and the slider reports it in the status line.
+
+A run too short to determine a circle from (fewer than 4 surviving points), or
+one the tolerance `DMS_CIRCLE_TOL` rejects, is kept as the points the sweep
+sampled — switching method can add resolution but never loses a curve.
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `DMS_CURVE_METHODS` | tuple | `('sweep', 'circle')` |
+| `dms_curve_method(name)` | `str` | Normalises a method name (`'circles'`, `'analytic'` → `'circle'`; `None`/`''` → `'sweep'`); raises `ValueError` otherwise |
+| `dms_split_runs(pts, idx, seg=None, ...)` | `list[np.ndarray]` | Splits one reflection's sweep into continuous arcs, cutting on scan-step gaps, large jumps and a change of `seg` (the scan-vector sign) |
+| `dms_fit_arcs(P, runs)` | `(centres, radii, normals, a0, a1, resid)` | Batched exact circle fit, one per run; angles are measured in the `dms_plane_basis` frame and unwrapped within the run, so `a0 → a1` spans the arc the way the sweep traversed it |
+| `dms_plane_basis(n)` | `np.ndarray` (N×3) | Deterministic in-plane axis for a circle of normal `n` — every producer and consumer of an arc must derive it the same way |
+| `dms_arc_points(c, r, n, a0, a1, counts)` | `(pts, counts)` | Tessellates arcs evenly in *angle*, all points concatenated for one batched projection |
+| `dms_arc_points_even(c, r, n, a0, a1, project, ...)` | `(pts, counts)` | Tessellates at even *pixel* spacing along the projected curve — two coarse probe passes (locate the on-image window, then measure it) and one `searchsorted` inversion over all arcs at once |
+| `_on_image_length(r0, c0, r1, c1, shape)` | `np.ndarray` | Liang–Barsky clip: how much of each segment is inside the image, so a probe step that crosses the plate between its endpoints still counts |
+| `dms_circle_curves(vecs, n_steps, n_refs, project, ...)` | `(pts, counts, owner, resid, fallback)` | The whole path: split → fit → size each tessellation from the pixel path it covers on the image → tessellate |
+
+Tests: `DMSAnalysis/tests/test_dms_curves.py` (standalone via
+`python -m DMSAnalysis.tests.test_dms_curves`, or under pytest).
+
+---
+
 ### `class intercepting_vects(...)`
 Finds scattering vectors that intersect the detector for a given set of crystal parameters.
 
@@ -430,12 +507,54 @@ These functions build a stack of binary 2D kernel images, one per predicted mult
 | `roibuilder_ico_hkl(args)` | As `roibuilder_ico` using `dmscalc_ico_hkl` |
 | `roibuilder_ico_x3(args)` | Icosahedral ROI builder with 3 ROIs per reflection |
 
+**Two ROIs per reflection.** `roibuilder_ico_hkl` traces one reflection's line
+and cuts it in half *along itself*: each half becomes its own kernel plane
+(`2*i` and `2*i+1` for reflection `i`, both kept or both dropped). A rigid shift
+of the line moves both halves the same way, but a *rotation* moves them
+oppositely — the pair is what makes the fit sensitive to the line's orientation
+and not only its position.
+
+The locus it starts from is the reflection's on-detector pixels in scan order,
+and it is not always one tidy curve, so the path is prepared in three steps
+(see *Making the pair from a locus that is not one tidy curve* in `CLAUDE.md`):
+
+| Step | Function | Why |
+|------|----------|-----|
+| dedupe | `roi_dedupe_path(pts)` | both psi solutions are in the index, and often trace the same line twice |
+| cut | `roi_split_runs(pts, …)` | the locus can leave the region/plate and come back; the pair is built from the longest run, and extra pieces are reported |
+| draw | `roi_rasterise(path, imshape)` | joins consecutive samples so the kernel is a continuous path, clipped to the image |
+
+The kernel does not depend on how the overlay curve was produced:
+`roibuilder_ico_hkl` builds its own `dmscalc_ico_hkl`, which has no
+`curve_method` — it always comes from the sampled θ-sweep, in both curve modes
+(see *DMS curve method* in `CLAUDE.md`). Kernels are built once and reused
+across the fit.
+
+`dmscalc_ico_hkl` and `dmsfit_ico_hkl` must agree on where a reflection's line
+is, including which θ steps have a physical Ewald solution at all — otherwise
+the ROI is laid along a line the fit is not scored on. Anything touching either
+`imcalc` should be checked against
+`test_roi_kernels.test_the_roi_engine_and_the_fit_engine_find_the_same_lines`.
+
 ---
 
 ### `msroi(img, kernel, width)` / `msroi2(img, kernel, width)`
 Extracts an intensity line profile perpendicular to a kernel streak in an image.
 
 - **Returns:** `(sumvals, roi_coords)` — integrated intensity per slice and corresponding pixel coordinates.
+
+### `roi_outline(kernel, width)`
+Closed `(rows, cols)` outline of the strip `msroi` integrates for one kernel
+plane — the kernel path swept sideways over the same perpendicular offsets, for
+drawing the ROI on the detector image (the slider's **ROIs** overlay toggle).
+Empty arrays for a kernel with no usable direction. Tests:
+`DMSAnalysis/tests/test_roi_outline.py`.
+
+### `roi_walk_path(vs)`
+A kernel plane's pixels back in path order, by walking 8-connected neighbours
+from an end. `np.where` returns them row by row and a curved arc doubles back in
+any detector axis, so neither gives the order the line goes in; `roi_outline`
+needs it or the strip's two edges come out as zigzags.
 
 ---
 

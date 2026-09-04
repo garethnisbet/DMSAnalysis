@@ -17,7 +17,31 @@ python -m DMSAnalysis.dat2config scan.dat out.json --datapoint N --datapoint0 M
 
 The slider is the single interactive app: refine geometry with the sliders, click
 arcs to select reflections, **Build curves** to integrate the ROIs for the checked
-reflections, then **Fit**. `fit.py` is the non-interactive/batch path.
+reflections, then **Fit**. `fit.py` is the non-interactive/batch path. The
+**Curves** combo in the *Fit* box picks how the DMS lines themselves are computed
+— the sampled θ-sweep, or the circles they analytically are (see *DMS curve
+method* below).
+
+Two sets of view toggles, both off by default and neither touching the fit:
+**ROIs** (next to *DMS lines* / *Labels*) outlines the integration strips on the
+detector image — see *The ROI pair* below; and above the integrated-curve grid,
+**Axes** puts ticks on each ROI panel (x is the position across the integration
+width, the units the centres and residual are in; y the integrated intensity),
+**Drag zoom** makes left-drag zoom to a rectangle on a panel instead of panning,
+and **Reset zoom** rescales every panel to its curves and re-enables
+auto-scaling. Left-click still selects a ROI and right-click still assigns its
+centre in either mouse mode.
+
+Missing scan data never stops the slider from opening. If the config's `.dat` or
+its detector image cannot be read (a beamline path that does not exist on this
+machine, data on another disk, …), the app starts on placeholder metadata
+(`slider.fallback_experiment` — lattice from `crystal.initial_guess_base`, energy
+set to put the primary reflection at a 20° Bragg angle) and a blank frame, lists
+what was missing in a startup dialog, and lets the user browse to the real file
+with the Scan loader (**Browse…** → **Load**), which replaces all of it. A scan
+whose `.dat` reads but whose image is absent loads too — metadata is applied and
+the blank frame is kept, noted in the status line. `fit.py` (batch) still fails
+loudly on missing data.
 
 `tripfit.py` is a separate, image-free batch app: it refines a conventional
 lattice by driving the three Kossel lines of one or more secondary-reflection
@@ -82,7 +106,7 @@ Each app reads a JSON config (passed as an argument, or the `configs/` default).
 | `display` | `zoomval` (1 or 2), `colourlim`, `colmap` — image display settings |
 | `roi` | `width_per_zoom`, `comwidth_per_zoom` — ROI extraction widths (scaled by `zoomval`) |
 | `geometry` | `hkl`, `psi`, `px_unscaled`, `py_unscaled` — primary reflection and detector origin |
-| `computation` | `numsteps`, `simsigma_per_zoom`, `thrange_delta`, `bravais`, `pseudocubic_transform` (1–12, conventional only), `opt_method`, `peak_method` (`gauss`/`centroid`), `tolerance` |
+| `computation` | `numsteps`, `simsigma_per_zoom`, `thrange_delta`, `bravais`, `pseudocubic_transform` (1–12, conventional only), `curve_method` (`sweep`/`circle` — see *DMS curve method*), `opt_method`, `peak_method` (`gauss`/`centroid`), `tolerance` |
 | `crystal` | `lattice2`, `initial_guess_base`, `ref_6d` (quasicrystal 6D reflections) **or** `reflist_hkl` (conventional 3-index reflections) — starting parameters and reference reflections |
 | `manual_centres` | Dict of `"roi_index": pixel_position` overrides for poorly fitted ROI centres |
 | `paths` | `cif_file` — path to CIF file used by `loadcif()` |
@@ -95,7 +119,9 @@ Each app reads a JSON config (passed as an argument, or the `configs/` default).
 0        a (lattice parameter, Å)
 1–2      b, c  (unused for icosahedral — cubic constraint applied)
 3–5      alpha, beta, gamma  (unused for icosahedral)
-6–9      psicor, hcor, kcor, lcor  (azimuthal/hkl corrections)
+6–9      psicor, chicor, thcor, lcor  (azimuthal / chi-axis / Bragg-angle
+         corrections; slots 7 and 8 were formerly hcor/kcor, and slot 9 is
+         unused — every branch of imcalc holds the hkl corrections at zero)
 10       detdist (detector distance, pixels; halved and scaled by zoomval at runtime)
 11–13    dxrot, dyrot, dzrot  (detector rotation angles, degrees)
 14       energy offset (added to loaded energy value)
@@ -103,6 +129,138 @@ Each app reads a JSON config (passed as an argument, or the `configs/` default).
 ```
 
 The `bravais` flag selects which subset of indices are passed to the optimiser. For `icosahedral`, parameters [0, 6–9, 10–13, 15–23] (with optional energy) are optimised; lattice parameters 1–5 are locked by symmetry.
+
+## DMS curve method: the sampled sweep, or the circle the cone is
+
+A DMS (Kossel) line comes from **one secondary reflection**: the doubly-diffracted
+radiation leaves the sample along a **cone** of exit directions, all satisfying
+that plane's diffraction condition. A cone of unit vectors is a circle on the
+sphere, so each locus is **exactly a circle** in exit-direction space — the
+θ-scan only samples it. `computation.curve_method` (slider: the **Curves** combo
+in the *Fit* box) picks how that is delivered:
+
+| Method | What the engine draws | What `numsteps` (**Points**) buys |
+|--------|-----------------------|-----------------------------------|
+| `sweep` (default) | the sampled scan points, joined | both the smoothness of the curve *and* where it ends |
+| `circle` | each continuous run reduced to the circle it lies on, re-sampled at ~0.5 px | only where each arc **ends**; the curve between the ends is exact at any resolution |
+
+**It is not a free speedup.** Circle mode runs the whole θ-sweep first (that is
+where the arc ends come from), then fits, measures and re-samples, so at the
+*same* Points it costs 2.5–5x more. The win is at equal *quality* — 40
+conventional reflections over a 1200x1200 plate, worst gap against a 4000-point
+sweep:
+
+| | ms | worst gap |
+|---|---|---|
+| sweep @ 100 | 4.4 | 107 px |
+| **circle @ 100** | **20.0** | **1.0 px** |
+| sweep @ 1000 | 17.8 | 19 px |
+| circle @ 1000 | 43.6 | 1.0 px |
+| sweep @ 4000 | 72.0 | — |
+
+So circles at 100 points cost about what a 1000-point sweep costs and are ~19x
+more faithful, or a third of the 4000-point sweep that would match them. 1.0 px
+is the engine's own whole-pixel rounding — the floor, not a limit of the method.
+The rule is to switch the method *and* drop Points; leaving Points at 1000 just
+makes every overlay update and fit evaluation slower for a curve that was
+already right.
+
+Both the overlay and the fit engine take the setting, so the residual is
+always scored on the curves that are on screen; it is saved in the session, in
+an exported fit config, and read back by `fit.py`. The **ROI kernel** is still
+built from the sampled scan (`roibuilder_ico_hkl`): it only has to lay a path
+along the line, and it is built once and reused.
+
+**The ROIs do not change with the curve method.** Each reflection gets *two*
+ROIs — the builder cuts the line in half along itself and makes each half a
+kernel plane (`2*i`, `2*i+1`). A rigid shift of the line moves both halves
+together; a rotation moves them oppositely, which is where the fit's sensitivity
+to the line's orientation comes from. `roibuilder_ico_hkl` builds its own
+`dmscalc_ico_hkl`, a class with no `curve_method` at all, so in circle mode the
+pair is formed exactly as in sweep mode, from the sampled scan. One consequence
+worth knowing: the kernel path is interpolated between *sampled* points, so
+dropping Points (which circle mode invites) bows the ROI off the arc it is meant
+to follow by the chord sagitta — a few pixels at 100 points, inside a typical
+45 px width but not zero. The slider's **ROIs** overlay toggle draws the strips
+(`ts_quasi.roi_outline`) so this is visible rather than assumed.
+
+### The ROI engine must find the same lines as the fit engine
+
+The ROI builder runs `dmscalc_ico_hkl`; the overlay and the fit run
+`dmsfit_ico_hkl`. The two share the geometry code but *did not* share the
+physical-solution test: the fit engine drops the θ steps where the Ewald
+construction has no solution (`|sin| > 1`, or a negative discriminant), while
+the ROI engine clamped both quantities and so turned every non-physical step
+into a solution. Those invented points form a perfectly smooth curve of their
+own somewhere else on the plate, so the builder could lay a ROI along a line
+that does not exist — on `TestExample.json`, `[-1 1 1]` drew a near-vertical arc
+and got a near-horizontal ROI 835 px away, and `msroi` then integrated whatever
+that strip happened to cross. `dmscalc_ico_hkl.imcalc` now carries the same
+`valid` mask and NaN-drops before the integer cast, as the fit engine does.
+
+A cross-engine check is worth keeping in mind for anything else that touches
+either `imcalc`: the two must put a reflection's line in the same place, and
+`DMSAnalysis/tests/test_roi_kernels.py` asserts it on both a cubic and an
+icosahedral fixture (only the icosahedral one has non-physical steps, so it is
+the one that catches this class of bug).
+
+### Making the pair from a locus that is not one tidy curve
+
+The path the builder is handed is the reflection's on-detector pixels *in scan
+order*, and three things make it messy. Each is handled explicitly, because the
+result is not visible in the fit — only in the ROI curves it is scored on:
+
+* **Both psi solutions are in it.** The engine walks ψ₁ and ψ₂ and concatenates
+  them, and in many geometries they trace the *same* detector line, so the raw
+  index is that line twice over. `roi_dedupe_path` keeps one visit per pixel, in
+  first-seen order.
+* **The locus can be in several pieces** — it leaves the physical region or the
+  plate and comes back. `roi_split_runs` cuts on the gaps (6× the median step,
+  floored at 4 px) and the pair is built from the **longest** run; the build
+  prints which reflections had more than one piece and how much of the index it
+  used.
+* **It is not a function of either detector axis.** A DMS line is an arc, and a
+  curved one doubles back in whichever axis you sort by.
+
+Before this, the builder sorted the whole index by its dominant detector axis,
+cut at the median and ran `interp1d` over each half. All three cases above break
+that: the sort interleaves separate pieces and duplicate branches, and the
+interpolation then wires them together, so a ROI could leave its line and shoot
+hundreds of pixels across the plate. `msroi` integrated whatever that crossed and
+took its perpendicular direction from the ROI's first and last pixel, which for
+such a ROI means nothing — so the affected reflections contributed a meaningless
+curve, and a meaningless centre, to the fit. On the 18-reflection
+`TestExample.json` two reflections were affected; their kernels held jumps of up
+to 830 px.
+
+Also fixed there: the builder passed the *whole* `reflist2` (perpendicular
+components) while passing a single parallel reflection, and `PhasonDistoArray`
+broadcasts, so every ROI was built from N loci instead of one — N identical
+copies for a conventional crystal, N slightly different ones for a quasicrystal,
+each carrying another reflection's phason shift. It now passes row `i` only.
+
+Tests: `DMSAnalysis/tests/test_roi_kernels.py`, and
+`test_roi_outline.py` for the drawn strip.
+
+The engine (`ts_quasi.dms_circle_curves` and friends, ported from the sibling
+`ReciprocalSpaceVisualisation` project's `dms_compute.py`, which does the same
+thing in reciprocal space) leaves the worst deviation of any run from its fitted
+circle in `dmsfit_ico_hkl.circle_residual`; the slider prints it in the status
+line. It is ~1e-13 rad in both lattice modes, at any ψ, with or without phason
+strain or a χ correction. Two things to know:
+
+- **A θ range spanning zero** — the default `[θ_B-27, θ_B+10]` does whenever
+  θ_B < 27° — reverses the scan vector mid-sweep, re-aligning the crystal and
+  putting the rest of the sweep on a *different* circle. The runs are cut there
+  (`dms_split_runs`); without that cut such a run fits a circle wrong by ~0.2 rad.
+- **A θ correction** (slot 8) shears the locus slightly off-plane, first order in
+  θcor (~2e-4 rad at 1°, sub-pixel at a 3000 px detector distance). This is the
+  one case where the circle is not exact, which is why the residual is reported
+  rather than assumed.
+
+A run too short to fit a circle to, or one the tolerance rejects, is kept as the
+points the sweep sampled, so switching method can add resolution but never loses
+a curve. Tests: `DMSAnalysis/tests/test_dms_curves.py`.
 
 ## Conventional crystals
 

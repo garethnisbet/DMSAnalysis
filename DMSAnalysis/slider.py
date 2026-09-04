@@ -31,8 +31,7 @@ tau = 55 / 34.
 
 # ── scan / geometry ────────────────────────────────────────────────────────────
 zoomval   = 1
-numsteps  = 1000
-numsteps_interactive = 300
+numsteps  = 1000          # hkl-scan resolution, shared by every engine
 colourlim = [0, 1000]
 colmap    = 'gray'
 simsigma  = 4.5 * zoomval
@@ -62,7 +61,8 @@ else:
         'display':     {'zoomval': zoomval, 'colourlim': colourlim, 'colmap': colmap},
         'computation': {'numsteps': numsteps,
                         'simsigma_per_zoom': simsigma / max(zoomval, 1),
-                        'thrange_delta': [-27, 10]},
+                        'thrange_delta': [-27, 10],
+                        'curve_method': 'sweep'},
         'flags':       {'save': 0, 'fit': 0, 'firstplot': 0,
                         'detoptimize': 1, 'energyopt': 0, 'autoreflist': 0},
     }
@@ -73,10 +73,62 @@ datapoint  = cfg['scan']['datapoint']
 datapoint0 = cfg['scan']['datapoint0']
 imnum      = datapoint + 1
 
+# ── missing data at startup ────────────────────────────────────────────────────
+# The config's scan folder often does not exist on the machine the slider is run
+# on (a config written at the beamline, data on another disk, …).  That must not
+# stop the GUI from opening: the app starts on placeholder metadata and a blank
+# image, tells the user what is missing, and lets them browse to the real .dat
+# with the Scan loader ("Browse…" → "Load"), which replaces all of it.
+STARTUP_NOTES = []            # human-readable notes about what could not be read
+
+# Pilatus 2M frame, used for the blank stand-in image (rows, cols).
+BLANK_IMAGE_SHAPE = (1679, 1475)
+
+
+def blank_image(shape=BLANK_IMAGE_SHAPE, zoom=1):
+    """An all-zero stand-in for a detector image that could not be read."""
+    return np.zeros((int(shape[0] * zoom), int(shape[1] * zoom)), dtype=np.float32)
+
+
+def fallback_experiment(cfg_, scannum_):
+    """The ``experiment`` block to run on when the .dat cannot be read.
+
+    The lattice comes from the config's initial guess when it has one; the
+    energy is chosen to put the primary reflection at a 20° Bragg angle, so the
+    Ewald-sphere construction is valid and the overlay draws something sane
+    until a real scan is loaded."""
+    lat = [6.461053, 6.461053, 6.461053, 90.0, 90.0, 90.0]
+    try:
+        base = [float(v) for v in cfg_['crystal']['initial_guess_base'][0:6]]
+        if all(v > 0 for v in base):
+            lat = base
+    except (KeyError, TypeError, ValueError, IndexError):
+        pass
+    hkl0 = np.asarray(cfg_.get('geometry', {}).get('hkl', [1, 0, 0]), dtype=float)
+    try:
+        d  = float(np.asarray(ts.dhkl(lat, hkl0).d()).ravel()[0])
+        en = 12.3984187 / (2 * d * np.sin(np.radians(20.0)))
+    except Exception:
+        en = 10.0
+    return {
+        'lattice':        lat,
+        'energy':         en,
+        'energy0':        en,
+        'azir':           list(cfg_.get('geometry', {}).get('azir', [0.0, 0.0, 1.0])),
+        'hkl':            [float(v) for v in np.asarray(hkl0).ravel()],
+        'psi':            float(cfg_.get('geometry', {}).get('psi', 0.0)),
+        'image_template': '%s-pilatus2M-files/%%05d.tif' % scannum_,
+    }
+
+
 exp = cfg.get('experiment')
 if exp is None:
-    exp = dat2config.extract_metadata(
-        os.path.join(scanpath, str(scannum) + '.dat'), datapoint, datapoint0)
+    _dat_path = os.path.join(scanpath, str(scannum) + '.dat')
+    try:
+        exp = dat2config.extract_metadata(_dat_path, datapoint, datapoint0)
+    except Exception as _e:
+        STARTUP_NOTES.append('Scan file not read (%s): %s' % (_dat_path, _e))
+        exp = fallback_experiment(cfg, scannum)
     cfg['experiment'] = exp
 
 lattice    = list(exp['lattice'])
@@ -89,9 +141,20 @@ psi = cfg['geometry']['psi']
 hkl = np.array(cfg['geometry']['hkl'], dtype=float) * energy / energy0
 hklint = np.round(hkl)
 
-im      = imageio.imread(os.path.join(scanpath, imtemplate % imnum))
-im      = ndimage.zoom(im, zoomval, order=3)
+_im_path = os.path.join(scanpath, imtemplate % imnum)
+try:
+    im  = imageio.imread(_im_path)
+    im  = ndimage.zoom(im, zoomval, order=3)
+except Exception as _e:
+    STARTUP_NOTES.append('Detector image not read (%s): %s' % (_im_path, _e))
+    im  = blank_image(zoom=zoomval)
 imdata  = np.copy(im)
+
+# True when both the scan metadata and its image came off disk; False means the
+# app is running on the placeholder above and needs the user to load a scan.
+SCAN_LOADED = not STARTUP_NOTES
+for _note in STARTUP_NOTES:
+    print(_note)
 
 px = cfg['geometry']['px_unscaled'] * zoomval
 py = cfg['geometry']['py_unscaled'] * zoomval
@@ -114,6 +177,12 @@ bravais      = _comp.get('bravais', 'icosahedral')
 # and no phason matrix (reflist2 = 0, phason = 0).
 CONVENTIONAL = bravais in ts.CONVENTIONAL_SYSTEMS
 opt_method   = _comp.get('opt_method', 'COBYLA')
+# How the DMS curves are computed from the hkl scan: 'sweep' (the sampled scan
+# points are the curve — the original) or 'circle' (each continuous run is
+# reduced to the circle it analytically lies on and re-sampled at detector
+# resolution, so Points only has to locate where each arc *ends*).  Same option,
+# same two names, as the sibling ReciprocalSpaceVisualisation viewer.
+curve_method = ts.dms_curve_method(_comp.get('curve_method', 'sweep'))
 # Peak-position method for the raw and simulated ROI curves: 'gauss' (Gaussian
 # curve fit) or 'centroid' (centre of mass).
 peak_method  = _comp.get('peak_method', 'gauss')
@@ -547,6 +616,7 @@ def make_overlay_dms(reflist_, reflist2_, hkl_, imdata_, psirange_, thrange_,
     # setLattice supplies the fixed lattice used by the 'icosahedral_fixed_a'
     # branch; harmless for the other modes.
     dms.setLattice(list(np.asarray(ig, dtype=float)[:6]))
+    dms.setCurveMethod(curve_method)
     if CONVENTIONAL:
         # The conventional engine reads the constrained lattice and the unrefined
         # parameters from the full guess vector.
@@ -797,7 +867,11 @@ class UpdateWorker(QtCore.QThread):
                     sel_lines = [(np.copy(x), np.copy(y))
                                  for x, y in (getattr(sel_dms, 'dmslines', None) or [])]
 
-                self.done.emit('discovery', (rows, cols, disc_lines, sel_lines))
+                # Worst deviation of any run from the circle fitted to it, in
+                # circle mode (None in sweep mode).  Reported rather than hidden:
+                # it is machine precision unless the theta correction is non-zero.
+                resid = getattr(dms_ref, 'circle_residual', None)
+                self.done.emit('discovery', (rows, cols, disc_lines, sel_lines, resid))
             except Exception as e:
                 print('UpdateWorker error:', e)
             finally:
@@ -1049,6 +1123,7 @@ class BuildWorker(QtCore.QThread):
         self._numsteps    = numsteps
         self._width       = width
         self._simsigma    = simsigma
+        self._curve_method = curve_method
 
     def run(self):
         try:
@@ -1110,9 +1185,18 @@ class BuildWorker(QtCore.QThread):
             fit_dms.setCalLattice(ig[:6].tolist())
             fit_dms.setLattice(ig[:6].tolist())
             fit_dms.setPeakMethod(self._peak_method, ts.AUTO_DOUBLET_SIG)
+            # The simulated image the fit is scored on is drawn by the same
+            # curve method as the overlay, so the residual describes the curves
+            # on screen.
+            fit_dms.setCurveMethod(self._curve_method)
             if CONVENTIONAL:
                 fit_dms.setIGFull(ig)
-            fit_dms.hkllistrange[2] = numsteps_interactive
+            # Left at hkllistrange_fit's numsteps — the resolution the fit
+            # scores at.  This engine produces both the live residual readout
+            # and the objective, so a coarser setting here would put the number
+            # on screen on a different footing from the one Fit reports (and
+            # only until the Points spinbox pushed numsteps back in, which made
+            # the readout change yardstick mid-session).
             try:
                 fit_dms.imcalc(extract_reduced(ig))
             except Exception:
@@ -1130,6 +1214,9 @@ class BuildWorker(QtCore.QThread):
                 'centres':          centres,
                 'override_rois':    override_rois,
                 'fit_dms':          fit_dms,
+                # The width these ROIs were integrated at (the spinbox may move
+                # before the next build); the ROI overlay draws with it.
+                'width':            self._width,
             })
         except Exception as e:
             self.error.emit(str(e))
@@ -1185,6 +1272,9 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._datapoint0     = datapoint0
         self._imtemplate     = imtemplate
         self._pending_scan_path = scanpath + str(scannum) + '.dat'
+        # False while running on the placeholder metadata/blank image (the
+        # config's scan folder was not readable); set True by _do_load_scan.
+        self._scan_loaded    = SCAN_LOADED
         self._initial_guess  = initial_guess.copy()
         self._en_scan        = energy        # raw scan energy (no user offset)
         self._cfg            = cfg           # live config (shown in the Config table)
@@ -1214,6 +1304,13 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._build_overrides = {}   # overrides handed to the in-flight build
         self._fit_dms       = None
         self._kernel        = None
+        # Integration width the current kernel was integrated at (snapshotted by
+        # the build).  The ROI overlay draws with this, not the live spinbox, so
+        # the boxes on screen are the ones the curves came out of until the user
+        # rebuilds.
+        self._kernel_width  = width
+        # Outline items of the "ROIs" overlay toggle
+        self._roi_overlay_items = []
         self._centres       = None
         self._linedatax     = None
         self._linedatay     = None
@@ -1257,8 +1354,12 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._build_ui()
         self._update_img_scrub_range()
         self._do_update()
-        # Offer to restore the previous session once the event loop is running.
-        QtCore.QTimer.singleShot(0, self._maybe_restore_session)
+        if not self._scan_loaded:
+            self._status.setText('No scan data loaded — use Browse… then Load '
+                                 'in the Scan loader')
+        # Offer to restore the previous session once the event loop is running,
+        # then (if there is still no data) point the user at the scan loader.
+        QtCore.QTimer.singleShot(0, self._startup_tasks)
 
     # ── UI ─────────────────────────────────────────────────────────────────────
 
@@ -1441,14 +1542,46 @@ class DMSSlider(QtWidgets.QMainWindow):
         fitl.setSpacing(4)
         fitl.setContentsMargins(4, 4, 4, 4)
 
+        # How the DMS curves are computed from the hkl scan (curve_method
+        # global).  Sits above Points because it changes what Points buys.
+        _cm_lbl = QtWidgets.QLabel('Curves')
+        _cm_lbl.setToolTip(
+            'How each DMS curve is computed from the hkl scan.\n\n'
+            'θ-sweep (sampled): the scanned points are the curve, so Points sets '
+            'both its smoothness and where it ends — a coarse scan gives '
+            'faceted, gappy lines.\n\n'
+            'circles (analytic): a DMS locus is a cone of exit directions, i.e. '
+            'exactly a circle; each continuous run is reduced to the circle it '
+            'lies on and re-drawn at sub-pixel spacing. Points then only locates '
+            'where each arc ends, so it can be run far coarser for smoother '
+            'curves and a cleaner simulated image.')
+        self._curve_combo = QtWidgets.QComboBox()
+        self._curve_combo.addItem('θ-sweep (sampled)', 'sweep')
+        self._curve_combo.addItem('circles (analytic)', 'circle')
+        self._curve_combo.setCurrentIndex(self._curve_combo.findData(curve_method))
+        self._curve_combo.setToolTip(_cm_lbl.toolTip())
+        self._curve_combo.currentIndexChanged.connect(self._on_curve_method_changed)
+        fitl.addWidget(_cm_lbl, 0, 0)
+        fitl.addWidget(self._curve_combo, 0, 1)
+
         # Number of points along the integrated curves (hkl scan resolution).
         # Drives Build curves and the final fit (numsteps global).
         _pts_lbl = QtWidgets.QLabel('Points')
-        _pts_lbl.setToolTip('Number of points sampled along each integrated curve '
-                            '(hkl scan resolution used by Build curves and the fit)')
+        _pts_lbl.setToolTip(
+            'Number of points sampled along each integrated curve (hkl scan '
+            'resolution used by Build curves and the fit).\n\n'
+            'The floor is 2 — the scan interpolates between the ends of the θ '
+            'range, so two points is the least that is still a scan. Values '
+            'that low are only useful with the circles curve method, where the '
+            'scan locates the ends of each arc rather than drawing it; note a '
+            'run needs 4 surviving points before a circle can be fitted to it, '
+            'below which it falls back to the sampled points.')
         self._sb_numsteps = QtWidgets.QSpinBox()
-        self._sb_numsteps.setRange(50, 20000)
-        self._sb_numsteps.setSingleStep(50)
+        self._sb_numsteps.setRange(2, 20000)
+        # 10 rather than 50: the useful range with circles is tens of points, and
+        # a 50-step could not reach it (from 100 the next step down was the old
+        # floor).  Larger values are typed rather than stepped to.
+        self._sb_numsteps.setSingleStep(10)
         self._sb_numsteps.setValue(int(numsteps))
         self._sb_numsteps.setToolTip(_pts_lbl.toolTip())
         self._sb_numsteps.valueChanged.connect(self._on_numsteps_changed)
@@ -1743,14 +1876,29 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._chk_labels_sel_only.setEnabled(False)   # enabled with Labels
         self._chk_labels_sel_only.setToolTip('Label only the selected reflection '
                                              'arcs, not the auto discovery slice.')
-        for _c in (self._chk_dms_lines, self._chk_labels, self._chk_labels_sel_only):
+        # ROIs: draw the integration strips the built curves came out of — the
+        # two per reflection (each half of its DMS line), in the reflection's own
+        # colour, the first half solid and the second dashed.
+        self._chk_show_rois = QtWidgets.QCheckBox('ROIs')
+        self._chk_show_rois.setChecked(False)
+        self._chk_show_rois.setToolTip(
+            'Outline the ROIs the integrated curves are taken from: two per '
+            'reflection (the two halves of its DMS line, which is what makes '
+            'the fit sensitive to a rotation of the line), drawn in that '
+            "reflection's colour — first half solid, second dashed. Needs "
+            'Build curves; the outlines show the width they were integrated '
+            'at, so they follow a width change only after a rebuild.')
+        for _c in (self._chk_dms_lines, self._chk_labels, self._chk_labels_sel_only,
+                   self._chk_show_rois):
             _f = _c.font(); _f.setPointSize(7); _c.setFont(_f)
         self._chk_labels.toggled.connect(self._on_labels_toggled)
         self._chk_labels_sel_only.toggled.connect(
             lambda _=None: self._refresh_overlay_labels())
+        self._chk_show_rois.toggled.connect(self._on_show_rois_toggled)
         lbl_row.addWidget(self._chk_dms_lines)
         lbl_row.addWidget(self._chk_labels)
         lbl_row.addWidget(self._chk_labels_sel_only)
+        lbl_row.addWidget(self._chk_show_rois)
         lbl_row.addStretch()
         arc_box_l.addLayout(lbl_row)
         ctrl_col2.addWidget(arc_box, 1)   # selected-reflections list expands
@@ -1871,6 +2019,41 @@ class DMSSlider(QtWidgets.QMainWindow):
         roi_w = QtWidgets.QWidget()
         roi_col = QtWidgets.QVBoxLayout(roi_w)
         roi_col.setContentsMargins(2, 2, 2, 2)
+        # View options for the ROI panels, over the panels they act on.  Both
+        # toggles are off by default: the panels are small and there are a lot of
+        # them, so ticks would take more room than the curve, and left-drag stays
+        # panning until asked otherwise.  This pane is the narrowest of the
+        # three, so it carries a minimum width — without one the row is the first
+        # thing clipped when the splitter is dragged left or the window is small.
+        roi_w.setMinimumWidth(300)
+        roi_opt_row = QtWidgets.QHBoxLayout()
+        roi_opt_row.setContentsMargins(2, 0, 2, 0)
+        roi_opt_row.setSpacing(6)
+        self._chk_roi_axes = QtWidgets.QCheckBox('Axes')
+        self._chk_roi_axes.setToolTip(
+            'Show the axes on each ROI panel: x is the position across the '
+            'integration width (the units the ROI centres and the residual are '
+            'in), y the integrated intensity.')
+        self._chk_roi_axes.toggled.connect(self._on_roi_axes_toggled)
+        self._chk_roi_zoom = QtWidgets.QCheckBox('Drag zoom')
+        self._chk_roi_zoom.setToolTip(
+            'Left-drag a rectangle on a ROI panel to zoom into it (off: '
+            'left-drag pans).  Either way the scroll wheel zooms, left-click '
+            'still selects the ROI and right-click still assigns its centre.')
+        self._chk_roi_zoom.toggled.connect(self._on_roi_zoom_toggled)
+        self._btn_roi_reset = QtWidgets.QPushButton('Reset zoom')
+        self._btn_roi_reset.setToolTip(
+            'Rescale every ROI panel to its curves and re-enable auto-scaling, '
+            'so later updates keep fitting the panel.')
+        self._btn_roi_reset.clicked.connect(self._on_roi_reset_zoom)
+        for _w in (self._chk_roi_axes, self._chk_roi_zoom, self._btn_roi_reset):
+            _f = _w.font(); _f.setPointSize(7); _w.setFont(_f)
+        roi_opt_row.addWidget(self._chk_roi_axes)
+        roi_opt_row.addWidget(self._chk_roi_zoom)
+        roi_opt_row.addWidget(self._btn_roi_reset)
+        roi_opt_row.addStretch()
+        roi_col.addLayout(roi_opt_row)
+
         self._roi_grid = pg.GraphicsLayoutWidget()
         self._roi_grid.scene().sigMouseClicked.connect(self._on_roi_grid_clicked)
         roi_col.addWidget(self._roi_grid, 1)
@@ -2203,7 +2386,7 @@ class DMSSlider(QtWidgets.QMainWindow):
                             'discovery', sel, self._sel_last_hkl)
 
     def _on_update_done(self, mode, payload):
-        rows, cols, disc_lines, sel_lines = payload
+        rows, cols, disc_lines, sel_lines, circle_resid = payload
         # Discovery scatter + per-reflection lines (cached for click-to-select).
         self._dms_scatter.setData(x=cols, y=rows)
         self._discovery_lines = disc_lines
@@ -2220,7 +2403,18 @@ class DMSSlider(QtWidgets.QMainWindow):
                 arc.setData(x=[], y=[])
         self._refresh_overlay_labels()
         self._maybe_update_live_curves()
-        self._status.setText('Ready')
+        self._status.setText(self._ready_text(circle_resid))
+
+    def _ready_text(self, circle_resid):
+        """Status line after an overlay update.  In circle mode it carries the
+        worst deviation of any run from the circle fitted to it — in radians of
+        arc and in the pixels that comes to at the current detector distance, so
+        "is the analytic curve still exact?" is answerable at a glance.  It is at
+        machine precision unless a theta correction is being refined."""
+        if circle_resid is None:
+            return 'Ready'
+        return 'Ready   circles: max deviation %.1e rad (%.3g px)' % (
+            circle_resid, circle_resid * float(self.ig[10]))
 
     # ── Overlay visibility ─────────────────────────────────────────────────────
 
@@ -2318,6 +2512,68 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._chk_labels_sel_only.setEnabled(checked)
         self._refresh_overlay_labels()
         self._status.setText('Overlay labels on' if checked else 'Overlay labels off')
+
+    # ── ROI outlines on the image ──────────────────────────────────────────────
+
+    def _ref_colour(self, j, sel_arcs=None):
+        """Colour of reflection `j` of the built set — the colour of its arc on
+        the image, so the ROI outlines, the arcs and the integrated-curve panels
+        all agree.  Falls back to an HSV ramp for an arc with no cached colour.
+        `sel_arcs` is the checked-arc list, passed in by a caller colouring a
+        whole set so the list widget is only walked once."""
+        if sel_arcs is None:
+            sel_arcs, _ = self._selected_arcs()
+        if j < len(sel_arcs) and getattr(sel_arcs[j], '_colour', None) is not None:
+            return sel_arcs[j]._colour
+        nref = len(self._reflist_fit) if self._reflist_fit is not None else 1
+        return pg.hsvColor(j / max(nref, 1), 0.85, 0.95, 0.85)
+
+    def _refresh_roi_overlay(self):
+        """(Re)draw the ROI outlines on the detector image.
+
+        One outline per kernel plane, i.e. **two per reflection**: the ROI
+        builder splits each DMS line at its midpoint, and it is that pair —
+        moving in opposite senses when the line rotates — that gives the fit its
+        sensitivity to a rotation rather than only to a translation.  The pair is
+        drawn in the reflection's own colour, the first half solid and the second
+        dashed, so the split is readable where the two halves nearly touch.
+
+        Drawn at the width the kernel was *integrated* at, not the live Width
+        spinbox: until Build curves runs again the curves on the right still come
+        from the old strips, and drawing the new width would show a region no
+        curve was taken from."""
+        for it in self._roi_overlay_items:
+            self._vb.removeItem(it)
+        self._roi_overlay_items = []
+        chk = getattr(self, '_chk_show_rois', None)
+        if chk is None or not chk.isChecked() or self._kernel is None:
+            return
+        w = float(getattr(self, '_kernel_width', width))
+        sel_arcs, _ = self._selected_arcs()
+        for i in range(self._kernel.shape[2]):
+            try:
+                rows, cols = ts.roi_outline(self._kernel[:, :, i], w)
+            except Exception:
+                continue
+            if np.size(rows) == 0:
+                continue
+            col = pg.mkColor(self._ref_colour(i // 2, sel_arcs))
+            col.setAlpha(200)
+            pen = pg.mkPen(col, width=1,
+                           style=(QtCore.Qt.SolidLine if i % 2 == 0
+                                  else QtCore.Qt.DashLine))
+            item = pg.PlotDataItem(x=cols, y=rows, pen=pen, connect='all')
+            item.setZValue(15)          # above the arcs, below the hkl labels
+            self._vb.addItem(item)
+            self._roi_overlay_items.append(item)
+
+    def _on_show_rois_toggled(self, checked):
+        self._refresh_roi_overlay()
+        if checked and self._kernel is None:
+            self._status.setText('No ROIs yet — Build curves to create them')
+        else:
+            self._status.setText('ROI outlines shown' if checked
+                                 else 'ROI outlines hidden')
 
     def _maybe_update_live_curves(self):
         """When 'Live Curve' is on, recompute the ROI integrated curves at the
@@ -3046,6 +3302,15 @@ class DMSSlider(QtWidgets.QMainWindow):
         if (_pc_new != self._pc_idx and CONVENTIONAL
                 and 1 <= _pc_new <= len(ts.PSEUDOCUBIC_TRANSFORMS)):
             self._pc_combo.setCurrentIndex(_pc_new - 1)
+        # A computation.curve_method edit switches through the combo, whose
+        # handler pushes the method into every engine.
+        try:
+            _cm_new = ts.dms_curve_method(
+                new_cfg.get('computation', {}).get('curve_method', curve_method))
+        except ValueError:
+            _cm_new = curve_method
+        if _cm_new != curve_method:
+            self._curve_combo.setCurrentIndex(self._curve_combo.findData(_cm_new))
         self._rebuild_dms_slice()
         self._rebuild_selected_engine()   # psi/px/py are baked into the engine
         self._do_update()
@@ -3117,7 +3382,7 @@ class DMSSlider(QtWidgets.QMainWindow):
                 fit_result.update(self._last_fit_info)
 
         return {
-            'version':        2,
+            'version':        3,
             'bravais':        bravais,   # crystal type (Ico / conventional system)
             # active pseudo-cubic re-indexing matrix (hkl/ref_6d are stored
             # already re-indexed; restore sets the bookkeeping only)
@@ -3139,6 +3404,10 @@ class DMSSlider(QtWidgets.QMainWindow):
             'ref_6d_checked': ref_6d_checked,
             'manual_centres': manual_centres,
             'peak_method':    self._peak_method,
+            # how the DMS curves are computed ('sweep' / 'circle') — it changes
+            # the simulated image, so a restored session must fit on the same
+            # construction it was saved on
+            'curve_method':   curve_method,
             # whether "Build curves" had been run, so a restore can rebuild the
             # ROI grid (and re-apply manual_centres) without a manual click
             'curves_built':   self._centres is not None,
@@ -3340,6 +3609,22 @@ class DMSSlider(QtWidgets.QMainWindow):
                 self._peak_combo.setCurrentIndex(self._peak_combo.findData(pm))
                 self._suppress = False
 
+        # 4.5 Restore the DMS curve method, before the rebuild in step 6 so the
+        #     curves come back on the construction the session was fitted on.
+        #     Sessions written before this option existed have no key and stay
+        #     on the sampled sweep, which is what they were computed with.
+        global curve_method
+        try:
+            cm = ts.dms_curve_method(data.get('curve_method', 'sweep'))
+        except ValueError:
+            cm = 'sweep'
+        curve_method = cm
+        if getattr(self, '_curve_combo', None) is not None:
+            self._suppress = True
+            self._curve_combo.setCurrentIndex(self._curve_combo.findData(cm))
+            self._suppress = False
+        self._apply_curve_method()
+
         # 5. Stash manual centre overrides and fit result.  Centre overrides are
         #    applied the next time "Build curves" rebuilds the ROI centres.
         self._pending_centre_overrides = {
@@ -3437,9 +3722,21 @@ class DMSSlider(QtWidgets.QMainWindow):
 
     # ── Scan loading ───────────────────────────────────────────────────────────
 
+    def _browse_start_dir(self):
+        """A directory the file dialog can actually open in: the current scan
+        folder if it exists (it may not — the config can name a beamline path
+        that is not on this machine), else the folder of the pending scan file,
+        else the working directory."""
+        for d in (self._scanpath,
+                  os.path.dirname(str(self._pending_scan_path or '')),
+                  os.getcwd()):
+            if d and os.path.isdir(d):
+                return d
+        return os.getcwd()
+
     def _on_browse_scan(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, 'Open scan file', self._scanpath,
+            self, 'Open scan file', self._browse_start_dir(),
             'DAT files (*.dat);;All files (*)')
         if not path:
             return
@@ -3599,11 +3896,17 @@ class DMSSlider(QtWidgets.QMainWindow):
         imtmpl    = exp['image_template']
         imnum_new = dp + 1
 
+        # A missing/unreadable image is not fatal: the scan metadata is still
+        # worth loading (geometry, lattice, energy all come from the .dat), so
+        # fall back to a blank frame and say so in the status line.
+        img_note = ''
         try:
             im_new = imageio.imread(scan_dir + imtmpl % imnum_new)
             im_new = ndimage.zoom(im_new, zoomval, order=3)
         except Exception as e:
-            raise RuntimeError('Cannot load image %s: %s' % (imtmpl % imnum_new, e))
+            im_new = blank_image(zoom=zoomval)
+            img_note = '  (image %s not read: %s)' % (imtmpl % imnum_new, str(e)[:40])
+            print('Cannot load image %s: %s' % (imtmpl % imnum_new, e))
 
         imdata_new = np.copy(im_new)
 
@@ -3795,6 +4098,7 @@ class DMSSlider(QtWidgets.QMainWindow):
                     'simsigma_per_zoom': simsigma / max(zoomval, 1),
                     'thrange_delta': [-27, 10],
                     'bravais': bravais,
+                    'curve_method': curve_method,
                     'opt_method': 'COBYLA',
                     'tolerance': 1e-6,
                     'intensity': 1, 'threshold': 0, 'n_parallel_starts': 1,
@@ -3857,6 +4161,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         cfg['computation']['numsteps']       = numsteps
         cfg['computation']['simsigma_per_zoom'] = float(simsigma / max(zoomval, 1))
         cfg['computation']['peak_method']    = self._peak_method
+        # fit.py reads this, so a batch run reproduces the curves the slider fitted
+        cfg['computation']['curve_method']   = curve_method
         # The exported hkl / azir / reflections are already in the active
         # pseudo-cubic indexing — the consumer must not re-apply the matrix.
         cfg['computation']['pseudocubic_transform'] = 1
@@ -4071,12 +4377,17 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._ref_6d_fit        = res['ref_6d_fit']
         self._hkllistrange_fit  = res['hkllistrange_fit']
         self._kernel            = res['kernel']
+        self._kernel_width      = res.get('width', width)
         self._imcoeffs          = res['imcoeffs']
         self._linedatax         = res['linedatax']
         self._linedatay         = res['linedatay']
         self._centres           = res['centres']
         self._centre_override_rois = res['override_rois']
         self._fit_dms           = res['fit_dms']
+        # The build snapshotted numsteps when it started; if the Points spinbox
+        # moved while it ran, the engine would score at the old resolution while
+        # Fit uses the current one.  Same reason _do_fit re-pushes it.
+        self._fit_dms.hkllistrange[2] = numsteps
 
         self._init_line_plot()
         # ROIs whose experimental peak could not be located have no target and
@@ -4110,30 +4421,31 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._exp_centre_lines, self._sim_centre_lines = [], []
         self._roi_plots = []
         self._selected_roi = None
+        # The ROI outlines on the image follow the kernel, which has just been
+        # installed (or cleared).
+        self._refresh_roi_overlay()
         if self._kernel is None:
             return
         n        = self._kernel.shape[2]
         ncols    = self._cfg.get('display', {}).get('subcellsy', 4)
-        nref     = len(self._reflist_fit)
         show_num = self._cfg.get('flags', {}).get('show_numbers', 1)
-        # Colour each reflection's sim curve to match its on-image DMS line/arc.
-        # Checked arcs are in the same order as self._ref_6d_fit, so refnum indexes
-        # both.  Fall back to the HSV ramp if an arc has no cached colour.
+        # Colour each reflection's sim curve to match its on-image DMS line/arc
+        # (and its ROI outline).  Checked arcs are in the same order as
+        # self._ref_6d_fit, so refnum indexes both.
         sel_arcs, _ = self._selected_arcs()
-        def _ref_colour(j):
-            if j < len(sel_arcs) and getattr(sel_arcs[j], '_colour', None) is not None:
-                return sel_arcs[j]._colour
-            return pg.hsvColor(j / max(nref, 1), 0.85, 0.95, 0.85)
+        _ref_colour = lambda j: self._ref_colour(j, sel_arcs)
         refnum, roicount = 0, 0
         for i in range(n):
             r, c = divmod(i, ncols)
             pl = self._roi_grid.addPlot(row=r, col=c)
             pl.setMenuEnabled(False); pl.hideButtons()
-            pl.hideAxis('left'); pl.hideAxis('bottom')
             pl.setDefaultPadding(0.05)
             if self._ref_6d_fit is not None and refnum < len(self._ref_6d_fit):
-                lbl = ('%d: %s' % (i, list(self._ref_6d_fit[refnum])) if show_num
-                       else str(list(self._ref_6d_fit[refnum])))
+                # Formatted, not str(list(...)): a list of numpy scalars renders
+                # as '[np.int64(1), np.int64(0), ...]' under numpy 2.  This is
+                # also the format the overlay labels and the reflection list use.
+                ref_txt = self._ref_label_text(self._ref_6d_fit[refnum])
+                lbl = ('%d: %s' % (i, ref_txt)) if show_num else ref_txt
             else:
                 lbl = str(i)
             pl.setTitle(lbl, size='7pt')
@@ -4152,8 +4464,62 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._exp_centre_lines.append(exp_cl)
             self._sim_centre_lines.append(sim_cl)
             self._roi_plots.append(pl)
+        # Axes / mouse mode for the panels just created (they are rebuilt on
+        # every build, so the toggles are re-applied here rather than remembered
+        # per panel).
+        self._apply_roi_panel_view()
         self._draw_exp_lines()
         self._try_draw_sim_lines()
+
+    def _apply_roi_panel_view(self):
+        """Push the ROI-panel view options onto every panel: axes shown or not,
+        and left-drag zooming a rectangle or panning."""
+        show_axes = (getattr(self, '_chk_roi_axes', None) is not None
+                     and self._chk_roi_axes.isChecked())
+        rect_zoom = (getattr(self, '_chk_roi_zoom', None) is not None
+                     and self._chk_roi_zoom.isChecked())
+        tick_font = QtGui.QFont()
+        tick_font.setPointSize(6)
+        for pl in self._roi_plots:
+            for name in ('left', 'bottom'):
+                ax = pl.getAxis(name)
+                # A fixed tick-label allowance keeps the panels the same size as
+                # each other whatever their y scale; without it a panel whose
+                # counts run to six figures is drawn narrower than its
+                # neighbours.
+                ax.setStyle(tickFont=tick_font, tickTextOffset=2,
+                            autoExpandTextSpace=False)
+                if name == 'left':
+                    ax.setWidth(42)
+                pl.showAxis(name, show_axes)
+            pl.vb.setMouseMode(pg.ViewBox.RectMode if rect_zoom
+                               else pg.ViewBox.PanMode)
+
+    def _on_roi_axes_toggled(self, checked):
+        self._apply_roi_panel_view()
+        self._status.setText('ROI panel axes on' if checked
+                             else 'ROI panel axes off')
+
+    def _on_roi_zoom_toggled(self, checked):
+        self._apply_roi_panel_view()
+        self._status.setText(
+            'ROI panels: left-drag zooms to a rectangle (Reset zoom to undo)'
+            if checked else 'ROI panels: left-drag pans')
+
+    def _on_roi_reset_zoom(self):
+        """Undo any zooming/panning of the ROI panels and put them back on
+        auto-scale, so the next curve update fits the panel again."""
+        if not self._roi_plots:
+            self._status.setText('No ROI curves yet — Build curves first')
+            return
+        for pl in self._roi_plots:
+            pl.vb.autoRange()
+            # After enableAutoRange, not before: autoRange() goes through
+            # setRange(), which turns auto-scaling back off, so doing it the
+            # other way round rescales once and then leaves the panel frozen at
+            # that range for every later curve update.
+            pl.vb.enableAutoRange(pg.ViewBox.XYAxes, True)
+        self._status.setText('ROI panels rescaled to their curves')
 
     def _draw_exp_lines(self):
         for i, curve in enumerate(self._exp_curves):
@@ -4333,6 +4699,28 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._fit_dms.setPeakMethod(self._peak_method, ts.AUTO_DOUBLET_SIG)
         if self._kernel is not None and not self._fitting:
             self._on_build_curves()
+
+    def _on_curve_method_changed(self, _idx=None):
+        """Switch how the DMS curves are computed from the hkl scan.  Every live
+        engine takes the new method (the overlay, the clicked-arc tracer and the
+        fit engine), so the drawn curves, the simulated image and the residual
+        all describe the same construction — the alternative would be a fit
+        scored against curves the screen is not showing."""
+        if self._suppress:
+            return
+        global curve_method
+        curve_method = ts.dms_curve_method(self._curve_combo.currentData())
+        self._apply_curve_method()
+        self._do_update()
+        self._maybe_update_live_curves()
+        self._status.setText(
+            'Curves: %s' % self._curve_combo.currentText())
+
+    def _apply_curve_method(self):
+        """Push the active curve method into every engine that draws or scores."""
+        for eng in (self._dms, self._dms_full, self._sel_dms, self._fit_dms):
+            if eng is not None:
+                eng.setCurveMethod(curve_method)
 
     def _on_numsteps_changed(self, value):
         """Update the point count (hkl scan resolution) used for the live image
