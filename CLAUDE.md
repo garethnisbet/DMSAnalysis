@@ -370,14 +370,15 @@ twice.
 A completed fit in the slider writes, without being asked,
 
 ```
-Processing/<scannum>_dp<datapoint>_<YYYYMMDD-HHMMSS>/
+Processing/<scannum>_dp<datapoint>_<YYYYMMDD-HHMMSS>_<method>/
     Result.txt              # the solution, and the recipe to rerun it
     IM_<scan>_dp<dp>.png    # the detector image with the DMS lines over it
     PLOT_<scan>_dp<dp>.svg  # the integrated ROI curves, as vector art
 ```
 
 Seconds are in the stamp because a fit takes seconds: two fits in one minute
-must not share a folder. The record is written *after* the post-fit curve
+must not share a folder. The method comes last, as in `fit.py`'s batch
+directories, so a scan's runs still sort chronologically. The record is written *after* the post-fit curve
 rebuild lands (`_flush_fit_snapshot`, called from `_on_build_done`), so the
 curves in the SVG are the refined ones, not the ones the fit started from; if
 that rebuild never starts or fails, it is written immediately instead. The
@@ -398,6 +399,16 @@ The SVG is drawn with matplotlib (`Figure` + `FigureCanvasSVG` directly — no
 pyplot, which would pull a second GUI backend into the running Qt app) from the
 same arrays the on-screen panels hold, sharing `sim_curve_scale` with
 `_draw_sim_lines` so the exported curves cannot drift from the drawn ones.
+
+**No Fit.** The last entry in the algorithm combo (`NoFit`) runs no optimiser:
+**Fit** scores and renders the geometry currently on the sliders and writes its
+run record, so the current guess can be exported — overlay, curves, Result.txt —
+without refining anything. It needs no enabled fit parameters, `Result.txt`
+says `no optimiser ran — the guess below was scored as-is` and lists what
+*would* have been refined, and the folder is tagged `…_NoFit` like any other
+method. In `FitWorker` it is a branch that skips straight to the final
+scoring/rendering the optimising paths end in, so the result dict it emits is
+the same shape as a real fit's.
 
 **Save fit snapshot → Processing** writes the same three files again in a folder
 of its own, plus the reproducibility extras the manual save always had:

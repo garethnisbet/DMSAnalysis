@@ -195,12 +195,17 @@ detoptimize  = _flags.get('detoptimize', 1)
 energyopt    = _flags.get('energyopt', 0)
 strat        = ts.DE_Strategy['best1exp']
 
+# 'NoFit' runs no optimiser: Fit then just scores and renders the geometry on
+# the sliders, and writes the run record for it — the way to export the current
+# guess (overlay, curves, Result.txt) without refining anything.
 algo_display = ['COBYLA', 'Nelder-Mead', 'Powell', 'L-BFGS-B', 'TNC',
                 'BH+Powell', 'BH+COBYLA', 'BH+NelderMead',
-                'Diff. Evolution', 'Dual Annealing', 'Least-Sq (TRF)']
+                'Diff. Evolution', 'Dual Annealing', 'Least-Sq (TRF)',
+                'No Fit (evaluate + save)']
 algo_methods = ['COBYLA', 'Nelder-Mead', 'Powell', 'L-BFGS-B', 'TNC',
                 'BHPowell', 'BHCOBYLA', 'BHNelderMead',
-                'GA', 'DualAnnealing', 'LSQ']
+                'GA', 'DualAnnealing', 'LSQ',
+                'NoFit']
 
 def _ref_pen(j, n, width=1.5):
     return pg.mkPen(pg.hsvColor(j / max(n, 1), 0.85, 0.95, 0.85), width=width)
@@ -988,7 +993,14 @@ class FitWorker(QtCore.QThread):
             from scipy.optimize import (minimize, differential_evolution,
                                         basinhopping, dual_annealing, least_squares)
             from joblib import Parallel, delayed
-            if cur == 'GA':
+            res = None
+            if cur == 'NoFit':
+                # No optimiser: fall through to the scoring/rendering below with
+                # the initial guess as the only candidate, so the caller gets a
+                # complete result (residual, simulated image, dmsindex) for the
+                # geometry currently on the sliders.
+                pass
+            elif cur == 'GA':
                 res = differential_evolution(obj, zbnds, strategy=strat,
                                              polish=not ev.is_set(), workers=1,
                                              callback=_cb_check)
@@ -1073,8 +1085,9 @@ class FitWorker(QtCore.QThread):
             # so take whichever of the reported result and the tracked best
             # actually scores lower, re-scored here so the comparison is
             # against the value the caller will be shown.
-            z_res  = np.asarray(res.x, dtype=float)
-            cand   = [obj.to_x(z_res)]
+            cand   = []
+            if res is not None:
+                cand.append(obj.to_x(np.asarray(res.x, dtype=float)))
             if obj.best_x() is not None:
                 cand.append(obj.best_x())
             cand.append(x0)                      # the initial guess itself
@@ -5158,13 +5171,15 @@ class DMSSlider(QtWidgets.QMainWindow):
         # Which reduced-vector positions are enabled by the per-slider checkboxes.
         enabled = {idx: self._sliders[label].is_fit_enabled()
                    for label, idx, *_ in slider_defs if isinstance(idx, int)}
-        free = [p for p, s in enumerate(slots) if enabled.get(s, True)]
-        if not free:
+        free    = [p for p, s in enumerate(slots) if enabled.get(s, True)]
+        no_fit  = (self._active_method == 'NoFit')
+        if not free and not no_fit:
             self._status.setText('Enable at least one parameter (fit checkbox) to fit')
             return
 
         self._fitting = True
-        self._status.setText('Fitting %d/%d parameters…' % (len(free), len(slots)))
+        self._status.setText('Evaluating the current guess (no fit)…' if no_fit else
+                             'Fitting %d/%d parameters…' % (len(free), len(slots)))
 
         dms = self._fit_dms
         dms.hkllistrange[2] = numsteps
@@ -5266,8 +5281,14 @@ class DMSSlider(QtWidgets.QMainWindow):
                 'best this session: %.6g  [%s]' % (self._best_opt, result['method']))
 
         start_opt = result.get('start_opt')
-        done_msg = 'Fit complete.  χ²=%.4f  t=%.1fs  [%s]' % (
-            result['opt'], result['elapsed'], result['method'])
+        if result['method'] == 'NoFit':
+            # Nothing was refined: this is the current guess, scored and saved.
+            done_msg = ('No fit — current guess evaluated.  χ²=%.4f  t=%.1fs'
+                        % (result['opt'], result['elapsed']))
+            start_opt = None
+        else:
+            done_msg = 'Fit complete.  χ²=%.4f  t=%.1fs  [%s]' % (
+                result['opt'], result['elapsed'], result['method'])
         if start_opt is not None:
             if result['opt'] < start_opt:
                 done_msg += '  (was %.4f)' % start_opt
