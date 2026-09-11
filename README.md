@@ -87,8 +87,10 @@ Typical flow in the **tripslider** (image-free):
    residual update live on a stereographic panel; switch crystal type from the
    dropdown — the icosahedral quasicrystal types take 6D reflections and refine
    `a` and the phason strain matrix, as in the slider.
-3. **Fit** — run the optimiser in the background (**Stop** to interrupt).
-4. **Save config** to re-run the exact setup in `python -m DMSAnalysis.tripfit`.
+3. **Fit** — run the optimiser in the background (**Stop** to interrupt). Untick
+   a slider's box to lock that parameter at its current value.
+4. **Save config** to re-run the exact setup, locks included, in
+   `python -m DMSAnalysis.tripfit`.
 
 ### Conventional crystals and pseudo-cubic re-indexing
 

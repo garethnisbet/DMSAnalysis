@@ -446,6 +446,9 @@ are projected with `Projection6dArrayApproximant(ref, tau)` (`tau` defaults to
 | `tripfit_params` | `(params)` | 15-element float copy; pads a 6-element lattice with a zero phason |
 | `tripfit_reflections` | `(reflist, system, tau=TAU_APPROX)` | `(parallel, perpendicular)` components of one triple |
 | `QUASI_SYSTEMS` / `TRIPFIT_SYSTEMS` | — | The quasicrystal modes / every accepted `bravais` |
+| `TRIPFIT_PARAM_NAMES` | — | Slot names as `computation.locked` spells them: `a b c alpha beta gamma a11 … a33` |
+| `tripfit_locked_slots` / `tripfit_locked_names` | `(names)` / `(slots)` | Map `computation.locked` names ↔ parameter slots (unknown name → `ValueError`) |
+| `tripfit_fit_positions` | `(system, locked=())` | Positions in the reduced vector the optimiser moves — the free slots not locked |
 
 #### Residual
 

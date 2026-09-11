@@ -116,14 +116,32 @@ class _ValueReadout(QtWidgets.QLineEdit):
 
 class FloatSlider(QtWidgets.QWidget):
     valueChanged = QtCore.pyqtSignal(float)
+    fitToggled = QtCore.pyqtSignal(bool)
 
     def __init__(self, label, val_init, val_min, val_max,
-                 fmt='%0.6f', n_steps=100000, parent=None):
+                 fmt='%0.6f', n_steps=100000, fittable=False, parent=None):
         super().__init__(parent)
         self._min, self._max, self._n, self._fmt = val_min, val_max, n_steps, fmt
         row = QtWidgets.QHBoxLayout(self)
         row.setContentsMargins(2, 0, 2, 0)
         row.setSpacing(4)
+
+        # Fit-enable checkbox, as in slider.py: only a parameter Fit can refine
+        # gets one; a fixed-width spacer keeps the label column aligned on the
+        # rest.  Unticked = locked at its current value during a fit.
+        self._fit_chk = None
+        if fittable:
+            self._fit_chk = QtWidgets.QCheckBox()
+            self._fit_chk.setChecked(True)
+            self._fit_chk.setFixedWidth(16)
+            self._fit_chk.setToolTip('Include "%s" in the fit — untick to lock it '
+                                     'at its current value' % label)
+            self._fit_chk.toggled.connect(self.fitToggled)
+            row.addWidget(self._fit_chk)
+        else:
+            _sp = QtWidgets.QWidget()
+            _sp.setFixedWidth(16)
+            row.addWidget(_sp)
 
         lbl = QtWidgets.QLabel(label)
         lbl.setFixedWidth(34)
@@ -178,6 +196,15 @@ class FloatSlider(QtWidgets.QWidget):
             self._min, self._max = v - half, v + half
         self.setValue(v)
         self.valueChanged.emit(v)
+
+    def is_fit_enabled(self):
+        """Whether this parameter is included in the fit (True if it has no
+        fit-enable checkbox, i.e. it isn't a fit parameter handled here)."""
+        return self._fit_chk is None or self._fit_chk.isChecked()
+
+    def set_fit_enabled(self, on):
+        if self._fit_chk is not None:
+            self._fit_chk.setChecked(bool(on))
 
     def _to_int(self, v):
         return int(round((v - self._min) / (self._max - self._min) * self._n))
@@ -319,6 +346,10 @@ class TripSlider(QtWidgets.QMainWindow):
                                          'best1bin')
         _fd = comp.get('fd_step', ts.TRIPFIT_FD_STEP)
         self._fd_step = None if _fd is None else float(_fd)
+        # Parameter slots locked out of the fit (the unticked slider boxes).
+        # Kept here rather than read off the checkboxes, so a lock survives the
+        # slider panel being rebuilt on a crystal-type change.
+        self._locked = set(ts.tripfit_locked_slots(comp.get('locked', [])))
         # The 15-element parameter vector: the lattice, then the phason strain
         # matrix a11..a33 (crystal.phason, zero when absent — a conventional
         # config never has one).  tau_approx is the approximant 6D indices are
@@ -634,12 +665,16 @@ class TripSlider(QtWidgets.QMainWindow):
             if slot == 0 and self._is_quasi():
                 half = QUASI_A_SPAN
             v = float(self._params[slot])
-            fs = FloatSlider(PARAM_LABELS[slot], v, v - half, v + half, fmt)
+            fs = FloatSlider(PARAM_LABELS[slot], v, v - half, v + half, fmt,
+                             fittable=slot in free)
             if slot not in free:
                 fs.setToolTip('Held fixed by this crystal type — not refined by Fit')
-            elif slot in ts.TRIPFIT_PHASON_SLOTS:
-                fs.setToolTip('Phason strain matrix element %s — refined by Fit'
-                              % PARAM_LABELS[slot])
+            else:
+                if slot in ts.TRIPFIT_PHASON_SLOTS:
+                    fs.setToolTip('Phason strain matrix element %s — refined by Fit'
+                                  % PARAM_LABELS[slot])
+                fs.set_fit_enabled(slot not in self._locked)
+                fs.fitToggled.connect(self._on_fit_toggled(slot))
             fs.valueChanged.connect(self._on_slider(slot))
             self._slider_vbox.addWidget(fs)
             self._param_sliders[slot] = fs
@@ -857,6 +892,19 @@ class TripSlider(QtWidgets.QMainWindow):
             # keep symmetry-linked lattice slots visually in step
             self._constrain_lattice()
             self._update_timer.start()
+        return handler
+
+    def _on_fit_toggled(self, slot):
+        def handler(on):
+            if on:
+                self._locked.discard(slot)
+            else:
+                self._locked.add(slot)
+            n_free = len(self._fit_positions())
+            self._status.showMessage('%s %s — Fit refines %d of %d parameters'
+                                     % ('Unlocked' if on else 'Locked',
+                                        PARAM_LABELS[slot], n_free,
+                                        len(self._free_slots())))
         return handler
 
     def _on_hkl(self, i):
@@ -1089,6 +1137,10 @@ class TripSlider(QtWidgets.QMainWindow):
         cfg['computation']['boundrange'] = list(self._boundrange)
         cfg['computation']['fd_step'] = (None if self._fd_step is None
                                          else float(self._fd_step))
+        if self._locked:
+            cfg['computation']['locked'] = ts.tripfit_locked_names(self._locked)
+        else:
+            cfg['computation'].pop('locked', None)
         crystal = cfg.setdefault('crystal', {})
         crystal['initial_guess'] = [float(v) for v in self._params[:6]]
         if self._is_quasi():
@@ -1210,25 +1262,45 @@ class TripSlider(QtWidgets.QMainWindow):
             s += g['tf'].fit(x)
         return s
 
+    def _fit_positions(self):
+        """Positions in the reduced vector the optimiser moves: the free
+        parameters whose slider box is ticked."""
+        return ts.tripfit_fit_positions(self._bravais, self._locked)
+
     def _on_fit(self):
         if self._fit_worker is not None:
             return
         if not any(g['enabled'] for g in self._groups):
             self._status.showMessage('Tick at least one triple intersection to fit')
             return
+        pos = self._fit_positions()
+        if not pos:
+            self._status.showMessage('Every parameter is locked — tick at least '
+                                     'one slider box to fit')
+            return
         method = self._algo_combo.currentText()
         self._fit_res = int(self._sp_fit.value())
         for g in self._groups:
             g['tf'].set_params(self._params)
-        x0 = self._reduced()
+        # The optimiser sees only the unlocked parameters; the locked ones stay
+        # at the values they had when Fit was pressed.
+        base = self._reduced()
+        self._fit_base, self._fit_pos = base, pos
+
+        def objective(z):
+            x = base.copy()
+            x[pos] = z
+            return self._fit_objective(x)
+
+        x0 = base[pos]
         lb = x0 + self._boundrange[0]
         ub = x0 + self._boundrange[1]
         bounds = list(zip(lb, ub))
         self._btn_fit.setEnabled(False)
         self._btn_stop.setEnabled(True)
-        self._status.showMessage('Fitting with %s (fit res %d)…'
-                                 % (method, self._fit_res))
-        self._fit_worker = FitWorker(self._fit_objective, x0, method, bounds,
+        self._status.showMessage('Fitting %d/%d parameters with %s (fit res %d)…'
+                                 % (len(pos), len(base), method, self._fit_res))
+        self._fit_worker = FitWorker(objective, x0, method, bounds,
                                      self._tol, self._niter, self._strat,
                                      self._fd_step)
         self._fit_worker.progress.connect(
@@ -1245,7 +1317,9 @@ class TripSlider(QtWidgets.QMainWindow):
         self._fit_worker = None
         self._btn_fit.setEnabled(True)
         self._btn_stop.setEnabled(False)
-        self._set_reduced(x)
+        full = self._fit_base.copy()
+        full[self._fit_pos] = np.atleast_1d(x)
+        self._set_reduced(full)
         self._constrain_lattice()
         # restore live resolution for the overlay
         for g in self._groups:

@@ -116,7 +116,10 @@ matrices, `pseudocubic_transform`, exactly as in `slider.py` — selecting one
 re-indexes the primary hkl, the azimuthal reference and every triple's reflection
 list live as `hkl' = M·hkl`, so you can read off which indexing gives the lowest
 triple-intersection residual), and run the optimiser in the background with
-**Fit** / **Stop**. The **Triple intersections**
+**Fit** / **Stop**. Each slider the fit can refine carries a tick box, as in
+`slider.py`: unticking it locks that parameter at its current value, so **Fit**
+optimises only the ticked ones. Unlike the slider, the locks are saved
+(`computation.locked`) and `tripfit.py` honours them. The **Triple intersections**
 table at the bottom edits the group list at runtime — **Add triple**,
 **Duplicate**, **Remove**, and per-cell editing of each group's label, three
 reflections, energy, intercepts and target; the panels rebuild live (wrapping to
@@ -466,7 +469,7 @@ These directories are immutable run records — do not modify them.
 |---------|---------|
 | `flags` | `save`, `fit` — run controls |
 | `geometry` | `hkl` (primary reflection), `azir` (azimuthal reference) |
-| `computation` | `bravais` (a `ts_quasi.TRIPFIT_SYSTEMS` name: a conventional system, or `icosahedral` / `icosahedral_fixed_a` / `cubic_no_strain`), `resolution` (Kossel-line sampling for the fit), `opt_method` (any name in `ts_quasi.TRIPFIT_METHODS` — see *Optimiser methods* below), `tolerance`, `boundrange` `[lo,hi]` added to the guess for bounds, optional `rr` (azimuthal pre-rotation, deg; conventional only), `bh_niter`, `de_strategy`, `fd_step` (finite-difference step for the gradient methods; omit/`null` to use SciPy's default), `pseudocubic_transform` (1–12, GUI only, conventional only — the Table-1 pseudo-cubic indexing matrix applied to the base indexing at load, same key/semantics as `fit.py`/`slider.py`; 1 = identity), and (GUI only) `live_resolution` for the interactive overlay |
+| `computation` | `bravais` (a `ts_quasi.TRIPFIT_SYSTEMS` name: a conventional system, or `icosahedral` / `icosahedral_fixed_a` / `cubic_no_strain`), `resolution` (Kossel-line sampling for the fit), `opt_method` (any name in `ts_quasi.TRIPFIT_METHODS` — see *Optimiser methods* below), `tolerance`, `boundrange` `[lo,hi]` added to the guess for bounds, optional `rr` (azimuthal pre-rotation, deg; conventional only), `locked` (parameter names held at their starting value by the fit — any of `a b c alpha beta gamma a11 … a33`, `ts_quasi.TRIPFIT_PARAM_NAMES`; the GUI's unticked slider boxes), `bh_niter`, `de_strategy`, `fd_step` (finite-difference step for the gradient methods; omit/`null` to use SciPy's default), `pseudocubic_transform` (1–12, GUI only, conventional only — the Table-1 pseudo-cubic indexing matrix applied to the base indexing at load, same key/semantics as `fit.py`/`slider.py`; 1 = identity), and (GUI only) `live_resolution` for the interactive overlay |
 | `crystal` | `initial_guess` — full 6-element lattice `[a,b,c,α,β,γ]`; for a quasicrystal type also `phason` (9 elements, a11…a33, default zero) and `tau_approx` (default 55/34, the slider's). Only the type's free slots are refined |
 | `intersections` | list of triples, each `{label, reflist (3×3 h k l, or 3×6 6D indices for a quasicrystal type), energy, target, enabled}` — the three secondary reflections whose Kossel lines must meet. Which crossing of each line pair to score is chosen automatically: the engine takes the tightest (mutually-closest) triple, so the selection stays consistent and the residual doesn't jump as the lattice varies. `enabled` (default `true`, the GUI's per-row tick box) drops a triple from the objective while still plotting it, dimmed. (A legacy `intercepts` index vector, if present, is ignored.) |
 | `display` | `lim`, `dpi` — plot settings |

@@ -82,6 +82,10 @@ params     = ts.tripfit_params(np.r_[
 tau        = float(_crystal.get('tau_approx', ts.TAU_APPROX))
 free_slots = ts.tripfit_free_slots(bravais)
 ig         = params[free_slots]                    # reduced free-parameter vector
+# computation.locked (the GUI's unticked slider boxes) holds parameters at their
+# starting value; the optimiser moves only the other positions of ``ig``.
+locked     = ts.tripfit_locked_slots(_comp.get('locked', []))
+fit_pos    = ts.tripfit_fit_positions(bravais, locked)
 
 _disp = cfg.get('display', {})
 lim   = float(_disp.get('lim', 0.005))
@@ -145,11 +149,21 @@ if save:
     subprocess.call('cp ' + _cfg_path + ' ' + outpath + '.', shell=True)
 
 # ── fit ──────────────────────────────────────────────────────────────────────
-lb = ig + boundrange[0]
-ub = ig + boundrange[1]
+def with_free(z):
+    '''The reduced vector ``ig`` with its unlocked positions set to ``z``.'''
+    x = ig.copy()
+    x[fit_pos] = np.atleast_1d(z)
+    return x
+
+
+lb = ig[fit_pos] + boundrange[0]
+ub = ig[fit_pos] + boundrange[1]
 bounds = list(zip(lb, ub))
 
 if fit:
+    if not fit_pos:
+        raise SystemExit('computation.locked locks every free parameter of %s — '
+                         'nothing to fit' % bravais)
     OptMethod = ts.tripfit_method(OptMethod)
     if OptMethod not in ts.TRIPFIT_METHODS:
         raise SystemExit('computation.opt_method "%s" is not one of: %s'
@@ -162,9 +176,10 @@ if fit:
               % (OptMethod[2:] or 'Powell', bravais))
     else:
         print('Fitting with %s, %s constraints' % (OptMethod, bravais))
-    res = ts.run_tripfit_optimiser(objective, ig, OptMethod, bounds, tolerance,
+    res = ts.run_tripfit_optimiser(lambda z: objective(with_free(z)), ig[fit_pos],
+                                   OptMethod, bounds, tolerance,
                                    niter=niter, strat=strat, fd_step=fd_step)
-    xbest = np.atleast_1d(np.asarray(res.x, dtype=float))
+    xbest = with_free(np.asarray(res.x, dtype=float))
     opt = objective(xbest)
 else:
     xbest = ig
@@ -221,6 +236,7 @@ def saveResult():
         f.write('fitted     = %s\n' % ', '.join(g['label'] for g in fit_groups))
         f.write('excluded   = %s\n' % ', '.join(g['label'] for g in groups
                                                 if not g['enabled']))
+        f.write('locked     = %s\n' % ', '.join(ts.tripfit_locked_names(locked)))
         f.write('reduced_x  = %s\n' % np.array2string(np.atleast_1d(xbest)))
         f.write('lattice    = %s\n' % np.array2string(np.array(lattice_fit)))
         if quasi:
@@ -237,6 +253,8 @@ if save:
 print('bravais    :', bravais)
 print('method     :', OptMethod)
 print('resolution :', resolution)
+if locked:
+    print('locked     :', ', '.join(ts.tripfit_locked_names(locked)))
 print('reduced x  :', np.atleast_1d(xbest))
 print('lattice    :', np.array(lattice_fit))
 if quasi:

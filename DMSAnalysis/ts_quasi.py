@@ -3282,6 +3282,39 @@ def tripfit_reflections(reflist, system, tau=TAU_APPROX):
     return np.asarray(par, dtype=float), np.asarray(perp, dtype=float)
 
 
+# Names of the tripfit parameter slots, as computation.locked spells them.
+TRIPFIT_PARAM_NAMES = ('a', 'b', 'c', 'alpha', 'beta', 'gamma',
+                       'a11', 'a12', 'a13', 'a21', 'a22', 'a23',
+                       'a31', 'a32', 'a33')
+
+
+def tripfit_locked_slots(names):
+    '''Parameter slots named in ``names`` (computation.locked, the GUI's
+    unticked slider boxes): parameters a fit holds at their starting value.
+    Raises ValueError on an unknown name.'''
+    if isinstance(names, str):
+        names = [names]
+    slots = set()
+    for n in names:
+        if n not in TRIPFIT_PARAM_NAMES:
+            raise ValueError('computation.locked: unknown parameter %r (expected '
+                             'any of %s)' % (n, ', '.join(TRIPFIT_PARAM_NAMES)))
+        slots.add(TRIPFIT_PARAM_NAMES.index(n))
+    return sorted(slots)
+
+
+def tripfit_locked_names(slots):
+    '''computation.locked names for a collection of parameter slots.'''
+    return [TRIPFIT_PARAM_NAMES[s] for s in sorted(set(slots))]
+
+
+def tripfit_fit_positions(system, locked=()):
+    '''Positions in the reduced vector (``tripfit_free_slots`` order) that the
+    optimiser moves: the free slots that are not locked.'''
+    locked = set(locked)
+    return [i for i, s in enumerate(tripfit_free_slots(system)) if s not in locked]
+
+
 class tripfit(object):
     '''Fit a lattice by driving three Kossel lines of a secondary-reflection
     triple to a common (triple-intersection) point on the stereographic
