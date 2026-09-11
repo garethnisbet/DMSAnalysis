@@ -1,8 +1,10 @@
 """Batch multiple-intersection (Renninger triple-intersection) lattice fit.
 
-Refine a conventional crystal lattice by driving the three Kossel lines of one
-or more secondary-reflection triples to a common point on the stereographic
-projection.  This is the image-free, multiple-diffraction analogue of
+Refine a crystal lattice by driving the three Kossel lines of one or more
+secondary-reflection triples to a common point on the stereographic
+projection.  An icosahedral ``bravais`` (``ts_quasi.QUASI_SYSTEMS``) takes 6D
+reflection indices and refines ``a`` and/or the phason strain matrix, exactly as
+the image fit's quasicrystal modes do.  This is the image-free, multiple-diffraction analogue of
 ``fit.py``: instead of matching ROI peak positions in a detector image it
 matches the geometry of simultaneous (multiple) diffraction, which is highly
 sensitive to the small lattice distortions of pseudo-symmetric crystals.
@@ -64,14 +66,22 @@ strat      = ts.DE_Strategy.get(_comp.get('de_strategy', 'best1bin'), 'best1bin'
 _fd        = _comp.get('fd_step', ts.TRIPFIT_FD_STEP)
 fd_step    = None if _fd is None else float(_fd)  # gradient-method probe step
 
-if bravais not in ts.CONVENTIONAL_SYSTEMS:
+if bravais not in ts.TRIPFIT_SYSTEMS:
     raise SystemExit(
-        "computation.bravais must be one of the conventional systems %s, got %r"
-        % (list(ts.CONVENTIONAL_SYSTEMS), bravais))
+        "computation.bravais must be one of %s, got %r"
+        % (list(ts.TRIPFIT_SYSTEMS), bravais))
+quasi = bravais in ts.QUASI_SYSTEMS
 
-initial_guess = np.array(cfg['crystal']['initial_guess'], dtype=float)
-free_slots    = ts.lattice_free_slots(bravais)
-ig            = initial_guess[free_slots]          # reduced free-parameter vector
+# The 15-element parameter vector: the 6-element lattice, then the phason strain
+# matrix a11..a33 (crystal.phason; zero when absent).  tau_approx is the
+# approximant 6D indices are projected with.  Same keys tripslider writes.
+_crystal   = cfg['crystal']
+params     = ts.tripfit_params(np.r_[
+    np.asarray(_crystal['initial_guess'], dtype=float)[:6],
+    np.asarray(_crystal.get('phason', [0.0] * 9), dtype=float)])
+tau        = float(_crystal.get('tau_approx', ts.TAU_APPROX))
+free_slots = ts.tripfit_free_slots(bravais)
+ig         = params[free_slots]                    # reduced free-parameter vector
 
 _disp = cfg.get('display', {})
 lim   = float(_disp.get('lim', 0.005))
@@ -87,18 +97,24 @@ if not _groups_cfg:
     raise SystemExit('config "intersections" must list at least one triple')
 
 if rr != 0.0:
+    if quasi:
+        raise SystemExit('computation.rr rotates 3-index reflections and cannot '
+                         'be applied to 6D indices; set it to 0 for %s' % bravais)
     _R = ts.rotxyz(azir, rr).rmat()
     hkl = np.round((_R * np.matrix(hkl).T).T)
 
+_ncol = 6 if quasi else 3
 groups = []
 for gi, gc in enumerate(_groups_cfg):
     reflist = np.matrix(np.array(gc['reflist'], dtype=float))
-    if reflist.shape != (3, 3):
-        raise SystemExit('intersection group %d: reflist must be 3x3' % gi)
+    if reflist.shape != (3, _ncol):
+        raise SystemExit('intersection group %d: reflist must be 3x%d for %s'
+                         % (gi, _ncol, bravais))
     if rr != 0.0:
         reflist = np.round((_R * reflist.T).T)
     tf = ts.tripfit(hkl, reflist, azir, resolution, bravais,
-                    float(gc['energy']), float(gc.get('target', 0.0)))
+                    float(gc['energy']), float(gc.get('target', 0.0)),
+                    params=params, tau=tau)
     groups.append({'label': gc.get('label', 'T%d' % (gi + 1)),
                    'reflist': reflist, 'tf': tf,
                    'enabled': bool(gc.get('enabled', True))})
@@ -156,15 +172,15 @@ else:
     res = ts.res(ig)
     OptMethod = 'None'
 
-def reduced_to_lattice(x):
-    '''Full [a,b,c,alpha,beta,gamma] for a reduced free-parameter vector.'''
-    six = np.zeros(6)
-    for slot, val in zip(free_slots, np.atleast_1d(x)):
-        six[slot] = val
-    return ts.expand_lattice(bravais, six)
+def reduced_to_params(x):
+    '''(lattice [a,b,c,alpha,beta,gamma], phason a11..a33) for a reduced
+    free-parameter vector.'''
+    full = params.copy()
+    full[free_slots] = np.atleast_1d(x)
+    return ts.tripfit_expand(bravais, full)
 
 
-lattice_fit = reduced_to_lattice(xbest)
+lattice_fit, phason_fit = reduced_to_params(xbest)
 
 # ── per-group full solutions for plotting ───────────────────────────────────────
 for g in groups:
@@ -207,6 +223,9 @@ def saveResult():
                                                 if not g['enabled']))
         f.write('reduced_x  = %s\n' % np.array2string(np.atleast_1d(xbest)))
         f.write('lattice    = %s\n' % np.array2string(np.array(lattice_fit)))
+        if quasi:
+            f.write('phason     = %s\n' % np.array2string(np.array(phason_fit)))
+            f.write('tau_approx = %r\n' % tau)
         f.write('opt        = %s\n' % opt)
 
 
@@ -220,6 +239,8 @@ print('method     :', OptMethod)
 print('resolution :', resolution)
 print('reduced x  :', np.atleast_1d(xbest))
 print('lattice    :', np.array(lattice_fit))
+if quasi:
+    print('phason     :', np.array(phason_fit))
 print('residual   :', opt)
 
 if __name__ == '__main__':

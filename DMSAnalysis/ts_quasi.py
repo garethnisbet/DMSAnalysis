@@ -34,6 +34,10 @@ except Exception:      # pragma: no cover - shapely is a declared dependency
 
 
 TAU =  0.5+0.5*5**0.5
+# The rational approximant the slider projects 6D reflections with
+# (Projection6dArrayApproximant) and exports as crystal.tau_approx.  Shared so
+# the tripfit engine indexes a quasicrystal exactly as the slider does.
+TAU_APPROX = 55 / 34.
 ###################################
 
 # ── Conventional-crystal symmetry layer ────────────────────────────────────────
@@ -3205,35 +3209,138 @@ def intersections(a, b):
     return x, y, ea, eb
 
 
+# ── quasicrystal modes for the tripfit engine ───────────────────────────────────
+# The three icosahedral modes of the image fit (dmsfit_ico_hkl) and the slider,
+# handled the slider's way: 6D reflection indices are projected into parallel
+# and perpendicular components with TAU_APPROX, the cell is cubic
+# [a, a, a, 90, 90, 90], and each reflection's physical vector is par + M·perp
+# for the phason strain matrix M (PhasonDistoArray).  The tripfit parameter
+# vector grows from the 6-element lattice to 15 elements,
+#     [a, b, c, alpha, beta, gamma, a11, a12, a13, a21, a22, a23, a31, a32, a33]
+# so a conventional system keeps exactly the slots, and the reduced vectors, it
+# had before.
+QUASI_SYSTEMS = ('icosahedral', 'icosahedral_fixed_a', 'cubic_no_strain')
+TRIPFIT_SYSTEMS = QUASI_SYSTEMS + CONVENTIONAL_SYSTEMS
+TRIPFIT_NPARAMS = 15
+TRIPFIT_PHASON_SLOTS = list(range(6, 15))
+_TRIPFIT_QUASI_FREE = {
+    'icosahedral':         [0] + TRIPFIT_PHASON_SLOTS,   # a + phason
+    'icosahedral_fixed_a': list(TRIPFIT_PHASON_SLOTS),   # phason; a held
+    'cubic_no_strain':     [0],                          # a; phason held at 0
+}
+
+
+def tripfit_free_slots(system):
+    '''Indices into the 15-element tripfit parameter vector that are refined for
+    ``system``.  For a conventional system these are its free lattice slots
+    (``lattice_free_slots``), so its reduced vector is unchanged.'''
+    if system in _TRIPFIT_QUASI_FREE:
+        return list(_TRIPFIT_QUASI_FREE[system])
+    return lattice_free_slots(system)
+
+
+def tripfit_params(params):
+    '''A 15-element float copy of a tripfit parameter vector.  A 6-element
+    lattice is accepted and read with a zero phason matrix.'''
+    p = np.zeros(TRIPFIT_NPARAMS, dtype=float)
+    v = np.asarray(params, dtype=float).ravel()[:TRIPFIT_NPARAMS]
+    p[:v.size] = v
+    return p
+
+
+def tripfit_expand(system, params):
+    '''(lattice, phason) for a tripfit parameter vector: the symmetry-constrained
+    [a,b,c,alpha,beta,gamma] and the 9-element phason matrix, row-major
+    a11..a33.  The phason is zero for a conventional system and for
+    cubic_no_strain, as in dmsfit_ico_hkl.imcalc.'''
+    p = tripfit_params(params)
+    if system in QUASI_SYSTEMS:
+        a = float(p[0])
+        phason = ([0.0] * 9 if system == 'cubic_no_strain'
+                  else [float(m) for m in p[6:15]])
+        return [a, a, a, 90.0, 90.0, 90.0], phason
+    return expand_lattice(system, p[:6]), [0.0] * 9
+
+
+def tripfit_reflections(reflist, system, tau=TAU_APPROX):
+    '''(parallel, perpendicular) components, each 3x3, of one triple's
+    reflections.  A quasicrystal mode takes 6D indices (3x6) and projects them
+    exactly as the slider does (``Projection6dArrayApproximant`` with ``tau``);
+    a conventional system takes Miller indices (3x3), whose perpendicular part
+    is zero.  Raises ValueError on the wrong index count, which would otherwise
+    only surface as the 500 failure penalty.'''
+    ref = np.asarray(reflist, dtype=float)
+    ncol = 6 if system in QUASI_SYSTEMS else 3
+    if ref.shape != (3, ncol):
+        raise ValueError('a %s triple needs a 3x%d reflection list (%s), got '
+                         'shape %s' % (system, ncol,
+                                       '6D indices' if ncol == 6 else 'h k l',
+                                       ref.shape))
+    if ncol == 3:
+        return ref, np.zeros_like(ref)
+    par, perp = Projection6dArrayApproximant(ref, tau).reflection_6d()
+    return np.asarray(par, dtype=float), np.asarray(perp, dtype=float)
+
+
 class tripfit(object):
-    '''Fit a conventional lattice by driving three Kossel lines of a secondary-
-    reflection triple to a common (triple-intersection) point on the stereographic
+    '''Fit a lattice by driving three Kossel lines of a secondary-reflection
+    triple to a common (triple-intersection) point on the stereographic
     projection.  This is the multiple-diffraction analogue of the image fit: no
     detector image is needed, only the geometry.
 
     Constructor:
-        tripfit(hkl, reflist, azir, resolution, bravais, energy, target)
+        tripfit(hkl, reflist, azir, resolution, bravais, energy, target,
+                params=None, tau=TAU_APPROX)
 
-    ``reflist`` is a 3 x 3 matrix of the three secondary reflections; ``bravais``
-    is one of ``CONVENTIONAL_SYSTEMS`` and selects which lattice parameters are
-    free (via ``lattice_free_slots`` / ``expand_lattice``, shared with the image
-    fit so the parameter packing cannot drift).  Each line pair may cross at more
-    than one point; the tightest (mutually-closest) triple is scored, so no
-    per-pair intercept index is needed.  The score is that triple's summed
-    squared pairwise distance (``triple_spread``).  ``target`` is the desired
-    residual (0 for a perfect triple intersection).
+    ``bravais`` is one of ``TRIPFIT_SYSTEMS``.  For a conventional system
+    ``reflist`` is a 3 x 3 matrix of Miller indices and the free parameters are
+    the symmetry-allowed lattice slots (``lattice_free_slots`` /
+    ``expand_lattice``, shared with the image fit).  For a quasicrystal mode
+    (``QUASI_SYSTEMS``) ``reflist`` holds three 6D indices (3 x 6), projected
+    with ``tau``, and the free parameters are those of the image fit's mode:
+    ``a`` and the phason matrix, the phason alone, or ``a`` alone
+    (``tripfit_free_slots``).  ``params`` is the full 15-element parameter
+    vector the reduced one is scattered into; it supplies what a mode holds
+    fixed (the ``a`` of icosahedral_fixed_a) — ``set_params`` updates it.
+
+    Each line pair may cross at more than one point; the tightest
+    (mutually-closest) triple is scored, so no per-pair intercept index is
+    needed.  The score is that triple's summed squared pairwise distance
+    (``triple_spread``).  ``target`` is the desired residual (0 for a perfect
+    triple intersection).
 
     ``fit(reduced)`` returns the scalar residual for a reduced free-parameter
     vector; ``full(reduced)`` returns (intercepts, st0, st1, st2, vr0, vr1, vr2)
     for plotting.'''
-    def __init__(self, hkl, reflist, azir, resolution, bravais, energy, target):
+    def __init__(self, hkl, reflist, azir, resolution, bravais, energy, target,
+                 params=None, tau=TAU_APPROX):
         self.hkl = hkl
-        self.reflist = np.matrix(reflist)
         self.azir = azir
         self.resolution = resolution
         self.bravais = bravais
         self.energy = energy
         self.target = target
+        self.tau = tau
+        self.set_params(np.zeros(TRIPFIT_NPARAMS) if params is None else params)
+        if bravais in QUASI_SYSTEMS:
+            self.ref_6d = np.matrix(np.asarray(reflist, dtype=float))
+            self.ref_par, self.ref_perp = tripfit_reflections(reflist, bravais, tau)
+            self.reflist = np.matrix(self.ref_par)
+        else:
+            self.reflist = np.matrix(reflist)
+
+    def set_params(self, params):
+        '''Set the full parameter vector (6-element lattice or 15-element
+        lattice + phason) that the reduced optimiser vector is scattered into.'''
+        self.params = tripfit_params(params)
+
+    def reflections(self, phason):
+        '''The three secondary reflections as 3D vectors (r.l.u.) under the
+        phason matrix ``phason``: par + M·perp for a quasicrystal — the slider's
+        PhasonDistoArray step — and the Miller indices otherwise.'''
+        if self.bravais in QUASI_SYSTEMS:
+            return PhasonDistoArray(self.ref_par, self.ref_perp, phason).qe1()
+        return self.reflist
 
     def _intercepts(self):
         '''The three pairwise Kossel-line intersection points (3x2, rows [x, y])
@@ -3258,21 +3365,19 @@ class tripfit(object):
                         best_cost, best = cost, (a, b, c)
         return np.array(best, dtype=float)
 
-    def _lattice_from_reduced(self, reduced):
-        '''Expand a reduced free-parameter vector into the full constrained
-        lattice [a,b,c,alpha,beta,gamma] for this crystal system.'''
-        reduced = np.asarray(reduced, dtype=float).ravel()
-        six = np.zeros(6, dtype=float)
-        for slot, val in zip(lattice_free_slots(self.bravais), reduced):
-            six[slot] = val
-        return expand_lattice(self.bravais, six)
+    def _params_from_reduced(self, reduced):
+        '''(lattice, phason) for a reduced free-parameter vector: scattered into
+        the full parameter vector and expanded with the mode's constraints.'''
+        full = self.params.copy()
+        full[tripfit_free_slots(self.bravais)] = np.asarray(reduced, dtype=float).ravel()
+        return tripfit_expand(self.bravais, full)
 
     def kosselcalc(self, inputs):
-        _lattice = self._lattice_from_reduced(inputs)
+        _lattice, _phason = self._params_from_reduced(inputs)
         # One vectorised call for all three Kossel lines; row blocks of length
         # ``resolution`` come back grouped by reflection.
         r = self.resolution
-        vr = kosscalc(_lattice, self.energy, self.hkl, self.reflist,
+        vr = kosscalc(_lattice, self.energy, self.hkl, self.reflections(_phason),
                       self.azir, 0, 360, r)[:, :3]
         vr0, vr1, vr2 = vr[:r], vr[r:2 * r], vr[2 * r:]
         self.vr0 = np.matrix(vr0 / np.array([np.apply_along_axis(np.linalg.norm, 1, vr0)]).T)

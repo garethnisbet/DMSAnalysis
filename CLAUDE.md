@@ -98,8 +98,10 @@ the blank frame is kept, noted in the status line. The config's own
 refinement); only a scan *load* seeds. `fit.py` (batch) still fails
 loudly on missing data.
 
-`tripfit.py` is a separate, image-free batch app: it refines a conventional
-lattice by driving the three Kossel lines of one or more secondary-reflection
+`tripfit.py` is a separate, image-free batch app: it refines a lattice — a
+conventional one, or an icosahedral quasicrystal's `a` and phason strain (see
+*Quasicrystals* under the tripfit configuration) — by driving the three Kossel
+lines of one or more secondary-reflection
 triples to a common point on the stereographic projection (the Renninger
 triple-intersection / multiple-diffraction geometry). It needs no detector image
 — only the reflection geometry — and is the sensitive probe for the small
@@ -107,7 +109,8 @@ lattice distortions of pseudo-symmetric crystals (see the pseudo-cubic
 re-indexing note under *Conventional crystals*). `tripslider.py` is its
 interactive pyqtgraph GUI (dark theme, matching `slider.py`): drag the free
 lattice / ψ sliders and watch each triple's Kossel lines and its residual update
-live on a stereographic panel, switch crystal system from a dropdown, pick the
+live on a stereographic panel, switch crystal type from a dropdown (the slider's
+list, the icosahedral quasicrystal types included), pick the
 pseudo-cubic re-indexing from the **Pseudo-cubic** dropdown (the 12 Table-1
 matrices, `pseudocubic_transform`, exactly as in `slider.py` — selecting one
 re-indexes the primary hkl, the azimuthal reference and every triple's reflection
@@ -463,9 +466,9 @@ These directories are immutable run records — do not modify them.
 |---------|---------|
 | `flags` | `save`, `fit` — run controls |
 | `geometry` | `hkl` (primary reflection), `azir` (azimuthal reference) |
-| `computation` | `bravais` (a `CONVENTIONAL_SYSTEMS` name), `resolution` (Kossel-line sampling for the fit), `opt_method` (any name in `ts_quasi.TRIPFIT_METHODS` — see *Optimiser methods* below), `tolerance`, `boundrange` `[lo,hi]` added to the guess for bounds, optional `rr` (azimuthal pre-rotation, deg), `bh_niter`, `de_strategy`, `fd_step` (finite-difference step for the gradient methods; omit/`null` to use SciPy's default), `pseudocubic_transform` (1–12, GUI only — the Table-1 pseudo-cubic indexing matrix applied to the base indexing at load, same key/semantics as `fit.py`/`slider.py`; 1 = identity), and (GUI only) `live_resolution` for the interactive overlay |
-| `crystal` | `initial_guess` — full 6-element lattice `[a,b,c,α,β,γ]`; only the crystal system's free slots are refined |
-| `intersections` | list of triples, each `{label, reflist (3×3), energy, target, enabled}` — the three secondary reflections whose Kossel lines must meet. Which crossing of each line pair to score is chosen automatically: the engine takes the tightest (mutually-closest) triple, so the selection stays consistent and the residual doesn't jump as the lattice varies. `enabled` (default `true`, the GUI's per-row tick box) drops a triple from the objective while still plotting it, dimmed. (A legacy `intercepts` index vector, if present, is ignored.) |
+| `computation` | `bravais` (a `ts_quasi.TRIPFIT_SYSTEMS` name: a conventional system, or `icosahedral` / `icosahedral_fixed_a` / `cubic_no_strain`), `resolution` (Kossel-line sampling for the fit), `opt_method` (any name in `ts_quasi.TRIPFIT_METHODS` — see *Optimiser methods* below), `tolerance`, `boundrange` `[lo,hi]` added to the guess for bounds, optional `rr` (azimuthal pre-rotation, deg; conventional only), `bh_niter`, `de_strategy`, `fd_step` (finite-difference step for the gradient methods; omit/`null` to use SciPy's default), `pseudocubic_transform` (1–12, GUI only, conventional only — the Table-1 pseudo-cubic indexing matrix applied to the base indexing at load, same key/semantics as `fit.py`/`slider.py`; 1 = identity), and (GUI only) `live_resolution` for the interactive overlay |
+| `crystal` | `initial_guess` — full 6-element lattice `[a,b,c,α,β,γ]`; for a quasicrystal type also `phason` (9 elements, a11…a33, default zero) and `tau_approx` (default 55/34, the slider's). Only the type's free slots are refined |
+| `intersections` | list of triples, each `{label, reflist (3×3 h k l, or 3×6 6D indices for a quasicrystal type), energy, target, enabled}` — the three secondary reflections whose Kossel lines must meet. Which crossing of each line pair to score is chosen automatically: the engine takes the tightest (mutually-closest) triple, so the selection stays consistent and the residual doesn't jump as the lattice varies. `enabled` (default `true`, the GUI's per-row tick box) drops a triple from the objective while still plotting it, dimmed. (A legacy `intercepts` index vector, if present, is ignored.) |
 | `display` | `lim`, `dpi` — plot settings |
 
 The lattice constraints reuse `ts_quasi.lattice_free_slots` / `expand_lattice`
@@ -475,6 +478,43 @@ groups; `fit=0` just evaluates and plots at the initial guess. The engine
 (`ts_quasi.kosscalc`, `stereoproj`, `intersections`, `tripfit`) is ported from
 the standalone `calcms/ts_light.py` so the whole workflow lives in the package.
 See `configs/tripfit_rhombohedral_PMN_PT_example.json`.
+
+### Quasicrystals
+
+The icosahedral types are handled exactly as `slider.py` handles a quasicrystal,
+and that lives in the engine (`ts_quasi.tripfit`), so the batch app and the GUI
+get it identically. A triple's reflections are 6D indices, projected with
+`Projection6dArrayApproximant(ref, tau_approx)`; the cell is `[a,a,a,90,90,90]`;
+and each reflection is `par + M·perp` for the phason matrix `M` — the
+`PhasonDistoArray` step of `dmsfit_ico_hkl.imcalc`. The primary `hkl` and `azir`
+are the non-integer vectors the slider carries. The parameter vector grows to 15
+elements, `[a,b,c,α,β,γ, a11…a33]` (`tripfit_params`), and the type picks what is
+refined (`tripfit_free_slots`), matching the image fit's modes:
+
+| `bravais` | Refined | Held |
+|-----------|---------|------|
+| `icosahedral` | `a` + phason | — |
+| `icosahedral_fixed_a` | phason | `a` (still shown as a slider, as in `slider.py`) |
+| `cubic_no_strain` | `a` | phason at zero |
+
+A conventional system keeps exactly its old slots and reduced vector, so existing
+configs and residuals are unchanged.
+
+`tau_approx` defaults to `ts_quasi.TAU_APPROX` = 55/34, which `slider.py` also
+reads — one source. `fit.py` still projects with `Projection6d`, which uses the
+exact golden ratio, so the image batch fit does not index a quasicrystal quite
+as the slider does; tripfit follows the slider.
+
+In the GUI the **Pseudo-cubic** combo is disabled on a quasicrystal type (a 3×3
+matrix cannot re-index 6D indices) and the table's reflection columns take six
+indices. h k l and 6D reflections cannot be converted into each other, so
+switching the crystal type across the two families sets the current triples
+aside and brings back the ones last used with the other family (a starter triple
+the first time). `rr` is refused for a quasicrystal type. See
+`configs/tripfit_icosahedral_AlPdMn_example.json`: its geometry, `a` and phason
+are the slider refinement of scan 913123, and its triples are ones predicted to
+meet there — a worked start, not measured intersections. Test:
+`DMSAnalysis/tests/test_tripfit_quasi.py`.
 
 ### The residual
 

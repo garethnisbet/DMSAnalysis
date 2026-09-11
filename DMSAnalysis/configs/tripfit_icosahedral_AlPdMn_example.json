@@ -1,0 +1,51 @@
+{
+  "description": "i-AlPdMn at the slider refinement of scan 913123 (dp 3): hkl, azir, a and the phason matrix are that refinement's, and each triple is three reflections from its list whose Kossel lines meet there at the scan energy. Predicted intersections, for a worked start - not measured ones.",
+  "flags": {
+    "save": 0,
+    "fit": 0
+  },
+  "geometry": {
+    "hkl": [2.279680642791141, 3.703079697081845, 1.2960038712280701],
+    "azir": [0.0, 1.5748, 2.548]
+  },
+  "computation": {
+    "bravais": "icosahedral",
+    "resolution": 1000,
+    "live_resolution": 200,
+    "opt_method": "L-BFGS-B",
+    "tolerance": 1e-17,
+    "boundrange": [-0.012, 0.012],
+    "rr": 0.0
+  },
+  "crystal": {
+    "initial_guess": [6.460481, 6.460481, 6.460481, 90.0, 90.0, 90.0],
+    "phason": [0.001466, 0.00094, -0.00014,
+               0.00125, -0.000095, -0.002316,
+               -0.001211, -0.001593, 0.00097],
+    "tau_approx": 1.6176470588235294
+  },
+  "intersections": [
+    {
+      "label": "T1",
+      "reflist": [[0, 2, 0, -2, -1, 1], [0, 2, -2, -3, 0, 3], [0, 0, -3, -2, 2, 3]],
+      "energy": 6.29955,
+      "target": 0.0
+    },
+    {
+      "label": "T2",
+      "reflist": [[2, 3, 0, -2, 0, 3], [-1, -1, -2, -1, 1, 1], [1, 2, -2, -3, 1, 4]],
+      "energy": 6.29955,
+      "target": 0.0
+    },
+    {
+      "label": "T3",
+      "reflist": [[2, 3, 0, -2, 0, 3], [2, 2, 1, 0, 0, 1], [0, 2, -2, -3, 0, 3]],
+      "energy": 6.29955,
+      "target": 0.0
+    }
+  ],
+  "display": {
+    "lim": 0.005,
+    "dpi": 130
+  }
+}

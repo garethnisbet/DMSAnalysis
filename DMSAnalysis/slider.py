@@ -27,7 +27,7 @@ pg.setConfigOptions(imageAxisOrder='row-major',
                     background='#1a1a1a', foreground='#cccccc')
 
 # ── constants ──────────────────────────────────────────────────────────────────
-tau = 55 / 34.
+tau = ts.TAU_APPROX       # 55/34; shared with the tripfit engine
 
 # ── scan / geometry ────────────────────────────────────────────────────────────
 zoomval   = 1

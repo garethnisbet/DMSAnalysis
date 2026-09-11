@@ -411,11 +411,12 @@ small lattice distortions of pseudo-symmetric crystals. Used by the
 | `intersections` | `(a, b)` | Intersection points of two closed stereographic loci (uses shapely); returns `(xs, ys, ring_a, ring_b)` |
 | `triple_spread` | `(pts)` | Residual metric: summed squared pairwise distance of three stereographic points (3×2) |
 
-### `class tripfit(hkl, reflist, azir, resolution, bravais, energy, target)`
-Fits a conventional lattice by driving the three Kossel lines of a secondary-reflection triple (`reflist`, 3×3) to a common triple-intersection point.
+### `class tripfit(hkl, reflist, azir, resolution, bravais, energy, target, params=None, tau=TAU_APPROX)`
+Fits a lattice by driving the three Kossel lines of a secondary-reflection triple to a common triple-intersection point.
 
 - `hkl` — the primary reflection as a **2-D row**, `np.array([[h, k, l]], dtype=float)` (shape `(1,3)`). A flat 1-D `[h,k,l]` raises inside `kosscalc`, which `fit()` silently turns into the 500 penalty — see *Residual* below.
-- `bravais` — one of `CONVENTIONAL_SYSTEMS`; selects the free lattice parameters via `lattice_free_slots` / `expand_lattice` (shared with the image fit, so the packing cannot drift).
+- `bravais` — one of `TRIPFIT_SYSTEMS`: a conventional system (`reflist` 3×3 Miller indices; the free lattice parameters come from `lattice_free_slots` / `expand_lattice`, shared with the image fit) or a quasicrystal mode in `QUASI_SYSTEMS` (`reflist` 3×6 6D indices), handled exactly as the slider handles a quasicrystal — see *Quasicrystal modes* below. The wrong index count raises `ValueError`.
+- `params` — the full 15-element parameter vector `[a, b, c, α, β, γ, a11 … a33]` the reduced vector is scattered into; it supplies what a mode holds fixed (the `a` of `icosahedral_fixed_a`). `set_params(params)` updates it; a 6-element lattice is read with a zero phason.
 - Intercept selection is automatic (`_intercepts`): each line pair may cross at several points, so the **tightest (mutually-closest) triple** — one crossing per pair — is scored. This follows the physical triple intersection directly and continuously, with no dependence on shapely's geometry-dependent point ordering, so the selection cannot jump as the lattice varies (and no per-pair intercept index is needed).
 - `target` — desired residual (0 for a perfect triple intersection).
 
@@ -423,6 +424,28 @@ Fits a conventional lattice by driving the three Kossel lines of a secondary-ref
 |--------|---------|-------------|
 | `fit(reduced)` | `float` | Scalar residual for a reduced free-parameter vector (500 on geometric failure) |
 | `full(reduced)` | tuple | `(intercepts, st0, st1, st2, vr0, vr1, vr2)` for plotting |
+| `reflections(phason)` | `(3,3)` | The three secondary reflections as 3D vectors under a phason matrix |
+
+#### Quasicrystal modes
+
+The same three modes as `dmsfit_ico_hkl`, computed the slider's way: 6D indices
+are projected with `Projection6dArrayApproximant(ref, tau)` (`tau` defaults to
+`TAU_APPROX` = 55/34, the slider's own approximant), the cell is
+`[a, a, a, 90, 90, 90]`, and each reflection is `par + M·perp` (`PhasonDistoArray`).
+
+| `bravais` | Refined (`tripfit_free_slots`) | Held |
+|-----------|--------------------------------|------|
+| `icosahedral` | `a`, phason `a11 … a33` — slots `[0, 6 … 14]` | — |
+| `icosahedral_fixed_a` | phason — slots `[6 … 14]` | `a`, from `params` |
+| `cubic_no_strain` | `a` — slot `[0]` | phason at zero |
+
+| Name | Signature | Description |
+|------|-----------|-------------|
+| `tripfit_free_slots` | `(system)` | Refined slots of the 15-element vector; a conventional system's are its `lattice_free_slots`, so its reduced vector is unchanged |
+| `tripfit_expand` | `(system, params)` | `(lattice, phason)` with the mode's constraints applied |
+| `tripfit_params` | `(params)` | 15-element float copy; pads a 6-element lattice with a zero phason |
+| `tripfit_reflections` | `(reflist, system, tau=TAU_APPROX)` | `(parallel, perpendicular)` components of one triple |
+| `QUASI_SYSTEMS` / `TRIPFIT_SYSTEMS` | — | The quasicrystal modes / every accepted `bravais` |
 
 #### Residual
 

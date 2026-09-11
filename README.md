@@ -21,7 +21,8 @@ two families:
 - **Image-free** (match the multiple-diffraction geometry directly, via the
   coincidence of Kossel lines on the stereographic projection): `tripslider` — an
   interactive GUI; and `tripfit` — the batch equivalent. These refine a
-  conventional lattice by driving secondary-reflection triples to a common
+  conventional lattice, or an icosahedral quasicrystal's `a` and phason strain,
+  by driving secondary-reflection triples to a common
   triple-intersection point, the sensitive probe for small lattice distortions of
   pseudo-symmetric crystals.
 
@@ -83,8 +84,9 @@ Typical flow in the **tripslider** (image-free):
 1. Add or edit triple intersections in the **Triple intersections** table (each
    row is three secondary reflections that should meet at one point).
 2. Drag the free lattice / ψ sliders and watch each triple's Kossel lines and its
-   residual update live on a stereographic panel; switch crystal system from the
-   dropdown.
+   residual update live on a stereographic panel; switch crystal type from the
+   dropdown — the icosahedral quasicrystal types take 6D reflections and refine
+   `a` and the phason strain matrix, as in the slider.
 3. **Fit** — run the optimiser in the background (**Stop** to interrupt).
 4. **Save config** to re-run the exact setup in `python -m DMSAnalysis.tripfit`.
 
@@ -150,9 +152,12 @@ The **image-based** apps (`slider`, `fit`) read a JSON config with these section
 The **image-free** apps (`tripfit`, `tripslider`) read a lighter, separate schema
 (no `scan`/`roi`/`ref_6d`): `geometry` (`hkl`, `psi`, `azir`), `computation`
 (`bravais`, `resolution`, `opt_method`, `tolerance`, `boundrange`, …),
-`crystal.initial_guess` (6-element lattice), and an `intersections` list — one
-entry per triple `{label, reflist (3×3), energy, intercepts, target}`. See
-[`configs/tripfit_rhombohedral_PMN_PT_example.json`](DMSAnalysis/configs/tripfit_rhombohedral_PMN_PT_example.json).
+`crystal.initial_guess` (6-element lattice, plus `phason` and `tau_approx` for a
+quasicrystal), and an `intersections` list — one entry per triple
+`{label, reflist (3×3, or 3×6 6D indices), energy, intercepts, target}`. See
+[`configs/tripfit_rhombohedral_PMN_PT_example.json`](DMSAnalysis/configs/tripfit_rhombohedral_PMN_PT_example.json)
+and, for a quasicrystal,
+[`configs/tripfit_icosahedral_AlPdMn_example.json`](DMSAnalysis/configs/tripfit_icosahedral_AlPdMn_example.json).
 
 See [`CLAUDE.md`](CLAUDE.md) for the parameter-vector index map, the full tripfit
 schema, and developer notes.

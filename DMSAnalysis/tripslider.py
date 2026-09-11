@@ -4,10 +4,16 @@ Interactive GUI for the multiple-intersection (Renninger triple-intersection)
 lattice fit — the pyqtgraph companion to ``tripfit.py``, styled to match the
 slider workflow (dark theme, live sliders).
 
-Refine a conventional lattice by watching the three Kossel lines of each
-secondary-reflection triple move on the stereographic projection as you drag the
-free lattice parameters; the panels update live and each shows its
-triple-intersection residual.  ``Fit`` runs the optimiser in the background.
+Refine a lattice by watching the three Kossel lines of each secondary-reflection
+triple move on the stereographic projection as you drag the free lattice
+parameters; the panels update live and each shows its triple-intersection
+residual.  ``Fit`` runs the optimiser in the background.
+
+Quasicrystals are handled as in ``slider.py``: the icosahedral crystal types
+take 6D reflection indices, projected with the slider's rational approximant of
+τ onto a cubic cell, and refine ``a`` and the phason strain matrix
+(*Icosahedral*), the phason alone (*Icosahedral (fixed a)*) or ``a`` alone
+(*Cubic (no strain)*).
 
 Run as a module from the repository root:
 
@@ -15,9 +21,10 @@ Run as a module from the repository root:
 
 With no argument it loads the shipped example
 (``configs/tripfit_rhombohedral_PMN_PT_example.json``).  The engine
-(``ts_quasi.tripfit`` and helpers) and the crystal-system lattice constraints
-(``lattice_free_slots`` / ``expand_lattice``) are shared with ``tripfit.py`` and
-the image fit, so the two workflows cannot drift.
+(``ts_quasi.tripfit`` and helpers) and the parameter constraints
+(``tripfit_free_slots`` / ``tripfit_expand``, built on the image fit's
+``lattice_free_slots`` / ``expand_lattice``) are shared with ``tripfit.py``, so
+the two workflows cannot drift.
 """
 
 import os, sys, json, copy
@@ -41,9 +48,22 @@ DEFAULT_CONFIG = os.path.join(CONFIGS, 'tripfit_rhombohedral_PMN_PT_example.json
 # Kossel-line colours (match the r/g/b convention of tripfit.py's plotster).
 LINE_PENS = ('#ff5555', '#55ff55', '#5aa0ff')
 LATTICE_LABELS = ['a', 'b', 'c', 'α', 'β', 'γ']
-# (half-range, format) for the lattice sliders: lengths in Å, angles in degrees.
-LATTICE_SPAN = [(0.3, '%0.6f'), (0.3, '%0.6f'), (0.3, '%0.6f'),
-                (1.5, '%0.6f'), (1.5, '%0.6f'), (1.5, '%0.6f')]
+# Label and (half-range, format) per slot of the 15-element tripfit parameter
+# vector (ts_quasi.tripfit_params): the lattice — lengths in Å, angles in
+# degrees — then the phason strain matrix a11..a33, spanned as in slider.py.
+PARAM_LABELS = LATTICE_LABELS + ['a%d%d' % (i, j) for i in (1, 2, 3)
+                                 for j in (1, 2, 3)]
+PARAM_SPAN = [(0.3, '%0.6f')] * 3 + [(1.5, '%0.6f')] * 3 + [(0.05, '%0.7f')] * 9
+QUASI_A_SPAN = 0.2       # slider.py's half-range for the quasicrystal's 'a'
+
+# The triple a reflection family starts from when the crystal type crosses
+# between Miller (h k l) and 6D indexing, which cannot be converted into each
+# other.  Keyed by "is a quasicrystal type"; the 6D triple is T1 of
+# configs/tripfit_icosahedral_AlPdMn_example.json.
+DEFAULT_REFLIST = {
+    False: [[0, 0, 2], [2, 0, 0], [2, 0, 2]],
+    True:  [[0, 2, 0, -2, -1, 1], [0, 2, -2, -3, 0, 3], [0, 0, -3, -2, 2, 3]],
+}
 
 # Steps across the h/k/l sliders' full span: 3x the FloatSlider default, so one
 # arrow-key press moves the index a third as far.  The readout carries an extra
@@ -53,12 +73,15 @@ HKL_FMT   = '%0.5f'
 
 ALGO_METHODS = list(ts.TRIPFIT_METHODS)
 
-# Crystal-type selector entries: (display label, bravais value) — the 7
-# conventional systems, mirroring the conventional subset of slider.py's
-# CRYSTAL_TYPE_CHOICES so both GUIs present the same names.  tripfit is image-
-# free and conventional-only (no icosahedral modes).  The tetragonal/monoclinic
-# unique-axis variants are picked with the separate axis combo, not listed here.
+# Crystal-type selector entries: (display label, bravais value) — slider.py's
+# CRYSTAL_TYPE_CHOICES, so both GUIs present the same names: the icosahedral
+# quasicrystal family (ts_quasi.QUASI_SYSTEMS) and the 7 conventional systems.
+# The tetragonal/monoclinic unique-axis variants are picked with the separate
+# axis combo, not listed here.
 CRYSTAL_TYPE_CHOICES = [
+    ('Icosahedral (quasicrystal)', 'icosahedral'),
+    ('Icosahedral (fixed a)',      'icosahedral_fixed_a'),
+    ('Cubic (no strain)',          'cubic_no_strain'),
     ('Cubic',        'cubic'),
     ('Tetragonal',   'tetragonal'),
     ('Orthorhombic', 'orthorhombic'),
@@ -112,8 +135,14 @@ class FloatSlider(QtWidgets.QWidget):
         self._sl.setPageStep(max(1, n_steps // 100))
 
         self._vl = _ValueReadout()
-        self._vl.setFixedWidth(92)
         f = self._vl.font(); f.setFamily('monospace'); self._vl.setFont(f)
+        # Wide enough for the longest value the format prints over this range,
+        # sign included: a fixed 92 px clipped the leading '-' off the phason
+        # readouts ('%0.7f'), so a negative element read as positive.
+        widest = max((fmt % v for v in (val_min, val_max, -abs(val_min),
+                                        -abs(val_max))), key=len)
+        self._vl.setFixedWidth(max(92, QtGui.QFontMetrics(f).horizontalAdvance(widest)
+                                   + 14))
         self._editing = False
         self._vl.editRequested.connect(self._begin_edit)
         self._vl.editingFinished.connect(self._commit_edit)
@@ -266,16 +295,18 @@ class TripSlider(QtWidgets.QMainWindow):
 
         comp = cfg['computation']
         self._bravais = comp['bravais']
-        if self._bravais not in ts.CONVENTIONAL_SYSTEMS:
-            raise SystemExit('computation.bravais must be a conventional system, '
-                             'got %r' % self._bravais)
+        if self._bravais not in ts.TRIPFIT_SYSTEMS:
+            raise SystemExit('computation.bravais must be one of %s, got %r'
+                             % (', '.join(ts.TRIPFIT_SYSTEMS), self._bravais))
         # Pseudo-cubic re-indexing (Table 1 of doi:10.1107/S1600576723004120),
         # mirroring slider.py / fit.py: computation.pseudocubic_transform (1-12,
         # 1 = identity) selects one of the 12 equivalent indexing matrices,
         # applied as hkl' = M @ hkl to the primary reflection, the azimuthal
         # reference and every triple's reflection list.  The stored config values
         # are the base indexing; the matrix is applied at load (see below).
-        self._pc_idx = int(comp.get('pseudocubic_transform', 1))
+        # Conventional types only: a 3x3 matrix cannot re-index 6D indices.
+        self._pc_idx = (1 if self._is_quasi()
+                        else int(comp.get('pseudocubic_transform', 1)))
         if not 1 <= self._pc_idx <= len(ts.PSEUDOCUBIC_TRANSFORMS):
             self._pc_idx = 1
         self._live_res = int(comp.get('live_resolution', 200))
@@ -288,23 +319,50 @@ class TripSlider(QtWidgets.QMainWindow):
                                          'best1bin')
         _fd = comp.get('fd_step', ts.TRIPFIT_FD_STEP)
         self._fd_step = None if _fd is None else float(_fd)
-        self._six = np.array(cfg['crystal']['initial_guess'], dtype=float)
+        # The 15-element parameter vector: the lattice, then the phason strain
+        # matrix a11..a33 (crystal.phason, zero when absent — a conventional
+        # config never has one).  tau_approx is the approximant 6D indices are
+        # projected with; both are the keys slider.py exports.
+        crystal = cfg['crystal']
+        self._params = ts.tripfit_params(np.r_[
+            np.asarray(crystal['initial_guess'], dtype=float)[:6],
+            np.asarray(crystal.get('phason', [0.0] * 9), dtype=float)])
+        self._params[:6] = ts.tripfit_expand(self._bravais, self._params)[0]
+        self._tau = float(crystal.get('tau_approx', ts.TAU_APPROX))
         self._groups_cfg = cfg['intersections']
         if not self._groups_cfg:
             raise SystemExit('config "intersections" must list at least one triple')
+        # triples of the other reflection family (h k l / 6D), set aside while
+        # the crystal type is switched across — see _switch_crystal
+        self._stash = {}
         # apply the configured pseudo-cubic matrix to the base indexing at load
         if self._pc_idx != 1:
             self._reindex(ts.pseudocubic_matrix(self._pc_idx))
 
+    def _is_quasi(self):
+        return self._bravais in ts.QUASI_SYSTEMS
+
     def _free_slots(self):
-        return ts.lattice_free_slots(self._bravais)
+        return ts.tripfit_free_slots(self._bravais)
+
+    def _shown_slots(self):
+        """Parameter slots that get a slider: the refined ones, plus the 'a' an
+        icosahedral_fixed_a fit holds, which still sets the cell (slider.py
+        shows it too)."""
+        free = self._free_slots()
+        return [0] + free if self._bravais == 'icosahedral_fixed_a' else free
 
     def _reduced(self):
-        return np.array([self._six[s] for s in self._free_slots()], dtype=float)
+        return np.array([self._params[s] for s in self._free_slots()], dtype=float)
 
     def _set_reduced(self, x):
         for s, v in zip(self._free_slots(), np.atleast_1d(x)):
-            self._six[s] = float(v)
+            self._params[s] = float(v)
+
+    def _constrain_lattice(self):
+        """Apply the crystal type's symmetry constraint to the lattice slots,
+        leaving the phason slots alone (cubic_no_strain only ignores them)."""
+        self._params[:6] = ts.tripfit_expand(self._bravais, self._params)[0]
 
     # ── engines ───────────────────────────────────────────────────────────────
     def _rebuild_engines(self):
@@ -313,7 +371,8 @@ class TripSlider(QtWidgets.QMainWindow):
             reflist = np.matrix(np.array(gc['reflist'], dtype=float))
             tf = ts.tripfit(self._hkl, reflist, self._azir,
                             self._live_res, self._bravais, float(gc['energy']),
-                            float(gc.get('target', 0.0)))
+                            float(gc.get('target', 0.0)),
+                            params=self._params, tau=self._tau)
             self._groups.append({
                 'label': gc.get('label', 'T%d' % (gi + 1)),
                 'reflist': reflist, 'target': float(gc.get('target', 0.0)),
@@ -351,9 +410,12 @@ class TripSlider(QtWidgets.QMainWindow):
         self._crystal_combo = QtWidgets.QComboBox()
         for _disp, _name in CRYSTAL_TYPE_CHOICES:
             self._crystal_combo.addItem(_disp, _name)
-        self._crystal_combo.setToolTip('Crystal system — sets which lattice '
-                                       'parameters are free (constrained by '
-                                       'symmetry via expand_lattice).')
+        self._crystal_combo.setToolTip(
+            'Crystal type — sets which parameters are free: the symmetry-allowed '
+            'lattice parameters of a conventional system (h k l reflections), or '
+            'a and/or the phason strain matrix of an icosahedral quasicrystal '
+            'type (6D reflections).  Crossing between the two swaps the triples '
+            'for the ones last used with that indexing.')
         self._axis_combo = QtWidgets.QComboBox()
         self._axis_combo.setToolTip('Tetragonal: unique axis · Monoclinic: '
                                     'non-90° angle')
@@ -371,13 +433,16 @@ class TripSlider(QtWidgets.QMainWindow):
             'J. Appl. Cryst. 56, 1046-1050).  Re-indexes the primary hkl, the '
             'azimuthal reference and every triple’s reflection list as M · hkl '
             'to test the equivalent indexing choices of a pseudo-cubic crystal '
-            '(1 = identity).  The lattice parameters are left untouched.')
+            '(1 = identity).  The lattice parameters are left untouched.  '
+            'Conventional crystal types only — 6D indices cannot be re-indexed '
+            'by a 3x3 matrix.')
         self._pc_combo = QtWidgets.QComboBox()
         for _i in range(1, len(ts.PSEUDOCUBIC_TRANSFORMS) + 1):
             self._pc_combo.addItem('%2d  %s' % (_i, ts.pseudocubic_label(_i)), _i)
         _j = self._pc_combo.findData(self._pc_idx)
         self._pc_combo.setCurrentIndex(_j if _j >= 0 else 0)
         self._pc_combo.setToolTip(pc_lbl.toolTip())
+        self._pc_combo.setEnabled(not self._is_quasi())
         self._pc_combo.currentIndexChanged.connect(self._on_pc_transform_changed)
         pc_row.addWidget(pc_lbl)
         pc_row.addWidget(self._pc_combo, 1)
@@ -491,7 +556,7 @@ class TripSlider(QtWidgets.QMainWindow):
             views[panel['label']] = (list(xr), list(yr))
         return views
 
-    def _build_panels(self):
+    def _build_panels(self, keep_views=True):
         """One stereographic plot per intersection group, with three Kossel-line
         curves and the three intercept markers.  Each group gets an independent
         pg.PlotWidget (see the layout note in the UI setup) so the aspect-locked
@@ -499,8 +564,10 @@ class TripSlider(QtWidgets.QMainWindow):
 
         A group's zoom/pan is remembered by label across the rebuild, so adding
         or removing a triple does not yank the other panels back to autorange.
-        Panels the user never zoomed (still autoranging) are left autoranging."""
-        saved = self._panel_views()
+        Panels the user never zoomed (still autoranging) are left autoranging.
+        ``keep_views=False`` drops the remembered views, for when the triples
+        were replaced wholesale and a matching label is a different triple."""
+        saved = self._panel_views() if keep_views else {}
         # tear down any existing panels (hidden ones are parented, not in the grid)
         for panel in getattr(self, '_panels', []):
             w = panel['widget']
@@ -560,14 +627,22 @@ class TripSlider(QtWidgets.QMainWindow):
             w = it.widget()
             if w is not None:
                 w.setParent(None); w.deleteLater()
-        self._lat_sliders = {}
-        for slot in self._free_slots():
-            half, fmt = LATTICE_SPAN[slot]
-            v = float(self._six[slot])
-            fs = FloatSlider(LATTICE_LABELS[slot], v, v - half, v + half, fmt)
+        self._param_sliders = {}
+        free = set(self._free_slots())
+        for slot in self._shown_slots():
+            half, fmt = PARAM_SPAN[slot]
+            if slot == 0 and self._is_quasi():
+                half = QUASI_A_SPAN
+            v = float(self._params[slot])
+            fs = FloatSlider(PARAM_LABELS[slot], v, v - half, v + half, fmt)
+            if slot not in free:
+                fs.setToolTip('Held fixed by this crystal type — not refined by Fit')
+            elif slot in ts.TRIPFIT_PHASON_SLOTS:
+                fs.setToolTip('Phason strain matrix element %s — refined by Fit'
+                              % PARAM_LABELS[slot])
             fs.valueChanged.connect(self._on_slider(slot))
             self._slider_vbox.addWidget(fs)
-            self._lat_sliders[slot] = fs
+            self._param_sliders[slot] = fs
         # primary hkl — sets the pole the frame is rotated onto, i.e. the origin
         # of the stereographic projection.  Configuration only: these are NOT in
         # the fit's free-parameter vector (``_reduced`` = lattice free slots).
@@ -583,8 +658,14 @@ class TripSlider(QtWidgets.QMainWindow):
             self._hkl_sliders.append(fs)
 
     # ── intersection-group editor ────────────────────────────────────────────────
-    _COLS = ['Label', 'Refl 1 (h k l)', 'Refl 2 (h k l)', 'Refl 3 (h k l)',
-             'Energy', 'Target']
+    def _n_indices(self):
+        """Indices per reflection: 6D for a quasicrystal type, else h k l."""
+        return 6 if self._is_quasi() else 3
+
+    def _cols(self):
+        idx = '6D' if self._is_quasi() else 'h k l'
+        return (['Label'] + ['Refl %d (%s)' % (i, idx) for i in (1, 2, 3)]
+                + ['Energy', 'Target'])
 
     def _build_intersections_editor(self):
         box = QtWidgets.QGroupBox('Triple intersections')
@@ -592,15 +673,16 @@ class TripSlider(QtWidgets.QMainWindow):
         v.setContentsMargins(4, 4, 4, 4)
         v.setSpacing(4)
 
-        self._table = QtWidgets.QTableWidget(0, len(self._COLS))
-        self._table.setHorizontalHeaderLabels(self._COLS)
+        self._table = QtWidgets.QTableWidget(0, len(self._cols()))
+        self._table.setHorizontalHeaderLabels(self._cols())
         self._table.verticalHeader().setDefaultSectionSize(22)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self._table.setToolTip(
             'Each row is one triple intersection: three secondary reflections '
             'whose Kossel lines should meet.  Reflections are space-separated '
-            'integers; energy is keV.  The tightest (closest) crossing triple is '
+            'integers — h k l, or the six 6D indices of an icosahedral crystal '
+            'type; energy is keV.  The tightest (closest) crossing triple is '
             'scored automatically.  Edits update the panels live.  Untick a row '
             'to drop that triple from the fit and the summed residual — its panel '
             'stays visible, dimmed, so you can watch it while it is excluded.')
@@ -655,6 +737,7 @@ class TripSlider(QtWidgets.QMainWindow):
 
     def _populate_table(self):
         self._table.blockSignals(True)
+        self._table.setHorizontalHeaderLabels(self._cols())
         self._table.setRowCount(len(self._groups_cfg))
         for r, gc in enumerate(self._groups_cfg):
             refl = np.array(gc['reflist'], dtype=float)
@@ -676,13 +759,14 @@ class TripSlider(QtWidgets.QMainWindow):
         """Parse the editor into a list of group-config dicts.  Returns
         (groups, error_string); error_string is '' on success."""
         groups = []
+        n = self._n_indices()
         for r in range(self._table.rowCount()):
             def cell(c):
                 it = self._table.item(r, c)
                 return it.text().strip() if it is not None else ''
             try:
-                reflist = [self._parse_vec(cell(1)), self._parse_vec(cell(2)),
-                           self._parse_vec(cell(3))]
+                reflist = [self._parse_vec(cell(1), n), self._parse_vec(cell(2), n),
+                           self._parse_vec(cell(3), n)]
                 energy = float(cell(4))
                 target = float(cell(5) or 0.0)
             except ValueError as e:
@@ -717,11 +801,8 @@ class TripSlider(QtWidgets.QMainWindow):
         self._status.showMessage('Applied %d triple intersection(s)' % len(groups))
 
     def _on_add_group(self):
-        template = (copy.deepcopy(self._groups_cfg[-1]) if self._groups_cfg else
-                    {'reflist': [[0, 0, 2], [2, 0, 0], [2, 0, 2]],
-                     'energy': self._groups_cfg[0]['energy']
-                     if self._groups_cfg else 8.0,
-                     'target': 0.0})
+        template = (copy.deepcopy(self._groups_cfg[-1]) if self._groups_cfg
+                    else self._default_groups()[0])
         template['label'] = 'T%d' % (self._table.rowCount() + 1)
         self._groups_cfg = list(self._groups_cfg) + [template]
         self._populate_table()
@@ -772,10 +853,9 @@ class TripSlider(QtWidgets.QMainWindow):
     # ── interactions ────────────────────────────────────────────────────────────
     def _on_slider(self, slot):
         def handler(v):
-            self._six[slot] = float(v)
+            self._params[slot] = float(v)
             # keep symmetry-linked lattice slots visually in step
-            self._six = np.array(ts.expand_lattice(self._bravais, self._six),
-                                 dtype=float)
+            self._constrain_lattice()
             self._update_timer.start()
         return handler
 
@@ -851,15 +931,44 @@ class TripSlider(QtWidgets.QMainWindow):
         suffix = self._axis_combo.currentData() if self._axis_combo.count() else ''
         return base + (suffix or '')
 
+    def _default_groups(self):
+        """A single starter triple in the active type's indexing."""
+        energy = (float(self._groups_cfg[0]['energy']) if self._groups_cfg
+                  else 8.0)
+        return [{'label': 'T1',
+                 'reflist': copy.deepcopy(DEFAULT_REFLIST[self._is_quasi()]),
+                 'energy': energy, 'target': 0.0, 'enabled': True}]
+
     def _switch_crystal(self, name):
         if not name or name == self._bravais:
             return
+        was_quasi = self._is_quasi()
+        groups, err = self._read_table()    # keep an edit still being debounced
+        if not err:
+            self._groups_cfg = groups
         self._bravais = name
-        self._six = np.array(ts.expand_lattice(name, self._six), dtype=float)
+        self._constrain_lattice()
+        msg = 'Crystal type: %s' % name
+        swapped = self._is_quasi() != was_quasi
+        if swapped:
+            # h k l and 6D reflections cannot be converted into each other —
+            # slider.py clears its selection here for the same reason.  Set the
+            # old family's triples aside and bring back the ones last used with
+            # the new family, so switching back and forth loses nothing.
+            self._stash[was_quasi] = self._groups_cfg
+            self._groups_cfg = (self._stash.pop(self._is_quasi(), None)
+                                or self._default_groups())
+            self._cfg['intersections'] = self._groups_cfg
+            self._populate_table()
+            msg += ' — triples swapped for the %s set' % (
+                '6D' if self._is_quasi() else 'h k l')
+        self._pc_combo.setEnabled(not self._is_quasi())
         self._populate_sliders()
         self._rebuild_engines()
+        if swapped:
+            self._build_panels(keep_views=False)
         self._redraw()
-        self._status.showMessage('Crystal type: %s' % name)
+        self._status.showMessage(msg)
 
     def _on_crystal_changed(self, _idx=None):
         base = self._crystal_combo.currentData()
@@ -891,6 +1000,15 @@ class TripSlider(QtWidgets.QMainWindow):
     def _on_pc_transform_changed(self, _idx=None):
         new = self._pc_combo.currentData()
         if new is None or new == self._pc_idx:
+            return
+        if self._is_quasi():
+            # 6D indices cannot be re-indexed by a 3x3 matrix — snap the combo
+            # back to the active matrix, as slider.py does.
+            self._pc_combo.blockSignals(True)
+            self._pc_combo.setCurrentIndex(max(0, self._pc_combo.findData(self._pc_idx)))
+            self._pc_combo.blockSignals(False)
+            self._status.showMessage('Pseudo-cubic re-indexing needs a '
+                                     'conventional crystal type')
             return
         # flush any pending (debounced) table edits so we re-index what is shown
         groups, err = self._read_table()
@@ -928,6 +1046,7 @@ class TripSlider(QtWidgets.QMainWindow):
         self._pc_combo.blockSignals(True)
         self._pc_combo.setCurrentIndex(j if j >= 0 else 0)
         self._pc_combo.blockSignals(False)
+        self._pc_combo.setEnabled(not self._is_quasi())
         self._sp_live.setValue(self._live_res)
         self._sp_fit.setValue(self._fit_res)
         self._populate_sliders()
@@ -970,7 +1089,14 @@ class TripSlider(QtWidgets.QMainWindow):
         cfg['computation']['boundrange'] = list(self._boundrange)
         cfg['computation']['fd_step'] = (None if self._fd_step is None
                                          else float(self._fd_step))
-        cfg.setdefault('crystal', {})['initial_guess'] = [float(v) for v in self._six]
+        crystal = cfg.setdefault('crystal', {})
+        crystal['initial_guess'] = [float(v) for v in self._params[:6]]
+        if self._is_quasi():
+            crystal['phason'] = [float(v) for v in self._params[6:15]]
+            crystal['tau_approx'] = float(self._tau)
+        else:
+            crystal.pop('phason', None)
+            crystal.pop('tau_approx', None)
         return cfg
 
     # ── panel rendering ─────────────────────────────────────────────────────────
@@ -1028,10 +1154,10 @@ class TripSlider(QtWidgets.QMainWindow):
 
     # ── live redraw ───────────────────────────────────────────────────────────
     def _redraw(self):
-        # keep lattice slider readouts in step with symmetry-linked values
-        for slot, fs in self._lat_sliders.items():
-            if abs(fs.val - self._six[slot]) > 1e-9:
-                fs.blockSignals(True); fs.setValue(float(self._six[slot]))
+        # keep parameter slider readouts in step with symmetry-linked values
+        for slot, fs in self._param_sliders.items():
+            if abs(fs.val - self._params[slot]) > 1e-9:
+                fs.blockSignals(True); fs.setValue(float(self._params[slot]))
                 fs.blockSignals(False)
         # keep h/k/l readouts in step with programmatic hkl changes (re-index, load)
         for i, fs in enumerate(getattr(self, '_hkl_sliders', [])):
@@ -1042,6 +1168,7 @@ class TripSlider(QtWidgets.QMainWindow):
         total = 0.0
         for g, panel in zip(self._groups, self._panels):
             tf = g['tf']
+            tf.set_params(self._params)       # what the mode holds fixed
             # A hidden panel is always an excluded one, so it contributes nothing
             # to the sum and nobody can see it — skip the Kossel-line solve.
             if not panel['shown']:
@@ -1091,6 +1218,8 @@ class TripSlider(QtWidgets.QMainWindow):
             return
         method = self._algo_combo.currentText()
         self._fit_res = int(self._sp_fit.value())
+        for g in self._groups:
+            g['tf'].set_params(self._params)
         x0 = self._reduced()
         lb = x0 + self._boundrange[0]
         ub = x0 + self._boundrange[1]
@@ -1117,16 +1246,18 @@ class TripSlider(QtWidgets.QMainWindow):
         self._btn_fit.setEnabled(True)
         self._btn_stop.setEnabled(False)
         self._set_reduced(x)
-        self._six = np.array(ts.expand_lattice(self._bravais, self._six),
-                             dtype=float)
+        self._constrain_lattice()
         # restore live resolution for the overlay
         for g in self._groups:
             g['tf'].resolution = self._live_res
         self._redraw()
-        lat = np.array2string(np.array(ts.expand_lattice(self._bravais, self._six)),
-                              precision=6)
-        self._status.showMessage('Fit done — Σ res=%.4e  lattice=%s'
-                                 % (residual, lat))
+        lattice, phason = ts.tripfit_expand(self._bravais, self._params)
+        if self._is_quasi():
+            desc = 'a=%.6f  phason=%s' % (
+                lattice[0], np.array2string(np.array(phason), precision=6))
+        else:
+            desc = 'lattice=%s' % np.array2string(np.array(lattice), precision=6)
+        self._status.showMessage('Fit done — Σ res=%.4e  %s' % (residual, desc))
 
     def closeEvent(self, ev):
         if self._fit_worker is not None:
