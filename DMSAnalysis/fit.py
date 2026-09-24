@@ -251,63 +251,9 @@ for _idx, _val in cfg["manual_centres"].items():
     centres[int(_idx)] = _val / 2 * zoomval
 
 #                            0_a        1_b    2_c    3_alpha     4_beta  5_gamma  6_psicor  7_hcor   8_kcor   9_lcor   10_detdist              11_dxrot   12_dyrot    13_dzrot    14_energy           15_pmatrix ->
-if CONVENTIONAL:
-    # Conventional crystal: the free lattice slots are selected by the crystal
-    # system; the phason block is never optimised.
-    ig = initial_guess[ts.reduced_param_indices(bravais, detoptimize, energyopt)]
-
-elif bravais == 'icosahedral':
-
-    if detoptimize:
-        if energyopt:
-            ig = initial_guess[[0,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23]]
-        else:
-            ig = initial_guess[[0,6,7,8,9,10,11,12,13,15,16,17,18,19,20,21,22,23]]
-    else:
-        if energyopt:
-            ig = initial_guess[[0,6,7,8,9,14,15,16,17,18,19,20,21,22,23]]
-            print(ig)
-        else:
-            ig = initial_guess[[0,6,7,8,9,15,16,17,18,19,20,21,22,23]]
-
-elif bravais == 'cubic_no_strain':
-
-    if detoptimize:
-        if energyopt:
-            ig = initial_guess[[0,6,7,8,9,10,11,12,13]]
-        else:
-            ig = initial_guess[[0,6,7,8,9,10,11,12]]
-    else:
-        if energyopt:
-            ig = initial_guess[[0,6,7,8,13]]
-        else:
-            ig = initial_guess[[0,6,7,8]]
-
-elif bravais == 'icosahedral_fixed_a':
-
-    if detoptimize:
-        if energyopt:
-            ig = initial_guess[[6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23]]
-        else:
-            ig = initial_guess[[6,7,8,9,10,11,12,14,15,16,17,18,19,20,21,22,23]]
-    else:
-        if energyopt:
-            ig = initial_guess[[6,7,8,13,14,15,16,17,18,19,20,21,22,23]]
-        else:
-            ig = initial_guess[[6,7,8,14,15,16,17,18,19,20,21,22,23]]
-
-elif bravais == 'calibrate':
-
-    if detoptimize:
-        if energyopt:
-            ig = initial_guess[[6,7,8,9,10,11,12,13]]
-        else:
-            ig = initial_guess[[6,7,8,9,10,11,12]]
-    else:
-        if energyopt:
-            ig = initial_guess[[6,7,8,13]]
-        else:
-            ig = initial_guess[[6,7,8]]
+# The reduced vector is packed exactly as dmsfit_ico_hkl.imcalc unpacks it for
+# this mode (conventional: the free lattice slots; never the phason block).
+ig = initial_guess[ts.imcalc_param_indices(bravais, detoptimize, energyopt)]
 
 iglow = ig - 1.5
 ighigh = ig + 1.5

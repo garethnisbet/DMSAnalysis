@@ -408,7 +408,10 @@ small lattice distortions of pseudo-symmetric crystals. Used by the
 |------|-----------|-------------|
 | `kosscalc` | `(lattice, energy, ref1, ref2, azir, start, end, steps)` | Kossel-line locus of secondary reflections `ref2` about primary `ref1`, swept over azimuth; returns `[x,y,z,ψ,θ]` per sample |
 | `stereoproj` | `(vin)` | Stereographic projection of unit vectors (N×3) → 2×N `[x,y]` |
-| `intersections` | `(a, b)` | Intersection points of two closed stereographic loci (uses shapely); returns `(xs, ys, ring_a, ring_b)` |
+| `intersections` | `(a, b)` | Intersection points of two closed stereographic **polylines** (uses shapely); returns `(xs, ys, ring_a, ring_b)`. The fallback path — see *Crossings are solved on the cones* below |
+| `sphere_circle_plane` | `(v)` | `(n, c, resid)` for the plane `v·n = c` of the circle unit vectors `v` (N×3, N≥3) lie on, and the worst deviation from it. The sign of `(n, c)` is arbitrary; raises if the points fix no circle |
+| `cone_pair_directions` | `(n1, c1, n2, c2)` | The unit directions where two Kossel cones meet — `v·n1 = c1`, `v·n2 = c2`, `\|v\| = 1` — as a `(k,3)` array, k of 2, 1 (tangent) or 0 (no crossing); raises for coaxial axes |
+| `KOSSEL_CIRCLE_TOL` | — | Plane deviation past which a locus is not accepted as a circle (`1e-9`; a real one sits at ~`5e-16`) |
 | `triple_spread` | `(pts)` | Residual metric: summed squared pairwise distance of three stereographic points (3×2) |
 
 ### `class tripfit(hkl, reflist, azir, resolution, bravais, energy, target, params=None, tau=TAU_APPROX)`
@@ -417,8 +420,10 @@ Fits a lattice by driving the three Kossel lines of a secondary-reflection tripl
 - `hkl` — the primary reflection as a **2-D row**, `np.array([[h, k, l]], dtype=float)` (shape `(1,3)`). A flat 1-D `[h,k,l]` raises inside `kosscalc`, which `fit()` silently turns into the 500 penalty — see *Residual* below.
 - `bravais` — one of `TRIPFIT_SYSTEMS`: a conventional system (`reflist` 3×3 Miller indices; the free lattice parameters come from `lattice_free_slots` / `expand_lattice`, shared with the image fit) or a quasicrystal mode in `QUASI_SYSTEMS` (`reflist` 3×6 6D indices), handled exactly as the slider handles a quasicrystal — see *Quasicrystal modes* below. The wrong index count raises `ValueError`.
 - `params` — the full 15-element parameter vector `[a, b, c, α, β, γ, a11 … a33]` the reduced vector is scattered into; it supplies what a mode holds fixed (the `a` of `icosahedral_fixed_a`). `set_params(params)` updates it; a 6-element lattice is read with a zero phason.
-- Intercept selection is automatic (`_intercepts`): each line pair may cross at several points, so the **tightest (mutually-closest) triple** — one crossing per pair — is scored. This follows the physical triple intersection directly and continuously, with no dependence on shapely's geometry-dependent point ordering, so the selection cannot jump as the lattice varies (and no per-pair intercept index is needed).
+- `resolution` — how finely each Kossel line is sampled. This sets how the lines are **drawn**, and supplies the points each cone's plane is fitted from; it does **not** change the residual — see *Crossings are solved on the cones* below.
+- Intercept selection is automatic (`_intercepts`): each line pair may cross at several points, so the **tightest (mutually-closest) triple** — one crossing per pair — is scored. This follows the physical triple intersection directly and continuously, with no dependence on the point ordering, so the selection cannot jump as the lattice varies (and no per-pair intercept index is needed).
 - `target` — desired residual (0 for a perfect triple intersection).
+- `circle_residual` — after `fit()`/`full()`, the worst deviation of any sampled point from the circle it lies on; `None` when a locus failed that test and its crossings came from the sampled polylines instead.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
@@ -449,6 +454,43 @@ are projected with `Projection6dArrayApproximant(ref, tau)` (`tau` defaults to
 | `TRIPFIT_PARAM_NAMES` | — | Slot names as `computation.locked` spells them: `a b c alpha beta gamma a11 … a33` |
 | `tripfit_locked_slots` / `tripfit_locked_names` | `(names)` / `(slots)` | Map `computation.locked` names ↔ parameter slots (unknown name → `ValueError`) |
 | `tripfit_fit_positions` | `(system, locked=())` | Positions in the reduced vector the optimiser moves — the free slots not locked |
+
+#### Crossings are solved on the cones, not on the sampled lines
+
+`kosscalc` sweeps each secondary reflection's exit direction a full 360° about
+that reflection's own axis, so the locus is a **cone** of unit vectors: exactly a
+circle on the sphere, `{v : |v| = 1, v·n = c}`, which the sweep only samples.
+Crossing the sampled polylines (`intersections`) therefore crosses *chords*: the
+crossing is off by about the chord sagitta (~`1/steps²`), and `triple_spread` —
+a squared distance — by ~`1/steps⁴`.
+
+So `_intercepts` fits each locus's plane (`sphere_circle_plane`), intersects the
+two cones of a pair in closed form (`cone_pair_directions`), and projects the
+resulting directions through `stereoproj`. The residual is then a property of the
+lattice alone: on both example configs it is identical to 9 significant figures
+over 50 → 4000 steps, with the loci meeting their fitted circles to ~`1e-15`.
+
+Two consequences worth knowing:
+
+- **`resolution` buys nothing but a smoother plot.** A low value is now free —
+  at `resolution = 50` the rhombohedral example fits ~6× faster and reaches the
+  same (in that run, a slightly better) minimum.
+- **Old residuals are not comparable.** The sampled crossings let an optimiser
+  reach machine zero by tuning the cell to the polygon rather than closing the
+  triple: on the rhombohedral example one triple scored `8.1e-17` at
+  `resolution = 1000` where its crossings are really `2.2e-11` apart (the
+  sequence over 100/400/1000/4000 steps ran `1.0e-6`, `6.3e-10`, `8.1e-17`,
+  `1.2e-11`). This is also why `tripslider`'s control-panel Σ (live resolution)
+  and its status bar (fit resolution) used to report the same fit as two
+  different numbers.
+
+A locus that is not usable as a circle — deviation above `KOSSEL_CIRCLE_TOL`, or
+points that fix no plane, or a coaxial pair — falls back to `intersections` on
+the sampled polylines, and `circle_residual` is then `None`. A pair that is well
+posed but simply does not meet still raises, exactly as before: that is an answer
+about the geometry, not a reason to drop to a cruder method. `tripfit.py` prints
+the worst circle deviation (`circle fit :`, also `circlefit` in `Result.txt`) and
+the GUI names any triple that fell back next to the Σ residual.
 
 #### Residual
 

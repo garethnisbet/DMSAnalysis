@@ -201,6 +201,14 @@ lattice_fit, phason_fit = reduced_to_params(xbest)
 for g in groups:
     g['full'] = g['tf'].full(xbest)
 
+# Worst deviation of any sampled Kossel point from the circle it lies on.  The
+# crossings are solved as intersections of the cones those circles are, so this
+# is the evidence that the assumption held rather than something to assume; a
+# locus that failed it was crossed as a sampled polyline instead, and its
+# residual then depends on ``resolution`` (None below marks that case).
+_circ = [g['tf'].circle_residual for g in groups]
+circle_resid = None if any(c is None for c in _circ) else max(_circ)
+
 
 # ── plotting ────────────────────────────────────────────────────────────────
 def _ref_title(reflist):
@@ -242,6 +250,8 @@ def saveResult():
         if quasi:
             f.write('phason     = %s\n' % np.array2string(np.array(phason_fit)))
             f.write('tau_approx = %r\n' % tau)
+        f.write('circlefit  = %s\n' % ('%.3e' % circle_resid if circle_resid
+                                        is not None else 'not used (sampled)'))
         f.write('opt        = %s\n' % opt)
 
 
@@ -259,6 +269,12 @@ print('reduced x  :', np.atleast_1d(xbest))
 print('lattice    :', np.array(lattice_fit))
 if quasi:
     print('phason     :', np.array(phason_fit))
+if circle_resid is None:
+    print('circle fit : not used — a locus was crossed as a sampled polyline, '
+          'so this residual depends on the resolution')
+else:
+    print('circle fit : %.3e (worst deviation from the Kossel circle)'
+          % circle_resid)
 print('residual   :', opt)
 
 if __name__ == '__main__':

@@ -126,6 +126,39 @@ def reduced_param_indices(system, detopt, energyopt):
     return idx
 
 
+IMCALC_MODES = ('icosahedral', 'icosahedral_fixed_a', 'cubic_no_strain', 'calibrate')
+
+def imcalc_param_indices(system, detopt, energyopt):
+    '''Indices into the 24-element guess that make up the reduced vector
+    ``dmsfit_ico_hkl.imcalc`` unpacks, for any mode it supports.
+
+    The packing is fixed by imcalc's own branches, so it lives here, next to the
+    engine, for the slider and fit.py to share.  For the non-conventional modes:
+    ``a`` (unless the lattice is fixed), psicor/chicor/thcor, then slot 9 as a
+    placeholder imcalc skips — needed only when something follows it, since the
+    detector block, energy and phason block are read at fixed offsets past it —
+    then the detector (``detopt``), energy (``energyopt``) and phason block.
+
+    These tables were once written out by hand per mode and drifted from imcalc:
+    ``cubic_no_strain`` with the detector refined was one slot short (every
+    evaluation raised IndexError, so the slider overlay silently stopped
+    updating), and ``icosahedral_fixed_a`` fed the energy in as the detector z
+    rotation.'''
+    if system in CONVENTIONAL_SYSTEMS:
+        return reduced_param_indices(system, detopt, energyopt)
+    if system not in IMCALC_MODES:
+        raise ValueError('Unknown bravais: %s' % system)
+    phason = system in ('icosahedral', 'icosahedral_fixed_a')
+    idx = ([0] if system in ('icosahedral', 'cubic_no_strain') else []) + [6, 7, 8]
+    tail = ([10, 11, 12, 13] if detopt else []) + ([14] if energyopt else [])
+    if tail or phason:
+        idx += [9]
+    idx += tail
+    if phason:
+        idx += list(range(15, 24))
+    return idx
+
+
 def hklgen_3d(depth):
     '''All integer Miller indices [h,k,l] in [-depth, depth]^3 minus the origin
     (the 3D analogue of the icosahedral 6D hkl generator).'''
@@ -3174,9 +3207,12 @@ def kosscalc(lattice, energy, ref1, ref2, azir, startval, endval, steps):
 
 def stereoproj(vin):
     '''Stereographic projection of unit vectors ``vin`` (N x 3) onto the plane,
-    returned as a 2 x N array of [x, y].'''
-    return np.concatenate((vin[:, 0] / (1. - vin[:, 2]),
-                           vin[:, 1] / (1. - vin[:, 2])), 1).T
+    returned as a 2 x N array of [x, y].  Column slices rather than bare column
+    indices, so a plain ndarray projects as well as the np.matrix the sweep
+    hands over, and both come back in the type they went in as.'''
+    vin = np.asanyarray(vin, dtype=float)
+    return np.concatenate((vin[:, 0:1] / (1. - vin[:, 2:3]),
+                           vin[:, 1:2] / (1. - vin[:, 2:3])), 1).T
 
 
 def triple_spread(pts):
@@ -3193,6 +3229,99 @@ def triple_spread(pts):
     d23 = v2 - v3
     d13 = v1 - v3
     return float(d12 @ d12 + d23 @ d23 + d13 @ d13)
+
+
+# ── Kossel lines as the circles they analytically are ──────────────────────────
+# `kosscalc` sweeps each secondary reflection's exit direction a full 360 deg
+# about that reflection's own axis, so the locus is a cone of unit vectors:
+# *exactly* a circle on the sphere, {v : |v| = 1, v.n = c}, which the sweep only
+# samples.  Crossing the sampled polylines (`intersections`, via shapely) is
+# therefore crossing chords rather than arcs: the crossing sits off the true one
+# by about the chord sagitta (~1/steps^2), and `triple_spread` — a *squared*
+# distance — is wrong by ~1/steps^4.
+#
+# That made the residual a function of `resolution` rather than of the lattice,
+# and left an optimiser free to reach machine zero by tuning the cell to the
+# polygon instead of closing the triple: on the rhombohedral example, res=1000
+# scored 8e-17 for a triple whose crossings are really 2.2e-11 apart (the
+# sequence over 100/400/1000/4000 steps runs 1.0e-6, 6.3e-10, 8.1e-17, 1.2e-11).
+# The GUI showed the same fit two ways for the same reason: the status bar's
+# number came from the fit resolution and the control panel's from the live one.
+#
+# So the pair crossings are solved on the sphere instead — fit each locus's
+# plane, intersect the two cones analytically, project the directions — and the
+# residual is the same number at every resolution, which now only sets how
+# finely the lines are drawn.
+
+# Worst deviation from the fitted plane past which a locus is not accepted as a
+# circle and the sampled polylines are crossed instead.  A genuine Kossel locus
+# sits at ~5e-16 here (any resolution, both lattice families), so this is orders
+# of magnitude of headroom rather than a tuned threshold.
+KOSSEL_CIRCLE_TOL = 1e-9
+
+
+def sphere_circle_plane(v):
+    '''The plane of the circle that unit vectors ``v`` (N x 3, N >= 3) lie on:
+    ``(n, c, resid)`` for ``v . n = c`` with ``n`` a unit normal, and ``resid``
+    the worst deviation of any point from that plane.
+
+    The sign is arbitrary — negating both ``n`` and ``c`` describes the same
+    circle — so a locus's pair is only ever meaningful used together.  ``resid``
+    is the evidence that the locus *is* a circle; a caller that depends on it
+    must check it (``KOSSEL_CIRCLE_TOL``).  Raises ValueError when the points do
+    not determine a plane at all (all coincident, or a circle of zero radius).'''
+    v = np.asarray(v, dtype=float)
+    if v.ndim != 2 or v.shape[1] != 3 or v.shape[0] < 3:
+        raise ValueError('sphere_circle_plane needs an N x 3 array, N >= 3')
+    # [v | 1] @ [n; -c] = 0.  The plane is the null vector of that homogeneous
+    # system, taken over every sampled point in one SVD rather than from a
+    # chosen three of them.  The economy SVD of a bare 3-point system returns
+    # only 3 right singular vectors — dropping the very null vector wanted —
+    # so that one case asks for the full basis; at N >= 4 the economy form
+    # already spans it, and is what keeps a 4000-point locus cheap.
+    _u, s, vt = np.linalg.svd(np.column_stack((v, np.ones(len(v)))),
+                              full_matrices=len(v) < 4)
+    # The null space must be one-dimensional: the system is 4 columns wide, so
+    # three non-zero singular values mean exactly one plane.  Fewer and the
+    # points are coincident or collinear and determine no circle.
+    if s[0] <= 0 or s[2] <= 1e-10 * s[0]:
+        raise ValueError('the locus does not determine a circle')
+    w = vt[-1]
+    nrm = np.linalg.norm(w[:3])
+    if nrm < 1e-12:                       # null vector is [0,0,0,1]: no plane
+        raise ValueError('the locus does not determine a circle')
+    n = w[:3] / nrm
+    c = float(-w[3] / nrm)
+    return n, c, float(np.abs(v @ n - c).max())
+
+
+def cone_pair_directions(n1, c1, n2, c2):
+    '''The unit directions where two Kossel cones meet: the solutions of
+    ``v . n1 = c1``, ``v . n2 = c2``, ``|v| = 1``, as a (k, 3) array with k of
+    2 (the general case), 1 (tangent cones) or 0 (they do not meet).
+
+    Writing ``v = a.n1 + b.n2 + t.(n1 x n2)`` makes the two plane conditions a
+    2x2 solve for (a, b) and ``|v| = 1`` a quadratic in t, so this is closed
+    form.  Raises ValueError for parallel axes, where the cones either coincide
+    or never meet and there is no isolated crossing to return.'''
+    n1 = np.asarray(n1, dtype=float).ravel()
+    n2 = np.asarray(n2, dtype=float).ravel()
+    d = float(n1 @ n2)
+    det = 1.0 - d * d                     # |n1 x n2|^2
+    if det <= 1e-12:
+        raise ValueError('the two Kossel cones are coaxial')
+    a = (c1 - c2 * d) / det
+    b = (c2 - c1 * d) / det
+    t2 = (1.0 - (a * a + b * b + 2.0 * a * b * d)) / det
+    if t2 < -1e-12:
+        return np.zeros((0, 3))
+    base = a * n1 + b * n2
+    if t2 <= 1e-12:                       # tangent: the two roots coincide
+        out = base[None, :]
+    else:
+        out = np.vstack((base + np.sqrt(t2) * np.cross(n1, n2),
+                         base - np.sqrt(t2) * np.cross(n1, n2)))
+    return out / np.linalg.norm(out, axis=1, keepdims=True)
 
 
 def intersections(a, b):
@@ -3342,6 +3471,12 @@ class tripfit(object):
     (``triple_spread``).  ``target`` is the desired residual (0 for a perfect
     triple intersection).
 
+    The crossings are solved on the sphere, as the intersections of the cones
+    the Kossel lines exactly are, so the residual does not depend on
+    ``resolution`` — that only sets how finely the lines are sampled for
+    plotting, and for the plane fit each cone is recovered from.  See *Kossel
+    lines as the circles they analytically are* above.
+
     ``fit(reduced)`` returns the scalar residual for a reduced free-parameter
     vector; ``full(reduced)`` returns (intercepts, st0, st1, st2, vr0, vr1, vr2)
     for plotting.'''
@@ -3354,6 +3489,10 @@ class tripfit(object):
         self.energy = energy
         self.target = target
         self.tau = tau
+        # Worst deviation of any sampled Kossel point from the plane of the
+        # circle it lies on, from the last _intercepts; None when the analytic
+        # solve was not used and the sampled polylines were crossed instead.
+        self.circle_residual = None
         self.set_params(np.zeros(TRIPFIT_NPARAMS) if params is None else params)
         if bravais in QUASI_SYSTEMS:
             self.ref_6d = np.matrix(np.asarray(reflist, dtype=float))
@@ -3375,13 +3514,53 @@ class tripfit(object):
             return PhasonDistoArray(self.ref_par, self.ref_perp, phason).qe1()
         return self.reflist
 
-    def _intercepts(self):
-        '''The three pairwise Kossel-line intersection points (3x2, rows [x, y])
-        that lie closest together — the tightest triple.  Each pair crosses at
-        one or more points; picking the mutually-closest one per pair follows the
-        physical triple intersection directly and continuously, with no
-        dependence on shapely's (geometry-dependent) point ordering, so the
-        selection cannot jump as the lattice varies.'''
+    def _circle_intercepts(self):
+        '''Every pair crossing solved on the sphere: each locus's cone plane
+        (`sphere_circle_plane`), the two cones of a pair intersected in closed
+        form (`cone_pair_directions`), and the directions projected.  Returns a
+        list of three (k, 2) arrays in the order (0,1), (0,2), (1,2), or None
+        when a locus is not usable as a circle, which asks the caller to cross
+        the sampled polylines instead.  Leaves the worst plane deviation in
+        `circle_residual` — the evidence that the loci are the circles this
+        assumes (None when the analytic path was not used).
+
+        A pair that is well posed but simply does *not* meet still raises, as
+        the polyline path does: that is a real answer about the geometry, not a
+        reason to fall back to a cruder method.'''
+        planes, worst = [], 0.0
+        for vr in (self.vr0, self.vr1, self.vr2):
+            try:
+                n, c, resid = sphere_circle_plane(np.asarray(vr))
+            except ValueError:
+                self.circle_residual = None
+                return None
+            # Written as `not <=` so a NaN deviation falls back too, rather
+            # than passing a `>` test it cannot fail.
+            if not resid <= KOSSEL_CIRCLE_TOL:
+                self.circle_residual = None
+                return None
+            worst = max(worst, resid)
+            planes.append((n, c))
+        P = []
+        for i, j in ((0, 1), (0, 2), (1, 2)):
+            try:
+                v = cone_pair_directions(planes[i][0], planes[i][1],
+                                         planes[j][0], planes[j][1])
+            except ValueError:            # coaxial: no isolated crossing
+                self.circle_residual = None
+                return None
+            if not len(v):
+                raise ValueError('a Kossel-line pair has no intersection')
+            # Projected through stereoproj itself, so the analytic crossings and
+            # the plotted lines cannot end up on different conventions.
+            P.append(stereoproj(v).T)
+        self.circle_residual = worst
+        return P
+
+    def _polyline_intercepts(self):
+        '''Every pair crossing taken from the sampled stereographic polylines —
+        the fallback for a locus the circle solve will not take.  Accurate only
+        to the chord sagitta, so the result depends on `resolution`.'''
         P = []
         for A, B in ((self.st0, self.st1), (self.st0, self.st2),
                      (self.st1, self.st2)):
@@ -3389,13 +3568,31 @@ class tripfit(object):
             if not len(x):
                 raise ValueError('a Kossel-line pair has no intersection')
             P.append(np.column_stack((x, y)))
+        return P
+
+    def _intercepts(self):
+        '''The three pairwise Kossel-line intersection points (3x2, rows [x, y])
+        that lie closest together — the tightest triple.  Each pair crosses at
+        one or more points; picking the mutually-closest one per pair follows the
+        physical triple intersection directly and continuously, with no
+        dependence on the point ordering, so the selection cannot jump as the
+        lattice varies.'''
+        P = self._circle_intercepts()
+        if P is None:
+            P = self._polyline_intercepts()
         best, best_cost = None, np.inf
         for a in P[0]:
             for b in P[1]:
                 for c in P[2]:
                     cost = triple_spread((a, b, c))
-                    if cost < best_cost:
+                    # A crossing at the projection pole projects to infinity;
+                    # it is a real direction but not a usable 2D point, so it
+                    # loses to any finite alternative rather than poisoning the
+                    # comparison.
+                    if np.isfinite(cost) and cost < best_cost:
                         best_cost, best = cost, (a, b, c)
+        if best is None:
+            raise ValueError('no finite triple intersection')
         return np.array(best, dtype=float)
 
     def _params_from_reduced(self, reduced):

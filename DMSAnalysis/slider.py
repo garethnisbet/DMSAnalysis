@@ -427,26 +427,7 @@ def reduced_slots_for(bravais_, detopt, energyopt):
     """The 24-element-guess indices that make up the reduced parameter vector for
     a given mode.  Keyed on its own bravais/detopt/energyopt (not the globals) so
     a stale engine and the current mode can't disagree on the vector length."""
-    detopt = bool(detopt); energyopt = bool(energyopt)
-    if bravais_ in ts.CONVENTIONAL_SYSTEMS:
-        return list(ts.reduced_param_indices(bravais_, detopt, energyopt))
-    if bravais_ == 'icosahedral':
-        if detopt:
-            return ([0,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] if energyopt
-                    else [0,6,7,8,9,10,11,12,13,15,16,17,18,19,20,21,22,23])
-        return ([0,6,7,8,9,14,15,16,17,18,19,20,21,22,23] if energyopt
-                else [0,6,7,8,9,15,16,17,18,19,20,21,22,23])
-    elif bravais_ == 'icosahedral_fixed_a':
-        if detopt:
-            return ([6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23] if energyopt
-                    else [6,7,8,9,10,11,12,14,15,16,17,18,19,20,21,22,23])
-        return ([6,7,8,13,14,15,16,17,18,19,20,21,22,23] if energyopt
-                else [6,7,8,14,15,16,17,18,19,20,21,22,23])
-    elif bravais_ == 'cubic_no_strain':
-        if detopt:
-            return [0,6,7,8,9,10,11,12,13] if energyopt else [0,6,7,8,9,10,11,12]
-        return [0,6,7,8,13] if energyopt else [0,6,7,8]
-    raise ValueError('Unknown bravais: %s' % bravais_)
+    return list(ts.imcalc_param_indices(bravais_, bool(detopt), bool(energyopt)))
 
 def reduced_slots():
     """Reduced-vector slots for the current (global) mode."""
@@ -700,7 +681,8 @@ class FloatSlider(QtWidgets.QWidget):
     valueChanged = QtCore.pyqtSignal(float)
 
     def __init__(self, label, val_init, val_min, val_max,
-                 fmt='%0.6f', n_steps=100000, fittable=False, parent=None):
+                 fmt='%0.6f', n_steps=100000, fittable=False, show_label=True,
+                 parent=None):
         super().__init__(parent)
         self._min = val_min
         self._max = val_max
@@ -713,6 +695,12 @@ class FloatSlider(QtWidgets.QWidget):
 
         # Per-parameter fit-enable checkbox (only for fittable parameters); a
         # fixed-width spacer keeps the label column aligned when absent.
+        #
+        # show_label=False drops the checkbox spacer and the label entirely, for
+        # a caller that is placing this in a grid of its own and supplies the
+        # label in the grid's own column — the built-in one is indented by the
+        # spacer and right-aligned in a fixed 52px, so it cannot line up with
+        # plain QLabels beside it.
         self._fit_chk = None
         if fittable:
             self._fit_chk = QtWidgets.QCheckBox()
@@ -720,14 +708,16 @@ class FloatSlider(QtWidgets.QWidget):
             self._fit_chk.setFixedWidth(16)
             self._fit_chk.setToolTip('Include "%s" in the fit' % label)
             row.addWidget(self._fit_chk)
-        else:
+        elif show_label:
             _sp = QtWidgets.QWidget()
             _sp.setFixedWidth(16)
             row.addWidget(_sp)
 
-        lbl = QtWidgets.QLabel(label)
-        lbl.setFixedWidth(52)
-        lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        lbl = None
+        if show_label:
+            lbl = QtWidgets.QLabel(label)
+            lbl.setFixedWidth(52)
+            lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
         self._sl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self._sl.setRange(0, n_steps)
@@ -745,7 +735,8 @@ class FloatSlider(QtWidgets.QWidget):
         self._vl.editRequested.connect(self._begin_edit)
         self._vl.editingFinished.connect(self._commit_edit)
 
-        row.addWidget(lbl)
+        if lbl is not None:
+            row.addWidget(lbl)
         row.addWidget(self._sl, 1)
         row.addWidget(self._vl)
 
@@ -824,6 +815,7 @@ class UpdateWorker(QtCore.QThread):
     requests.  Emits ('discovery', (rows, cols)) for the full-reflist scatter or
     ('selected', dmslines) for the per-reflection selected curves."""
     done = QtCore.pyqtSignal(str, object)
+    failed = QtCore.pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -905,7 +897,10 @@ class UpdateWorker(QtCore.QThread):
                 resid = getattr(dms_ref, 'circle_residual', None)
                 self.done.emit('discovery', (rows, cols, disc_lines, sel_lines, resid))
             except Exception as e:
+                # Nothing is emitted on 'done', so the overlay keeps whatever it
+                # last drew; say so on screen rather than only in the terminal.
                 print('UpdateWorker error:', e)
+                self.failed.emit('%s: %s' % (type(e).__name__, e))
             finally:
                 self.idle.set()
 
@@ -1327,6 +1322,19 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._geo_mode        = False
         self._psi_tol         = 3.0
         self._use_auto        = False
+        # |q_perp| ceiling for the generated reflection list.  None means no
+        # cut (the slider sits at the top of its range), which is what keeps a
+        # Depth change from silently inheriting an earlier set's maximum as a
+        # cutoff.  See _apply_qperp_cut.
+        self._qperp_cut       = None
+        # |q_perp| per row of the current full reflist, cached so the mask is
+        # a numpy compare rather than a reprojection on every slider step.
+        self._qperp_all       = np.zeros(0)
+        # Last identify: the clicked directions' scores over the whole list,
+        # and the arcs drawn for the candidates, so moving the slider can
+        # re-rank and redraw without another three clicks.
+        self._geo_scores      = None
+        self._geo_arcs        = {}
         self._pending_picks   = []
         self._pending_markers = []
         self._pick_items      = []
@@ -1391,6 +1399,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._worker = UpdateWorker()
         self._worker.done.connect(self._on_update_done,
                                   QtCore.Qt.ConnectionType.QueuedConnection)
+        self._worker.failed.connect(self._on_update_failed,
+                                    QtCore.Qt.ConnectionType.QueuedConnection)
 
         self._update_timer = QtCore.QTimer(self)
         self._update_timer.setSingleShot(True)
@@ -2009,20 +2019,61 @@ class DMSSlider(QtWidgets.QMainWindow):
         n_total = self.full_reflist.shape[0]
         init_n  = min(30, n_total)
 
-        rgl.addWidget(QtWidgets.QLabel('N refs'), 3, 0)
+        # Perpendicular-space ceiling on the generated list.  A quasicrystal's
+        # structure factor falls off steeply with |q_perp|, so most of the dense
+        # 6D set never produces a visible line; cutting on it thins the candidate
+        # pool down to the reflections that can actually be there, which is what
+        # makes the three-click identify able to choose (see _perp_strengths).
+        # At the top of its range it cuts nothing, which is the startup state.
+        _q_lo, _q_hi = self._qperp_range(self._qperp_values())
+        _qp_lbl = QtWidgets.QLabel('|q⟂| ≤')
+        self._sl_qperp = FloatSlider('|q⟂| ≤', _q_hi, _q_lo, _q_hi,
+                                     fmt='%0.4f', n_steps=2000, show_label=False)
+        self._sl_qperp.setToolTip(
+            'Drop generated reflections whose perpendicular-space component '
+            '|q_perp| exceeds this.\n\nThe structure factor of an icosahedral '
+            'quasicrystal falls off steeply with |q_perp|, so a large one means '
+            'a reflection that is indexable but not observable.  Thinning them '
+            'out leaves fewer near-degenerate candidates for Geo 3-click to '
+            'choose between, and fewer lines cluttering the overlay.\n\nAt the '
+            'top of the range nothing is cut.  The range runs from the smallest '
+            '|q_perp| present to the largest, so every position leaves something '
+            'to identify against; a cut you have set is kept across a Depth '
+            'change rather than being reset to the new maximum.\n\nCandidates '
+            'are ranked within the surviving pool, and only the best few are '
+            'drawn, so loosening the cut can push a drawn line off the list as '
+            'better-scoring ones come in — the pick label says how many of how '
+            'many are on screen.\n\nNo effect on a conventional crystal, which '
+            'has no perpendicular space.')
+        _qp_lbl.setToolTip(self._sl_qperp.toolTip())
+        rgl.addWidget(_qp_lbl, 3, 0)
+        rgl.addWidget(self._sl_qperp, 3, 1, 1, 3)
+
+        self._lbl_qperp = QtWidgets.QLabel('')
+        _f_qp = self._lbl_qperp.font()
+        _f_qp.setPointSize(7)
+        self._lbl_qperp.setFont(_f_qp)
+        self._lbl_qperp.setStyleSheet('color: #888888')
+        self._lbl_qperp.setToolTip(
+            'How many reflections the three-click identify would currently '
+            'search. The cut narrows that pool only — the generated list, '
+            'the overlay and the fit all keep every reflection.')
+        rgl.addWidget(self._lbl_qperp, 4, 0, 1, 4)
+
+        rgl.addWidget(QtWidgets.QLabel('N refs'), 5, 0)
         self._sl_n_refs = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self._sl_n_refs.setRange(1, max(1, init_n))
         self._sl_n_refs.setValue(init_n)
-        rgl.addWidget(self._sl_n_refs, 3, 1, 1, 3)
+        rgl.addWidget(self._sl_n_refs, 5, 1, 1, 3)
 
-        rgl.addWidget(QtWidgets.QLabel('Offset'), 4, 0)
+        rgl.addWidget(QtWidgets.QLabel('Offset'), 6, 0)
         self._sl_offset = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self._sl_offset.setRange(0, max(0, n_total - 1))
         self._sl_offset.setValue(0)
-        rgl.addWidget(self._sl_offset, 4, 1, 1, 3)
+        rgl.addWidget(self._sl_offset, 6, 1, 1, 3)
 
         self._lbl_nrefs = QtWidgets.QLabel('N=%d reflections' % n_total)
-        rgl.addWidget(self._lbl_nrefs, 5, 0, 1, 4)
+        rgl.addWidget(self._lbl_nrefs, 7, 0, 1, 4)
         ctrl_col2.addWidget(rg)
 
         # Pick / Identify group
@@ -2148,6 +2199,12 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._sb_depth.valueChanged.connect(lambda _: self._regenerate_reflist())
         self._sb_max_n.valueChanged.connect(lambda _: self._regenerate_reflist())
         self._sb_thresh.valueChanged.connect(lambda _: self._regenerate_reflist())
+        self._sl_qperp.valueChanged.connect(self._on_qperp_cut_changed)
+        # Coalesces a slider drag into one candidate redraw.
+        self._qperp_timer = QtCore.QTimer(self)
+        self._qperp_timer.setSingleShot(True)
+        self._qperp_timer.setInterval(120)
+        self._qperp_timer.timeout.connect(self._refilter_geo_candidates)
         self._sb_psi_tol.valueChanged.connect(
             lambda v: setattr(self, '_psi_tol', float(v)))
         self._sl_n_refs.valueChanged.connect(self._on_slice_changed)
@@ -2484,6 +2541,9 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._maybe_update_live_curves()
         self._status.setText(self._ready_text(circle_resid))
 
+    def _on_update_failed(self, msg):
+        self._status.setText('DMS overlay not updated — %s' % msg)
+
     def _ready_text(self, circle_resid):
         """Status line after an overlay update.  In circle mode it carries the
         worst deviation of any run from the circle fitted to it — in radians of
@@ -2748,6 +2808,150 @@ class DMSSlider(QtWidgets.QMainWindow):
 
     # ── Reflist management ─────────────────────────────────────────────────────
 
+    # |q_perp| filtering of the identify candidate pool ------------------------
+    #
+    # The cut narrows what Geo 3-click / nearest-ref will *consider*; it does not
+    # touch the generated list, the overlay slice or the fit.  That is what makes
+    # it live: filtering the reflist meant re-running hklgen and rebuilding the
+    # overlay engine on every step of a 2000-step slider, which at Depth 3 is
+    # over 100k reflections regenerated per drag event.  Masking a cached norm
+    # array costs nothing, so the slider can act while it is being dragged.
+    #
+    # `_qperp_cut` is an *absolute* ceiling, not a fraction of the range: a
+    # reflection's perpendicular-space component does not change when Depth does,
+    # so a cut the user has chosen must keep meaning the same thing when the set
+    # around it grows.  The range, by contrast, follows the generated set, so the
+    # slider's travel is always spent where the reflections actually are.  None
+    # means "not set" and pins the slider to the top on every regeneration, so an
+    # untouched slider never starts cutting because Depth went up.
+
+    def _qperp_values(self, reflist2=None):
+        """|q_perp| per row of a perpendicular-component array (the window's own
+        by default).  All zeros for a conventional crystal — there is no
+        cut-and-projection — which `_qperp_range_max` turns into a disabled
+        slider rather than a degenerate range."""
+        r2 = self.full_reflist2 if reflist2 is None else reflist2
+        r2 = np.asarray(r2, dtype=float)
+        if r2.size == 0:
+            return np.zeros(0)
+        return np.linalg.norm(r2, axis=1)
+
+    @staticmethod
+    def _qperp_range(qperp):
+        """(lo, hi) for the cut slider over a set of |q_perp| values.
+
+        `lo` is the *smallest* |q_perp| present, not zero, so every position on
+        the slider leaves something to identify against and the pool shrinks
+        monotonically as it is dragged down.  Ranging from zero gave the bottom
+        of the travel a dead zone where the ceiling passed nothing — which then
+        had to fall back to the whole list, so the slider showed the same
+        candidates at the bottom as at the top and different ones in between.
+
+        The span is never zero-width: FloatSlider maps value to position by
+        dividing through it, so an empty range raises on the first setValue.  A
+        conventional crystal (all zeros), an empty list, and a set whose
+        |q_perp| values are all equal all land here."""
+        q  = np.asarray(qperp, dtype=float)
+        hi = float(q.max()) if q.size else 0.0
+        lo = float(q.min()) if q.size else 0.0
+        if hi <= 0:
+            return 0.0, 1.0
+        if lo >= hi:
+            lo = 0.0            # one shell only — let the slider span down to 0
+        return lo, hi
+
+    @staticmethod
+    def _qperp_le(q, cut):
+        """`q <= cut`, with a relative tolerance.
+
+        Symmetry-equivalent reflections have mathematically equal |q_perp| but
+        their computed norms differ in the last bits, so an exact compare can
+        admit one member of a star and drop another — which reads as the cut
+        behaving erratically.  The tolerance is far above that noise and far
+        below any real separation between shells."""
+        return np.asarray(q, dtype=float) <= float(cut) * (1.0 + 1e-9)
+
+    def _qperp_usable(self):
+        """Whether the cut means anything at all: a quasicrystal with cached
+        norms that are not all zero.  The mask, the slider's enabled state and
+        the pool label all read this, so they cannot disagree about whether a
+        cut is in force — the label used to ask the widget instead, which made
+        it describe the crystal the window was *built* on rather than the mode
+        it is in."""
+        q = getattr(self, '_qperp_all', None)
+        return (not CONVENTIONAL) and q is not None and q.size > 0 \
+            and float(q.max()) > 0
+
+    def _refresh_qperp(self):
+        """Cache |q_perp| for the current full reflist and re-range the slider.
+
+        Called from `_regenerate_reflist` — the norms are what the mask is taken
+        over, so they must be recomputed whenever the list is, and they stay
+        row-aligned with `full_reflist_6d` by being derived from it."""
+        self._qperp_all = self._qperp_values()
+        lo, top = self._qperp_range(self._qperp_all)
+        self._sl_qperp.setEnabled(self._qperp_usable())
+        # setRange clamps the current value without emitting, so re-ranging here
+        # cannot re-enter _on_qperp_cut_changed.
+        self._sl_qperp.blockSignals(True)
+        self._sl_qperp.setRange(lo, top)
+        self._sl_qperp.setValue(top if self._qperp_cut is None
+                                else min(max(self._qperp_cut, lo), top))
+        self._sl_qperp.blockSignals(False)
+        self._update_qperp_label()
+
+    def _qperp_mask(self):
+        """Boolean mask over the full reflist: which reflections the identify may
+        consider.  All-True when the cut is off, on a conventional crystal, or
+        when the norms are not cached yet.
+
+        A ceiling below every |q_perp| present keeps the smallest shell rather
+        than nothing — and, importantly, rather than everything, which is what an
+        earlier version fell back to and which made the bottom of the slider show
+        the same candidates as the top.  The slider's own range now starts at
+        that smallest value, so this is only reachable when a cut set on one
+        reflection set is carried onto a different one."""
+        q = getattr(self, '_qperp_all', None)
+        n = int(np.asarray(self.full_reflist_6d).shape[0])
+        if (not self._qperp_usable()) or q.size != n or self._qperp_cut is None:
+            return np.ones(n, dtype=bool)
+        keep = self._qperp_le(q, self._qperp_cut)
+        if not keep.any():
+            keep = self._qperp_le(q, float(q.min()))
+        return keep
+
+    def _update_qperp_label(self):
+        """How much of the list the identify would currently look at."""
+        lbl = getattr(self, '_lbl_qperp', None)
+        if lbl is None:
+            return
+        n = int(np.asarray(self.full_reflist_6d).shape[0])
+        if not self._qperp_usable():
+            lbl.setText('identify pool: all %d (no perpendicular space)' % n)
+            return
+        if self._qperp_cut is None:
+            lbl.setText('identify pool: all %d' % n)
+            return
+        n_pass = int(self._qperp_mask().sum())
+        lbl.setText('identify pool: %d / %d  (|q⟂| ≤ %.4f)'
+                    % (n_pass, n, self._qperp_cut))
+
+    def _on_qperp_cut_changed(self, v):
+        """Slider moved.  Records the ceiling, updates the count, and re-filters
+        whatever candidates are on screen — no regeneration, so this is cheap
+        enough to run while the slider is being dragged.
+
+        At the top of the range the cut is recorded as None rather than as that
+        number, so it reads as off — and stays off if Depth later generates
+        reflections beyond it."""
+        top = self._sl_qperp._max
+        self._qperp_cut = None if v >= top - 1e-12 else float(v)
+        self._update_qperp_label()
+        # Coalesce a drag into one redraw: hiding arcs is instant, but a
+        # candidate re-entering the top of the ranking needs a one-reflection
+        # imcalc to trace, so the redraw is worth debouncing.
+        self._qperp_timer.start()
+
     def _regenerate_reflist(self):
         depth  = self._sb_depth.value()
         thresh = self._sb_thresh.value()
@@ -2768,6 +2972,9 @@ class DMSSlider(QtWidgets.QMainWindow):
         self.full_reflist    = rl
         self.full_reflist2   = rl2
         self.full_reflist_6d = src
+        # Cache |q_perp| and re-range the cut slider for the set just built; the
+        # cut itself is applied at identify time, not here.
+        self._refresh_qperp()
         n_total = rl.shape[0]
         init_n  = min(max_n, n_total)
         self._sl_n_refs.blockSignals(True)
@@ -2970,6 +3177,12 @@ class DMSSlider(QtWidgets.QMainWindow):
         for i in range(self._arc_list.count()):
             if self._arc_list.item(i).text() == vec_str:
                 return
+        # A candidate that has been selected belongs to the user now — drop it
+        # from the identify's cache so a later |q_perp| re-filter cannot hide the
+        # arc of a reflection that is in the selected list.
+        for row, cached in list(self._geo_arcs.items()):
+            if cached is arc_item:
+                del self._geo_arcs[row]
         list_item = QtWidgets.QListWidgetItem(vec_str)
         list_item.setFlags(list_item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
         list_item.setCheckState(QtCore.Qt.CheckState.Checked)
@@ -2995,6 +3208,9 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._vb.removeItem(arc_item)
             self._pick_items.remove(arc_item)
         self._arc_to_6d.pop(id(arc_item), None)
+        for row, cached in list(self._geo_arcs.items()):
+            if cached is arc_item:
+                del self._geo_arcs[row]
         if not getattr(self, '_bulk_select', False):
             self._on_selection_changed()
 
@@ -3101,6 +3317,10 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._vb.removeItem(item)
         self._pick_items.clear()
         self._arc_to_6d.clear()
+        # The candidate arcs have just been removed from the scene; the cached
+        # rows would otherwise point at dead items.
+        self._geo_arcs.clear()
+        self._geo_scores = None
         self._arc_to_list_item.clear()
         self._arc_list.clear()
         for m in self._pending_markers:
@@ -3252,6 +3472,41 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._arc_to_6d[id(arc)] = hkl_6d.copy()
         return arc
 
+    def _perp_strengths(self, idx):
+        """Perpendicular-space component |q_perp| of the candidate reflections
+        `idx`, and its ratio to the parallel component.
+
+        The Geo 3-click / nearest-ref score (`_ewald_scores`) is purely
+        geometric: it asks whether a reflection's cone can pass through the
+        clicked directions, never whether that reflection is observable at all.
+        For an icosahedral quasicrystal the structure factor is modulated by the
+        perpendicular-space component and falls off steeply with |q_perp|, so
+        only a modest subset of the dense 6D reflection set ever produces a
+        visible line.  That makes |q_perp| the tie-breaker the score cannot
+        supply — and 6D indexing makes geometrically near-degenerate candidates
+        common, so the tie needs breaking often.
+
+        Reported, not folded into the ranking: the candidates stay sorted by
+        psi_err, because a composite score would hide a poor geometric match
+        behind a plausible-looking |q_perp|.  The two numbers answer different
+        questions and are left to be read together.
+
+        Norms are taken on the projected components exactly as
+        `build_reflist_from_6d` returns them — both in the same units, so the
+        ratio is dimensionless and the magnitudes compare between candidates.
+        Neither is converted to A^-1, which a ranking aid does not need.
+
+        Returns (q_perp, perp/par) arrays, or None for a conventional crystal,
+        where there is no cut-and-projection and every perpendicular component
+        is zero.
+        """
+        if CONVENTIONAL:
+            return None
+        idx   = np.asarray(idx, dtype=int)
+        qperp = np.linalg.norm(np.asarray(self.full_reflist2, dtype=float)[idx], axis=1)
+        qpar  = np.linalg.norm(np.asarray(self.full_reflist,  dtype=float)[idx], axis=1)
+        return qperp, qperp / np.where(qpar > 0, qpar, np.nan)
+
     def _run_geo_search(self, pts):
         self._sync_ig()
         self._status.setText('Searching (geo)...')
@@ -3263,31 +3518,96 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._status.setText('Ready')
             return
 
-        scores   = self._ewald_scores(dirs)
-        mask     = scores < self._psi_tol
-        cand_idx = np.where(mask)[0]
-        print('Geo search: %d/%d pass (psi_tol=%.1f°)' % (
-            len(cand_idx), len(scores), self._psi_tol))
+        # Kept so a move of the |q_perp| slider can re-rank these same three
+        # clicks without the user making them again.
+        self._geo_scores = self._ewald_scores(dirs)
+        self._add_red_crosses(pts)
+        self._show_geo_candidates(verbose=True)
+        self._status.setText('Ready')
 
-        if len(cand_idx) == 0:
+    GEO_MAX_DRAWN = 10
+
+    def _show_geo_candidates(self, verbose=False):
+        """Rank, draw and label the candidates for the last three clicks.
+
+        Shared by the three-click search and the live |q_perp| re-filter, so
+        dragging the cut shows exactly what a fresh three clicks would — the two
+        cannot present different answers for the same geometry.
+
+        Arcs are cached by reflection row and hidden rather than destroyed: each
+        one costs a single-reflection imcalc to trace, so a candidate that leaves
+        the top of the ranking and comes back as the slider moves is redrawn for
+        free."""
+        scores = self._geo_scores
+        if scores is None:
+            return
+        pool     = self._qperp_mask()
+        cand_idx = np.where((scores < self._psi_tol) & pool)[0]
+        if verbose:
+            print('Geo search: %d/%d pass (psi_tol=%.1f°%s)' % (
+                len(cand_idx), len(scores), self._psi_tol,
+                '' if self._qperp_cut is None
+                else ', |q_perp|<=%.4f' % self._qperp_cut))
+
+        sel    = cand_idx[np.argsort(scores[cand_idx])]
+        keep   = set(int(i) for i in sel[:self.GEO_MAX_DRAWN])
+        # Anything drawn for an earlier cut that is not in the new top set.
+        for row, arc in self._geo_arcs.items():
+            if row not in keep:
+                arc.setVisible(False)
+
+        if len(sel) == 0:
             self._lbl_pick.setText('No match found')
-            self._status.setText('Ready')
             return
 
-        order  = np.argsort(scores[cand_idx])
-        cands  = self.full_reflist_6d[cand_idx[order]]
-        s_vals = scores[cand_idx[order]]
+        cands   = self.full_reflist_6d[sel]
+        s_vals  = scores[sel]
+        perp    = self._perp_strengths(sel)
+        palette = [pg.intColor(i, hues=10) for i in range(self.GEO_MAX_DRAWN)]
+        shown   = self._dms_lines_shown()
+        n_drawn = 0
+        for k, row in enumerate(sel[:self.GEO_MAX_DRAWN]):
+            row = int(row)
+            if verbose:
+                extra = ('' if perp is None else
+                         '  |q_perp|=%.4f  perp/par=%.4f' % (perp[0][k], perp[1][k]))
+                print('  [%s]  psi_err=%.2f°%s' % (
+                    ' '.join('%d' % v for v in cands[k]), s_vals[k], extra))
+            arc = self._geo_arcs.get(row)
+            if arc is None:
+                arc = self._plot_arc(self.full_reflist_6d[row], palette[k])
+                if arc is None:
+                    continue          # line is off the plate at this geometry
+                self._geo_arcs[row] = arc
+            else:
+                # Rank, and so colour, can change as the cut moves.
+                arc.setBrush(pg.mkBrush(palette[k]))
+                arc._colour = pg.mkColor(palette[k])
+            arc.setVisible(shown)
+            n_drawn += 1
 
-        self._add_red_crosses(pts)
-        palette = [pg.intColor(i, hues=10) for i in range(10)]
-        for k, (hkl_6d, score) in enumerate(zip(cands[:10], s_vals[:10])):
-            print('  [%s]  psi_err=%.2f°' % (
-                ' '.join('%d' % v for v in hkl_6d), score))
-            self._plot_arc(hkl_6d, palette[k % 10])
-
+        # Say how much of the ranking is on screen.  Only GEO_MAX_DRAWN arcs are
+        # traced, and the ranking is taken over the *current* pool, so loosening
+        # the |q_perp| cut lets better-scoring candidates in and pushes drawn
+        # ones out — the drawn set is not nested even though the pool is.  That
+        # is deliberate (ranking over the unfiltered set would show almost
+        # nothing at a tight cut, since the best-scoring candidates are mostly
+        # the high-|q_perp| ones the cut exists to remove), but it is only
+        # comprehensible if the cap is visible.
         best_str = '[%s]' % ' '.join('%d' % v for v in cands[0])
-        self._lbl_pick.setText('%s  +%d more' % (best_str, max(0, len(cands) - 1)))
-        self._status.setText('Ready')
+        if perp is not None:
+            best_str += '  |q⟂|=%.4f' % perp[0][0]
+        if len(cands) > n_drawn:
+            best_str += '   showing %d of %d' % (n_drawn, len(cands))
+        elif len(cands) > 1:
+            best_str += '   %d candidates' % len(cands)
+        self._lbl_pick.setText(best_str)
+
+    def _refilter_geo_candidates(self):
+        """Debounced re-rank after the |q_perp| slider moved."""
+        if self._geo_scores is None:
+            return
+        self._show_geo_candidates(verbose=False)
 
     def _run_nearest_ref(self, pts):
         self._sync_ig()
@@ -3301,10 +3621,17 @@ class DMSSlider(QtWidgets.QMainWindow):
             return
 
         scores  = self._ewald_scores(dirs)
-        order   = np.argsort(scores)
+        # Same candidate pool as Geo 3-click, so the two rank over the same set.
+        pool    = np.where(self._qperp_mask())[0]
+        order   = pool[np.argsort(scores[pool])]
+        top     = order[:5]
+        perp    = self._perp_strengths(top)
         print('Nearest-ref top-5: %s' % ', '.join(
-            '[%s]=%.2f' % (' '.join('%d' % v for v in self.full_reflist_6d[i]), scores[i])
-            for i in order[:5]))
+            '[%s]=%.2f%s' % (' '.join('%d' % v for v in self.full_reflist_6d[i]),
+                             scores[i],
+                             '' if perp is None else
+                             ' (|q_perp|=%.4f)' % perp[0][k])
+            for k, i in enumerate(top)))
 
         best_idx = int(order[0])
         if scores[best_idx] > 10.0:
@@ -3315,8 +3642,14 @@ class DMSSlider(QtWidgets.QMainWindow):
 
         hkl_6d  = self.full_reflist_6d[best_idx].copy()
         vec_str = ' '.join('%d' % v for v in hkl_6d)
-        print('Nearest-ref: [%s]  psi_err=%.2f°' % (vec_str, scores[best_idx]))
-        self._lbl_pick.setText('[%s]  %.2f°' % (vec_str, scores[best_idx]))
+        best_perp = self._perp_strengths([best_idx])
+        print('Nearest-ref: [%s]  psi_err=%.2f°%s' % (
+            vec_str, scores[best_idx],
+            '' if best_perp is None else
+            '  |q_perp|=%.4f  perp/par=%.4f' % (best_perp[0][0], best_perp[1][0])))
+        self._lbl_pick.setText('[%s]  %.2f°%s' % (
+            vec_str, scores[best_idx],
+            '' if best_perp is None else '  |q⟂|=%.4f' % best_perp[0][0]))
 
         self._add_red_crosses(pts)
         self._plot_arc(hkl_6d, pg.mkColor('#00cccc'))

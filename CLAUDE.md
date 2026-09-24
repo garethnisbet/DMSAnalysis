@@ -85,6 +85,121 @@ guarded this; the removal path had not. `_on_update_done` now also clears the
 cache when a reflection drops off the plate, so right-click cannot pick an arc
 by where it used to be. Test: `DMSAnalysis/tests/test_arc_picking.py`.
 
+### Identifying a line: psi_err ranks, |q_perp| breaks the tie
+
+Both three-click identify paths — **Geo 3-click** (`_run_geo_search`, the
+candidates under `psi_tol`) and the nearest-ref search it replaces when
+unticked — score candidates with `_ewald_scores`, the mean ψ error over the
+three clicked directions. That score is *purely geometric*: it asks whether a
+reflection's cone can pass through those directions, never whether the
+reflection is observable. Three consequences, all of which bite hardest on a
+quasicrystal:
+
+* It is a **local** test. Three bunched clicks sample a short arc, and distinct
+  reflections whose lines osculate there diverge elsewhere. Spread the clicks
+  along the feature.
+* 6D indexing makes the candidate pool **dense**, so several candidates
+  routinely score alike and the ranking alone cannot choose between them.
+* It can only return an index **already in the list**. A "no match" at shallow
+  **Depth** is not evidence the feature is unindexable — widen **Auto reflist**
+  and re-run.
+
+For an icosahedral quasicrystal the structure factor is modulated by the
+perpendicular-space component and falls off steeply with |q_perp|, so only a
+modest subset of that dense set ever produces a visible line. `_perp_strengths`
+supplies it: every ranked candidate now prints `|q_perp|` and the dimensionless
+`perp/par` ratio next to `psi_err`, and the best one carries `|q⟂|` on the pick
+label. Among candidates the geometry cannot separate, the smallest |q_perp| is
+the physically likely one; a large one is almost certainly not producing a
+visible line however well it fits the clicks.
+
+It is **reported, not ranked on**. The order stays by `psi_err`, because a
+composite score would hide a poor geometric match behind a plausible |q_perp| —
+the two numbers answer different questions and are meant to be read together.
+The norms are taken on the projected components as `build_reflist_from_6d`
+returns them (both in the same units, neither converted to Å⁻¹), which is all a
+ranking aid needs. A conventional crystal has no cut-and-projection, so the
+helper returns `None` and the column is omitted rather than printed as zeros.
+
+The alignment is the thing to preserve: the helper indexes `full_reflist` /
+`full_reflist2` with positions derived from `full_reflist_6d`, so the three
+arrays must stay row-aligned (both assignment sites set all three together) and
+the caller's order must survive — candidates arrive sorted by ψ error, not in
+list order. Test: `DMSAnalysis/tests/test_perp_strengths.py`, which pins that
+and drives both identify paths on a real icosahedral config.
+
+The **|q⟂| ≤** slider in the *Reflist* box attacks the density problem from the
+other end: it narrows the pool the identify will *consider* to the reflections
+whose perpendicular component is small enough to be producing a visible line.
+The count under it reads `identify pool: 2366 / 15624`.
+
+**It narrows the identify only.** The generated list, the overlay slice and the
+fit all keep every reflection. That is deliberate, and it is what makes the
+slider usable: filtering the list meant a full `_regenerate_reflist` per slider
+event — at Depth 3 that is ~118k reflections reprojected and the overlay engine
+rebuilt, ~96 ms, on every one of a 2000-step slider's events. The cut is now a
+compare against `_qperp_all`, a norm array cached once per regeneration, at
+~0.02 ms. So the slider acts while it is being dragged, which is the only way it
+is worth having: you are looking for the cut that leaves the right candidate and
+drops the rest, and that is a thing you find by moving it.
+
+**The drawn set is capped, and is deliberately not nested.** Only
+`GEO_MAX_DRAWN` (10) arcs are traced, and the ranking is taken over the surviving
+pool, so loosening the cut lets better-scoring candidates in and pushes drawn
+ones out. The *pool* nests as the cut loosens and so do the candidates within
+`psi_tol` — it is only the display that churns. Ranking over the unfiltered
+candidates instead would make the drawn set nest, but it would show almost
+nothing exactly when the cut is working: on the example config at Depth 2, a cut
+leaving 73 candidates draws 10 lines this way and would draw **1** the other,
+because the best-scoring candidates are mostly the high-|q_perp| reflections the
+cut exists to remove. The pick label therefore states the cap — `showing 10 of
+73`, or `9 candidates` once it stops binding — since the churn is only
+confusing while the cap is invisible.
+
+Dragging also re-ranks **the candidates already on screen**, through a 120 ms
+debounce. `_show_geo_candidates` is shared by the three-click search and the
+re-filter, so a drag shows exactly what fresh clicks would. Candidate arcs are
+cached by reflection row and hidden rather than destroyed — each costs a
+one-reflection imcalc to trace, so a candidate that leaves the drawn set and
+comes back as you move the slider is redrawn for free. An arc that gets selected
+(or removed) leaves that cache, so a later re-filter cannot hide a reflection
+that is in the selected list.
+
+The rest of its semantics:
+
+* **The ceiling is absolute; the range is not.** |q_perp| does not depend on
+  Depth, so a cut you have set keeps meaning the same thing when Depth grows the
+  set around it — the range extends past it rather than resetting it.
+* **Untouched means off.** The cut is held as `None` until dragged, which pins
+  the slider to the top on every regeneration. Without that, an untouched slider
+  would inherit the previous set's maximum as a cutoff the moment Depth went up.
+  Dragging back to the top restores `None` rather than recording that number.
+* **The travel is monotonic.** The slider ranges from the *smallest* |q_perp|
+  present to the largest, not from zero, so every position leaves something to
+  identify against and dragging down never brings candidates back. Ranging from
+  zero gave the bottom a dead zone where the ceiling passed nothing, which then
+  fell back to the whole list — so the slider showed the same candidates at the
+  bottom as at the top and different ones in between. A ceiling below everything
+  (reachable only by carrying a cut onto a different reflection set) now keeps
+  the smallest shell, never the whole list.
+* **Equivalents are not split by float noise.** Symmetry-equivalent reflections
+  have mathematically equal |q_perp| but norms differing in the last bits, so
+  the compare (`_qperp_le`) carries a relative tolerance — far above that noise,
+  far below any real separation between shells. Without it the bottom of the
+  slider admits one member of a star and drops another.
+* **Nothing to cut on** — a conventional crystal, or norms not yet cached —
+  disables the slider and stands the mask down. `_qperp_usable` is the single
+  predicate behind the mask, the enabled state and the label, so the three
+  cannot disagree; the label used to ask the widget instead, which described the
+  crystal the window was *built* on rather than the mode it is in. The all-zero
+  case would also give `FloatSlider` a zero-width range, which raises on its
+  first `setValue`; `_qperp_range_max` never returns zero.
+
+`_qperp_mask` stands down if the cached norms fall out of step with the list,
+since masking by position would then read another reflection's row. Like Depth,
+Max N and Thresh, the cut is live UI state and is not saved in the session.
+Test: `DMSAnalysis/tests/test_qperp_filter.py`.
+
 Missing scan data never stops the slider from opening. If the config's `.dat` or
 its detector image cannot be read (a beamline path that does not exist on this
 machine, data on another disk, …), the app starts on placeholder metadata
@@ -189,6 +304,19 @@ Each app reads a JSON config (passed as an argument, or the `configs/` default).
 ```
 
 The `bravais` flag selects which subset of indices are passed to the optimiser. For `icosahedral`, parameters [0, 6–9, 10–13, 15–23] (with optional energy) are optimised; lattice parameters 1–5 are locked by symmetry.
+
+That subset is `ts_quasi.imcalc_param_indices(bravais, detopt, energyopt)`, the
+one table `slider.py` (`reduced_slots_for`) and `fit.py` both use. It is derived
+from the offsets `dmsfit_ico_hkl.imcalc` reads in each branch, and must stay
+that way. The slider and fit.py used to carry hand-written copies that had
+drifted from the engine. `cubic_no_strain` and `calibrate` with the detector or
+energy refined were a slot short, so every evaluation raised IndexError. In the
+slider that happened inside the overlay worker thread, which only printed it,
+so the DMS lines stopped following the sliders after a switch to *Cubic (no
+strain)*. `icosahedral_fixed_a` with the detector refined read the energy in as
+dzrot. A failed overlay update now shows in the status line
+(`UpdateWorker.failed`). Test: `DMSAnalysis/tests/test_imcalc_param_indices.py`,
+which round-trips every mode × detopt × energyopt through `inputarray`.
 
 ## DMS curve method: the sampled sweep, or the circle the cone is
 
@@ -469,7 +597,7 @@ These directories are immutable run records — do not modify them.
 |---------|---------|
 | `flags` | `save`, `fit` — run controls |
 | `geometry` | `hkl` (primary reflection), `azir` (azimuthal reference) |
-| `computation` | `bravais` (a `ts_quasi.TRIPFIT_SYSTEMS` name: a conventional system, or `icosahedral` / `icosahedral_fixed_a` / `cubic_no_strain`), `resolution` (Kossel-line sampling for the fit), `opt_method` (any name in `ts_quasi.TRIPFIT_METHODS` — see *Optimiser methods* below), `tolerance`, `boundrange` `[lo,hi]` added to the guess for bounds, optional `rr` (azimuthal pre-rotation, deg; conventional only), `locked` (parameter names held at their starting value by the fit — any of `a b c alpha beta gamma a11 … a33`, `ts_quasi.TRIPFIT_PARAM_NAMES`; the GUI's unticked slider boxes), `bh_niter`, `de_strategy`, `fd_step` (finite-difference step for the gradient methods; omit/`null` to use SciPy's default), `pseudocubic_transform` (1–12, GUI only, conventional only — the Table-1 pseudo-cubic indexing matrix applied to the base indexing at load, same key/semantics as `fit.py`/`slider.py`; 1 = identity), and (GUI only) `live_resolution` for the interactive overlay |
+| `computation` | `bravais` (a `ts_quasi.TRIPFIT_SYSTEMS` name: a conventional system, or `icosahedral` / `icosahedral_fixed_a` / `cubic_no_strain`), `resolution` (Kossel-line sampling during the fit — how the lines are drawn and where each cone's plane is fitted from, *not* something the residual depends on; see *The crossings are solved on the cones* below), `opt_method` (any name in `ts_quasi.TRIPFIT_METHODS` — see *Optimiser methods* below), `tolerance`, `boundrange` `[lo,hi]` added to the guess for bounds, optional `rr` (azimuthal pre-rotation, deg; conventional only), `locked` (parameter names held at their starting value by the fit — any of `a b c alpha beta gamma a11 … a33`, `ts_quasi.TRIPFIT_PARAM_NAMES`; the GUI's unticked slider boxes), `bh_niter`, `de_strategy`, `fd_step` (finite-difference step for the gradient methods; omit/`null` to use SciPy's default), `pseudocubic_transform` (1–12, GUI only, conventional only — the Table-1 pseudo-cubic indexing matrix applied to the base indexing at load, same key/semantics as `fit.py`/`slider.py`; 1 = identity), and (GUI only) `live_resolution` for the interactive overlay |
 | `crystal` | `initial_guess` — full 6-element lattice `[a,b,c,α,β,γ]`; for a quasicrystal type also `phason` (9 elements, a11…a33, default zero) and `tau_approx` (default 55/34, the slider's). Only the type's free slots are refined |
 | `intersections` | list of triples, each `{label, reflist (3×3 h k l, or 3×6 6D indices for a quasicrystal type), energy, target, enabled}` — the three secondary reflections whose Kossel lines must meet. Which crossing of each line pair to score is chosen automatically: the engine takes the tightest (mutually-closest) triple, so the selection stays consistent and the residual doesn't jump as the lattice varies. `enabled` (default `true`, the GUI's per-row tick box) drops a triple from the objective while still plotting it, dimmed. (A legacy `intercepts` index vector, if present, is ignored.) |
 | `display` | `lim`, `dpi` — plot settings |
@@ -546,6 +674,49 @@ evaluation (e.g. a line pair that does not intersect) scores the flat penalty
 > score a widely-separated triple near zero through cancellation. Residuals
 > from before this change (including those in older `Processing/` snapshots) are
 > **not comparable** to current ones.
+
+### The crossings are solved on the cones, not on the sampled lines
+
+`kosscalc` sweeps each secondary reflection's exit direction a full 360° about
+that reflection's own axis, so a Kossel line is a **cone** of unit vectors —
+exactly a circle on the sphere, `{v : |v| = 1, v·n = c}` — which the sweep only
+samples. Crossing the sampled polylines with shapely (`ts_quasi.intersections`)
+therefore crosses *chords*: each crossing is off by about the chord sagitta
+(~1/steps²) and `triple_spread`, a squared distance, by ~1/steps⁴.
+
+That made the residual a function of `computation.resolution` rather than of the
+lattice, and left the optimiser free to reach machine zero by tuning the cell to
+the polygon instead of closing the triple — on the rhombohedral example one
+triple scored 8.1e-17 at resolution 1000 where its crossings are really 2.2e-11
+apart (over 100/400/1000/4000 steps: 1.0e-6, 6.3e-10, 8.1e-17, 1.2e-11). It is
+also why `tripslider` reported one fit as two numbers: the status bar's came
+from the fit resolution and the control panel's Σ from the live one.
+
+`tripfit._intercepts` now fits each locus's plane (`ts_quasi.sphere_circle_plane`,
+one SVD over the sampled points), intersects the two cones of a pair in closed
+form (`ts_quasi.cone_pair_directions`), and projects the directions through
+`stereoproj` — so the analytic crossings and the drawn lines cannot end up on
+different conventions. The residual is then a property of the lattice alone:
+identical to 9 significant figures over 50 → 4000 steps on both example configs,
+with the loci meeting their fitted circles to ~1e-15.
+
+**`resolution` therefore buys nothing but a smoother plot.** A low value is free
+— at `resolution = 50` the rhombohedral example fits ~6× faster and, in that
+run, to a slightly *better* minimum than at 1000. **Residuals from before this
+change are not comparable**, including those in older `Processing/` snapshots.
+
+A locus that is not usable as a circle — deviation above `KOSSEL_CIRCLE_TOL`
+(1e-9; a real one sits at ~5e-16), points that fix no plane, or a coaxial pair —
+falls back to the sampled-polyline crossing, and `tripfit.circle_residual` is
+then `None`. A pair that is well posed but simply does not meet still raises and
+scores 500, as before: that is an answer about the geometry, not a reason to drop
+to a cruder method. `tripfit.py` prints the worst circle deviation (`circle fit
+:`, and `circlefit` in `Result.txt`); the GUI names any triple that fell back
+next to the Σ residual. Test:
+`DMSAnalysis/tests/test_tripfit_intercepts.py`, which pins the residual across
+resolutions, checks each crossing against the two cones it solves, exercises the
+fallback, and drives the real GUI to assert its live label and its fit objective
+agree.
 
 ### Optimiser methods
 

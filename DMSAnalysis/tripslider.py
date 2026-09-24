@@ -504,16 +504,21 @@ class TripSlider(QtWidgets.QMainWindow):
         self._sp_live = QtWidgets.QSpinBox()
         self._sp_live.setRange(50, 4000); self._sp_live.setSingleStep(50)
         self._sp_live.setValue(self._live_res)
-        self._sp_live.setToolTip('Kossel-line sampling used for the live overlay '
-                                 '(lower = snappier)')
+        self._sp_live.setToolTip('Kossel-line sampling used to draw the live '
+                                 'overlay (lower = snappier).  The crossings '
+                                 'are solved on the cones the lines are, not '
+                                 'on these samples, so this does not change '
+                                 'the residual.')
         self._sp_live.valueChanged.connect(self._on_live_res_changed)
         fg.addWidget(self._sp_live, 1, 1)
         fg.addWidget(QtWidgets.QLabel('Fit res'), 1, 2)
         self._sp_fit = QtWidgets.QSpinBox()
         self._sp_fit.setRange(50, 8000); self._sp_fit.setSingleStep(50)
         self._sp_fit.setValue(self._fit_res)
-        self._sp_fit.setToolTip('Kossel-line sampling used during the fit '
-                                '(higher = more accurate, slower)')
+        self._sp_fit.setToolTip('Kossel-line sampling used during the fit.  The '
+                                'residual is solved analytically from the '
+                                'cones, so raising this buys no accuracy — it '
+                                'only costs time; a low value is free.')
         fg.addWidget(self._sp_fit, 1, 3)
 
         self._btn_fit = QtWidgets.QPushButton('Fit')
@@ -1217,6 +1222,7 @@ class TripSlider(QtWidgets.QMainWindow):
                 fs.blockSignals(False)
         reduced = self._reduced()
         total = 0.0
+        sampled = []
         for g, panel in zip(self._groups, self._panels):
             tf = g['tf']
             tf.set_params(self._params)       # what the mode holds fixed
@@ -1234,6 +1240,12 @@ class TripSlider(QtWidgets.QMainWindow):
                 interc = np.asarray(interc)
                 panel['pts'].setData(interc[:, 0], interc[:, 1])
                 r = residual_from_intercepts(interc, g['target'])
+                # circle_residual is None when a locus was not usable as a
+                # circle and its crossings came from the sampled polylines;
+                # that triple's residual then depends on the sampling, so the
+                # live number and the fit's would part company again.
+                if tf.circle_residual is None:
+                    sampled.append(g['label'])
             except Exception:
                 panel['full'] = [(np.array([]), np.array([]))] * 3
                 for cv in panel['curves']:
@@ -1247,8 +1259,17 @@ class TripSlider(QtWidgets.QMainWindow):
                                       '' if g['enabled'] else '  (excluded)'),
                                    size='8pt')
         n_on = sum(1 for g in self._groups if g['enabled'])
-        self._total_lbl.setText('Σ residual: %.4e  (%d/%d)'
-                                % (total, n_on, len(self._groups)))
+        self._total_lbl.setText('Σ residual: %.4e  (%d/%d)%s'
+                                % (total, n_on, len(self._groups),
+                                   '  ·  sampled: %s' % ', '.join(sampled)
+                                   if sampled else ''))
+        self._total_lbl.setToolTip(
+            'Summed over the ticked triples, from crossings solved on the '
+            'Kossel cones — the same number the fit scores, at any resolution.'
+            if not sampled else
+            'These triples fell back to crossing the sampled lines: %s.  Their '
+            'residual depends on the resolution, so the live value and the '
+            "fit's need not agree." % ', '.join(sampled))
 
     # ── fitting ─────────────────────────────────────────────────────────────────
     def _fit_objective(self, x):
