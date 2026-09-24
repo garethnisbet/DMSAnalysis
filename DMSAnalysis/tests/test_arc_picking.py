@@ -47,16 +47,16 @@ def _fake_arc(win, ref, xs, ys):
 
 
 def _scene_pos(win, x, y):
-    from PyQt5 import QtCore
+    from ..qt import QtCore
     return win._vb.mapViewToScene(QtCore.QPointF(float(x), float(y)))
 
 
 def _right_click(win, scene_pos):
     """Drive the real handler, as ``sigMouseClicked`` does."""
-    from PyQt5 import QtCore
+    from ..qt import QtCore
 
     class Ev:
-        def button(self):   return QtCore.Qt.RightButton
+        def button(self):   return QtCore.Qt.MouseButton.RightButton
         def scenePos(self): return scene_pos
 
     win._on_scene_clicked(Ev())

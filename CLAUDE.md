@@ -574,8 +574,27 @@ This code analyses **X-ray multiple scattering (MS)** in an **icosahedral quasic
 
 ```
 numpy  scipy  matplotlib  PIL(Pillow)  shapely  imageio  joblib
-PyQt5  pyqtgraph   (for the slider GUI)
+PyQt6  pyqtgraph   (for the slider GUI; PyQt5 also works)
 ```
+
+**Qt binding.** Every GUI module imports Qt from `DMSAnalysis/qt.py`, never
+from `PyQt5`/`PyQt6` directly. It prefers PyQt6, which has arm64 wheels, and
+falls back to PyQt5; `PYQTGRAPH_QT_LIB` forces one. It must be imported before
+`pyqtgraph`, which picks its binding from that variable. Write to the API the
+two share:
+
+* **Scoped enums**: `QtCore.Qt.AlignmentFlag.AlignLeft`, not `QtCore.Qt.AlignLeft`.
+  PyQt6 has no unscoped names, and PyQt5 5.15 accepts the scoped form.
+* **`exec()`**, not `exec_()` (it is gone in PyQt6). The headless test harness
+  therefore stubs `QApplication.exec`.
+* **`QShortcut`** is imported from `.qt`, because it moved to QtGui in Qt6.
+* **`stateChanged` carries an int** in PyQt6, and an int never equals
+  `Qt.CheckState.Checked`, so wrap it with `qt.check_state(s)`. `toggled(bool)`
+  has no such problem.
+
+The GUI tests run offscreen on a 2560×1440 screen
+(`tests/offscreen_screen.json`). Qt6's `restoreGeometry` clamps the window to
+the 800×800 default screen, and the layout-persistence test fails on that.
 
 Every dependency is installable from PyPI; nothing here needs `cctbx`. The
 CIF-driven reflection list (`loadcif`, `flags.autoreflist`, `paths.cif_file`)

@@ -17,7 +17,7 @@ or under pytest:
 import os
 import tempfile
 
-from PyQt5 import QtCore
+from ..qt import QtCore
 
 from .gui_harness import slider_on
 
@@ -30,7 +30,7 @@ def _isolated_settings(win):
     never reads or writes the user's real settings."""
     tmp = tempfile.mkdtemp(prefix='dmslayout_')
     st  = QtCore.QSettings(os.path.join(tmp, 'slider.ini'),
-                           QtCore.QSettings.IniFormat)
+                           QtCore.QSettings.Format.IniFormat)
     win._layout_settings = lambda: st
     return st
 

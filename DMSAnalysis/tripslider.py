@@ -29,14 +29,13 @@ the two workflows cannot drift.
 
 import os, sys, json, copy
 
-os.environ.setdefault('PYQTGRAPH_QT_LIB', 'PyQt5')
 
 import numpy as np
 from shapely.geometry import LineString, box as _shbox
 
 from . import ts_quasi as ts
 
-from PyQt5 import QtWidgets, QtCore, QtGui
+from .qt import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 
 pg.setConfigOptions(background='#1a1a1a', foreground='#cccccc', antialias=True)
@@ -102,8 +101,8 @@ class _ValueReadout(QtWidgets.QLineEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setReadOnly(True)
-        self.setFocusPolicy(QtCore.Qt.ClickFocus)
-        self.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
         self.setStyleSheet(self._READ_STYLE)
         self.setToolTip('Double-click to type an exact value')
 
@@ -145,9 +144,9 @@ class FloatSlider(QtWidgets.QWidget):
 
         lbl = QtWidgets.QLabel(label)
         lbl.setFixedWidth(34)
-        lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
-        self._sl = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._sl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self._sl.setRange(0, n_steps)
         self._sl.setSingleStep(1)
         self._sl.setPageStep(max(1, n_steps // 100))
@@ -176,7 +175,7 @@ class FloatSlider(QtWidgets.QWidget):
         self._editing = True
         self._vl.setReadOnly(False)
         self._vl.setStyleSheet(self._vl._EDIT_STYLE)
-        self._vl.setFocus(QtCore.Qt.MouseFocusReason)
+        self._vl.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
         self._vl.selectAll()
 
     def _commit_edit(self):
@@ -417,9 +416,9 @@ class TripSlider(QtWidgets.QMainWindow):
         self._table_timer.setSingleShot(True)
         self._table_timer.setInterval(350)
         self._table_timer.timeout.connect(self._apply_table)
-        outer = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        outer = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         self.setCentralWidget(outer)
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         outer.addWidget(splitter)
 
         # left control column
@@ -712,7 +711,7 @@ class TripSlider(QtWidgets.QMainWindow):
         self._table.setHorizontalHeaderLabels(self._cols())
         self._table.verticalHeader().setDefaultSectionSize(22)
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setToolTip(
             'Each row is one triple intersection: three secondary reflections '
             'whose Kossel lines should meet.  Reflections are space-separated '
@@ -785,9 +784,9 @@ class TripSlider(QtWidgets.QMainWindow):
                 self._table.setItem(r, c, QtWidgets.QTableWidgetItem(txt))
             # the label cell carries the include-in-fit checkbox
             lbl = self._table.item(r, 0)
-            lbl.setFlags(lbl.flags() | QtCore.Qt.ItemIsUserCheckable)
-            lbl.setCheckState(QtCore.Qt.Checked if gc.get('enabled', True)
-                              else QtCore.Qt.Unchecked)
+            lbl.setFlags(lbl.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            lbl.setCheckState(QtCore.Qt.CheckState.Checked if gc.get('enabled', True)
+                              else QtCore.Qt.CheckState.Unchecked)
         self._table.blockSignals(False)
 
     def _read_table(self):
@@ -808,7 +807,7 @@ class TripSlider(QtWidgets.QMainWindow):
                 return None, 'row %d: %s' % (r + 1, e)
             lbl = self._table.item(r, 0)
             enabled = (lbl is None
-                       or lbl.checkState() == QtCore.Qt.Checked)
+                       or lbl.checkState() == QtCore.Qt.CheckState.Checked)
             groups.append({'label': cell(0) or 'T%d' % (r + 1),
                            'reflist': reflist, 'energy': energy,
                            'target': target, 'enabled': enabled})
@@ -1346,19 +1345,19 @@ def _dark_palette():
     dark, mid, light = (QtGui.QColor(26, 26, 26), QtGui.QColor(42, 42, 42),
                         QtGui.QColor(58, 58, 58))
     text, hilit = QtGui.QColor(210, 210, 210), QtGui.QColor(42, 130, 218)
-    p.setColor(QtGui.QPalette.Window, dark)
-    p.setColor(QtGui.QPalette.WindowText, text)
-    p.setColor(QtGui.QPalette.Base, mid)
-    p.setColor(QtGui.QPalette.AlternateBase, light)
-    p.setColor(QtGui.QPalette.Text, text)
-    p.setColor(QtGui.QPalette.Button, light)
-    p.setColor(QtGui.QPalette.ButtonText, text)
-    p.setColor(QtGui.QPalette.ToolTipBase, mid)
-    p.setColor(QtGui.QPalette.ToolTipText, text)
-    p.setColor(QtGui.QPalette.Highlight, hilit)
-    p.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor(0, 0, 0))
-    p.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.Text, QtGui.QColor(100, 100, 100))
-    p.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.ButtonText, QtGui.QColor(100, 100, 100))
+    p.setColor(QtGui.QPalette.ColorRole.Window, dark)
+    p.setColor(QtGui.QPalette.ColorRole.WindowText, text)
+    p.setColor(QtGui.QPalette.ColorRole.Base, mid)
+    p.setColor(QtGui.QPalette.ColorRole.AlternateBase, light)
+    p.setColor(QtGui.QPalette.ColorRole.Text, text)
+    p.setColor(QtGui.QPalette.ColorRole.Button, light)
+    p.setColor(QtGui.QPalette.ColorRole.ButtonText, text)
+    p.setColor(QtGui.QPalette.ColorRole.ToolTipBase, mid)
+    p.setColor(QtGui.QPalette.ColorRole.ToolTipText, text)
+    p.setColor(QtGui.QPalette.ColorRole.Highlight, hilit)
+    p.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor(0, 0, 0))
+    p.setColor(QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.Text, QtGui.QColor(100, 100, 100))
+    p.setColor(QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor(100, 100, 100))
     return p
 
 
@@ -1371,7 +1370,7 @@ def main():
     app.setPalette(_dark_palette())
     win = TripSlider(cfg, cfg_path)
     win.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == '__main__':

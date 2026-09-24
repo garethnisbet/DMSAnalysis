@@ -50,7 +50,7 @@ def test_boxes_are_on_the_refinable_sliders_only():
 
 
 def test_fit_moves_only_the_unlocked_parameters():
-    from PyQt5 import QtWidgets
+    from ..qt import QtWidgets
     win = _window(_cfg())
     app = QtWidgets.QApplication.instance()
     try:

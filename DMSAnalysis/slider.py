@@ -4,7 +4,6 @@ slider_quasi_AlPdMn_Annealed_hkl_v3.py
 Interactive DMS simulation viewer – PyQtGraph, dark theme, background threading.
 """
 import sys, os, time, itertools, threading, json, re, subprocess, copy, glob
-os.environ.setdefault('PYQTGRAPH_QT_LIB', 'PyQt5')
 
 PKGDIR  = os.path.abspath(os.path.dirname(__file__))
 CONFIGS = os.path.join(PKGDIR, 'configs')
@@ -20,7 +19,7 @@ from . import ts_quasi as ts
 from . import dat2config
 from .config_table import ConfigTable
 
-from PyQt5 import QtWidgets, QtCore, QtGui
+from .qt import QtWidgets, QtCore, QtGui, QShortcut, check_state
 import pyqtgraph as pg
 
 pg.setConfigOptions(imageAxisOrder='row-major',
@@ -685,8 +684,8 @@ class _ValueReadout(QtWidgets.QLineEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setReadOnly(True)
-        self.setFocusPolicy(QtCore.Qt.ClickFocus)
-        self.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
         self.setStyleSheet(self._READ_STYLE)
         self.setToolTip('Double-click to type an exact value')
 
@@ -728,9 +727,9 @@ class FloatSlider(QtWidgets.QWidget):
 
         lbl = QtWidgets.QLabel(label)
         lbl.setFixedWidth(52)
-        lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
-        self._sl = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._sl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self._sl.setRange(0, n_steps)
         # Fine control: arrow keys / wheel move one step (1/n_steps of the range);
         # a trough-click pages by ~1% so it still moves a visible amount.
@@ -757,7 +756,7 @@ class FloatSlider(QtWidgets.QWidget):
         self._editing = True
         self._vl.setReadOnly(False)
         self._vl.setStyleSheet(self._vl._EDIT_STYLE)
-        self._vl.setFocus(QtCore.Qt.MouseFocusReason)
+        self._vl.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
         self._vl.selectAll()
 
     def _commit_edit(self):
@@ -1391,7 +1390,7 @@ class DMSSlider(QtWidgets.QMainWindow):
 
         self._worker = UpdateWorker()
         self._worker.done.connect(self._on_update_done,
-                                  QtCore.Qt.QueuedConnection)
+                                  QtCore.Qt.ConnectionType.QueuedConnection)
 
         self._update_timer = QtCore.QTimer(self)
         self._update_timer.setSingleShot(True)
@@ -1417,7 +1416,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         root_layout.setContentsMargins(4, 4, 4, 4)
         root_layout.setSpacing(0)
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         splitter.setObjectName('main_splitter')
         self._splitter = splitter
         root_layout.addWidget(splitter)
@@ -1457,7 +1456,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._vb.addItem(self._dms_scatter)
 
         self._coord_lbl = QtWidgets.QLabel('row —   col —   I=—')
-        self._coord_lbl.setAlignment(QtCore.Qt.AlignCenter)
+        self._coord_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         f = self._coord_lbl.font()
         f.setFamily('monospace')
         f.setPointSize(8)
@@ -1472,7 +1471,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         scrub_row = QtWidgets.QHBoxLayout()
         scrub_row.setContentsMargins(2, 0, 2, 0)
         scrub_lbl = QtWidgets.QLabel('Image')
-        self._img_scrub = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._img_scrub = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self._img_scrub.setRange(0, 0)
         self._img_scrub.setToolTip('Scrub through the detector images in this scan '
                                    '(display only — no processing)')
@@ -1727,7 +1726,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         _f_res.setBold(True)
         self._lbl_resid.setFont(_f_res)
         self._lbl_resid.setStyleSheet('color: #cccccc')
-        self._lbl_resid.setAlignment(QtCore.Qt.AlignCenter)
+        self._lbl_resid.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         fitl.addWidget(self._lbl_resid, 7, 0, 1, 2)
 
         # Best residual reached by a fit this session, to compare the live value
@@ -1737,7 +1736,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         _f_best.setPointSize(8)
         self._lbl_resid_best.setFont(_f_best)
         self._lbl_resid_best.setStyleSheet('color: #888888')
-        self._lbl_resid_best.setAlignment(QtCore.Qt.AlignCenter)
+        self._lbl_resid_best.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         fitl.addWidget(self._lbl_resid_best, 8, 0, 1, 2)
         self._best_opt = None
 
@@ -1836,7 +1835,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         # Sliders in scroll area
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         inner = QtWidgets.QWidget()
         vbox  = QtWidgets.QVBoxLayout(inner)
         vbox.setSpacing(1)
@@ -1887,7 +1886,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         arc_box_l.addWidget(hint)
         self._arc_list = QtWidgets.QListWidget()
         self._arc_list.setMinimumHeight(280)
-        self._arc_list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self._arc_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self._arc_list.customContextMenuRequested.connect(self._on_list_context_menu)
         self._arc_list.itemChanged.connect(self._on_list_item_changed)
         f_list = self._arc_list.font()
@@ -2011,13 +2010,13 @@ class DMSSlider(QtWidgets.QMainWindow):
         init_n  = min(30, n_total)
 
         rgl.addWidget(QtWidgets.QLabel('N refs'), 3, 0)
-        self._sl_n_refs = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._sl_n_refs = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self._sl_n_refs.setRange(1, max(1, init_n))
         self._sl_n_refs.setValue(init_n)
         rgl.addWidget(self._sl_n_refs, 3, 1, 1, 3)
 
         rgl.addWidget(QtWidgets.QLabel('Offset'), 4, 0)
-        self._sl_offset = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self._sl_offset = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self._sl_offset.setRange(0, max(0, n_total - 1))
         self._sl_offset.setValue(0)
         rgl.addWidget(self._sl_offset, 4, 1, 1, 3)
@@ -2128,7 +2127,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._roi_grid.scene().sigMouseClicked.connect(self._on_roi_grid_clicked)
         roi_col.addWidget(self._roi_grid, 1)
         self._roi_coord_lbl = QtWidgets.QLabel('build curves to integrate ROIs')
-        self._roi_coord_lbl.setAlignment(QtCore.Qt.AlignCenter)
+        self._roi_coord_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         f4 = self._roi_coord_lbl.font()
         f4.setFamily('monospace'); f4.setPointSize(8)
         self._roi_coord_lbl.setFont(f4)
@@ -2144,7 +2143,7 @@ class DMSSlider(QtWidgets.QMainWindow):
 
         # Connect controls
         self._chk_auto.stateChanged.connect(
-            lambda s: (setattr(self, '_use_auto', s == QtCore.Qt.Checked),
+            lambda s: (setattr(self, '_use_auto', check_state(s) == QtCore.Qt.CheckState.Checked),
                        self._regenerate_reflist()))
         self._sb_depth.valueChanged.connect(lambda _: self._regenerate_reflist())
         self._sb_max_n.valueChanged.connect(lambda _: self._regenerate_reflist())
@@ -2155,7 +2154,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._sl_offset.valueChanged.connect(self._on_slice_changed)
         self._btn_clear.clicked.connect(self._on_clear_picks)
         self._chk_geo.stateChanged.connect(
-            lambda s: setattr(self, '_geo_mode', s == QtCore.Qt.Checked))
+            lambda s: setattr(self, '_geo_mode', check_state(s) == QtCore.Qt.CheckState.Checked))
 
         # Where the user dragged the panel dividers last time.  Saved on every
         # drag as well as on exit, so it survives a kill, not just a clean quit.
@@ -2516,7 +2515,7 @@ class DMSSlider(QtWidgets.QMainWindow):
                 continue
             list_item = self._arc_to_list_item.get(id(arc))
             checked = (list_item is None
-                       or list_item.checkState() == QtCore.Qt.Checked)
+                       or list_item.checkState() == QtCore.Qt.CheckState.Checked)
             arc.setVisible(show and checked)
 
     def _on_dms_lines_toggled(self, checked):
@@ -2640,8 +2639,8 @@ class DMSSlider(QtWidgets.QMainWindow):
             col = pg.mkColor(self._ref_colour(i // 2, sel_arcs))
             col.setAlpha(200)
             pen = pg.mkPen(col, width=1,
-                           style=(QtCore.Qt.SolidLine if i % 2 == 0
-                                  else QtCore.Qt.DashLine))
+                           style=(QtCore.Qt.PenStyle.SolidLine if i % 2 == 0
+                                  else QtCore.Qt.PenStyle.DashLine))
             item = pg.PlotDataItem(x=cols, y=rows, pen=pen, connect='all')
             item.setZValue(15)          # above the arcs, below the hkl labels
             self._vb.addItem(item)
@@ -2690,9 +2689,9 @@ class DMSSlider(QtWidgets.QMainWindow):
         arcs, sel6d = [], []
         for i in range(self._arc_list.count()):
             item = self._arc_list.item(i)
-            if item.checkState() != QtCore.Qt.Checked:
+            if item.checkState() != QtCore.Qt.CheckState.Checked:
                 continue
-            arc = item.data(QtCore.Qt.UserRole)
+            arc = item.data(QtCore.Qt.ItemDataRole.UserRole)
             h6d = self._arc_to_6d.get(id(arc)) if arc is not None else None
             if arc is not None and h6d is not None:
                 arcs.append(arc)
@@ -2707,8 +2706,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         # Clear list arcs that are currently unchecked (candidate previews that
         # were never added to the list keep their static preview).
         for list_item in self._arc_to_list_item.values():
-            if list_item.checkState() != QtCore.Qt.Checked:
-                arc = list_item.data(QtCore.Qt.UserRole)
+            if list_item.checkState() != QtCore.Qt.CheckState.Checked:
+                arc = list_item.data(QtCore.Qt.ItemDataRole.UserRole)
                 if arc is not None:
                     arc.setData(x=[], y=[])
         if len(arcs) == 0:
@@ -2911,7 +2910,7 @@ class DMSSlider(QtWidgets.QMainWindow):
     # ── Click / pick handling ──────────────────────────────────────────────────
 
     def _on_scene_clicked(self, event):
-        if event.button() == QtCore.Qt.MiddleButton:
+        if event.button() == QtCore.Qt.MouseButton.MiddleButton:
             # Add the genuinely nearest reflection — whether it's an already
             # drawn arc or one of the auto-generated (discovery) lines.
             ref, arc = self._nearest_selectable(event.scenePos())
@@ -2926,12 +2925,12 @@ class DMSSlider(QtWidgets.QMainWindow):
                     return
             self._add_arc_to_list(np.asarray(ref), arc)
             return
-        if event.button() == QtCore.Qt.RightButton:
+        if event.button() == QtCore.Qt.MouseButton.RightButton:
             arc = self._nearest_arc_at(event.scenePos())
             if arc is not None:
                 self._remove_arc_from_list(arc)
             return
-        if event.button() != QtCore.Qt.LeftButton:
+        if event.button() != QtCore.Qt.MouseButton.LeftButton:
             return
         pos    = event.scenePos()
         vb_pos = self._vb.mapSceneToView(pos)
@@ -2972,9 +2971,9 @@ class DMSSlider(QtWidgets.QMainWindow):
             if self._arc_list.item(i).text() == vec_str:
                 return
         list_item = QtWidgets.QListWidgetItem(vec_str)
-        list_item.setFlags(list_item.flags() | QtCore.Qt.ItemIsUserCheckable)
-        list_item.setCheckState(QtCore.Qt.Checked)
-        list_item.setData(QtCore.Qt.UserRole, arc_item)
+        list_item.setFlags(list_item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+        list_item.setCheckState(QtCore.Qt.CheckState.Checked)
+        list_item.setData(QtCore.Qt.ItemDataRole.UserRole, arc_item)
         colour = getattr(arc_item, '_colour', None)
         if colour is not None:
             list_item.setForeground(QtGui.QBrush(colour))
@@ -3001,10 +3000,10 @@ class DMSSlider(QtWidgets.QMainWindow):
 
     def _on_list_item_changed(self, list_item):
         """Checkbox toggle → rebuild the selected-reflection overlay."""
-        arc_item = list_item.data(QtCore.Qt.UserRole)
+        arc_item = list_item.data(QtCore.Qt.ItemDataRole.UserRole)
         if arc_item is not None:
             arc_item.setVisible(self._dms_lines_shown()
-                                and list_item.checkState() == QtCore.Qt.Checked)
+                                and list_item.checkState() == QtCore.Qt.CheckState.Checked)
         if not getattr(self, '_bulk_select', False):
             self._on_selection_changed()
 
@@ -3014,9 +3013,9 @@ class DMSSlider(QtWidgets.QMainWindow):
             return
         menu = QtWidgets.QMenu(self)
         remove_action = menu.addAction('Remove')
-        action = menu.exec_(self._arc_list.mapToGlobal(pos))
+        action = menu.exec(self._arc_list.mapToGlobal(pos))
         if action == remove_action:
-            arc_item = list_item.data(QtCore.Qt.UserRole)
+            arc_item = list_item.data(QtCore.Qt.ItemDataRole.UserRole)
             if arc_item is not None:
                 self._remove_arc_from_list(arc_item)
 
@@ -3412,11 +3411,11 @@ class DMSSlider(QtWidgets.QMainWindow):
         ref_6d, ref_6d_checked = [], []
         for i in range(self._arc_list.count()):
             item = self._arc_list.item(i)
-            arc_item = item.data(QtCore.Qt.UserRole)
+            arc_item = item.data(QtCore.Qt.ItemDataRole.UserRole)
             hkl_6d = self._arc_to_6d.get(id(arc_item)) if arc_item is not None else None
             if hkl_6d is not None:
                 ref_6d.append([int(v) for v in hkl_6d])
-                ref_6d_checked.append(item.checkState() == QtCore.Qt.Checked)
+                ref_6d_checked.append(item.checkState() == QtCore.Qt.CheckState.Checked)
         return ref_6d, ref_6d_checked
 
     def _apply_reflections(self, ref_6d_list, checked_list=None):
@@ -3440,7 +3439,7 @@ class DMSSlider(QtWidgets.QMainWindow):
                     list_item = self._arc_to_list_item.get(id(arc_item))
                     if list_item is not None:
                         self._arc_list.blockSignals(True)
-                        list_item.setCheckState(QtCore.Qt.Unchecked)
+                        list_item.setCheckState(QtCore.Qt.CheckState.Unchecked)
                         self._arc_list.blockSignals(False)
                         arc_item.setVisible(False)
         self._bulk_select = False
@@ -3837,15 +3836,15 @@ class DMSSlider(QtWidgets.QMainWindow):
         detail = '\n'.join('• %s' % n for n in STARTUP_NOTES) or \
                  '• No scan data has been loaded.'
         box = QtWidgets.QMessageBox(self)
-        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setIcon(QtWidgets.QMessageBox.Icon.Warning)
         box.setWindowTitle('Scan data not found')
         box.setText('The scan files in the config could not be read, so the '
                     'slider has started on placeholder metadata and a blank '
                     'image.\n\nBrowse to a .dat file to load real data.')
         box.setDetailedText(detail)
-        browse = box.addButton('Browse…', QtWidgets.QMessageBox.AcceptRole)
-        box.addButton('Continue', QtWidgets.QMessageBox.RejectRole)
-        box.exec_()
+        browse = box.addButton('Browse…', QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        box.addButton('Continue', QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.exec()
         if box.clickedButton() is browse:
             self._on_browse_scan()
 
@@ -3864,9 +3863,9 @@ class DMSSlider(QtWidgets.QMainWindow):
         reply = QtWidgets.QMessageBox.question(
             self, 'Restore previous session',
             'Resume your last session (%s)?' % descr,
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.Yes)
-        if reply == QtWidgets.QMessageBox.Yes:
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.Yes)
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
             self._restore_from_dict(data)
             self._status.setText('Restored previous session (%s)' % descr)
 
@@ -3876,9 +3875,9 @@ class DMSSlider(QtWidgets.QMainWindow):
             self, 'Clear workflow',
             'Clear the whole workflow (geometry, selected reflections, built '
             'curves, centre overrides and fit result)?',
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No)
-        if reply != QtWidgets.QMessageBox.Yes:
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No)
+        if reply != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         # Drop selected reflections and built ROI/fit state
         self._on_clear_picks()
@@ -4019,7 +4018,7 @@ class DMSSlider(QtWidgets.QMainWindow):
 
         edit = QtWidgets.QPlainTextEdit()
         edit.setReadOnly(True)
-        edit.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        edit.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
         f = edit.font(); f.setFamily('monospace'); f.setPointSize(8); edit.setFont(f)
         edit.setPlainText(text)
 
@@ -4039,36 +4038,35 @@ class DMSSlider(QtWidgets.QMainWindow):
             term = search.text()
             if not term:
                 return
-            flags = QtGui.QTextDocument.FindFlags()
-            if backward:
-                flags |= QtGui.QTextDocument.FindBackward
-            if not edit.find(term, flags):
+            flags = ((QtGui.QTextDocument.FindFlag.FindBackward,)
+                     if backward else ())
+            if not edit.find(term, *flags):
                 # wrap around to the start (or end) and try once more
                 cur = edit.textCursor()
-                cur.movePosition(QtGui.QTextCursor.End if backward
-                                 else QtGui.QTextCursor.Start)
+                cur.movePosition(QtGui.QTextCursor.MoveOperation.End if backward
+                                 else QtGui.QTextCursor.MoveOperation.Start)
                 edit.setTextCursor(cur)
-                found = edit.find(term, flags)
+                found = edit.find(term, *flags)
                 search.setStyleSheet('' if found else 'background:#5c2a2a')
             else:
                 search.setStyleSheet('')
 
         def on_return():
             do_find(bool(QtWidgets.QApplication.keyboardModifiers()
-                         & QtCore.Qt.ShiftModifier))
+                         & QtCore.Qt.KeyboardModifier.ShiftModifier))
 
         search.returnPressed.connect(on_return)
         search.textChanged.connect(lambda _t: search.setStyleSheet(''))
         btn_next.clicked.connect(lambda: do_find(False))
         btn_prev.clicked.connect(lambda: do_find(True))
 
-        sc = QtWidgets.QShortcut(QtGui.QKeySequence.Find, dlg)
+        sc = QShortcut(QtGui.QKeySequence.StandardKey.Find, dlg)
         sc.activated.connect(lambda: (search.setFocus(), search.selectAll()))
 
         btn = QtWidgets.QPushButton('Close')
         btn.clicked.connect(dlg.accept)
         lay.addWidget(btn)
-        dlg.exec_()
+        dlg.exec()
 
     def _do_load_scan(self, path, dp, dp0, seed_from_metadata=None):
         """Load ``path`` at datapoint ``dp`` (reference ``dp0``).
@@ -4752,9 +4750,9 @@ class DMSSlider(QtWidgets.QMainWindow):
         out = []
         for i in range(self._arc_list.count()):
             item = self._arc_list.item(i)
-            if item.checkState() != QtCore.Qt.Checked:
+            if item.checkState() != QtCore.Qt.CheckState.Checked:
                 continue
-            arc_item = item.data(QtCore.Qt.UserRole)
+            arc_item = item.data(QtCore.Qt.ItemDataRole.UserRole)
             hkl_6d = self._arc_to_6d.get(id(arc_item)) if arc_item is not None else None
             if hkl_6d is not None:
                 out.append([int(v) for v in hkl_6d])
@@ -4947,9 +4945,9 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._exp_curves.append(pl.plot(pen=pg.mkPen('#4488ff', width=1)))
             self._sim_curves.append(pl.plot(pen=pg.mkPen(ref_col, width=1)))
             exp_cl = pg.InfiniteLine(angle=90, movable=False,
-                pen=pg.mkPen('#4488ff', width=1, style=QtCore.Qt.DashLine))
+                pen=pg.mkPen('#4488ff', width=1, style=QtCore.Qt.PenStyle.DashLine))
             sim_cl = pg.InfiniteLine(angle=90, movable=False,
-                pen=pg.mkPen(ref_col, width=1, style=QtCore.Qt.DashLine))
+                pen=pg.mkPen(ref_col, width=1, style=QtCore.Qt.PenStyle.DashLine))
             pl.addItem(exp_cl); pl.addItem(sim_cl)
             self._exp_centre_lines.append(exp_cl)
             self._sim_centre_lines.append(sim_cl)
@@ -5032,7 +5030,7 @@ class DMSSlider(QtWidgets.QMainWindow):
             cl.setVisible(True)
             cl.setValue(val)
             cl.setPen(pg.mkPen('#ffaa00', width=1.5) if overridden
-                      else pg.mkPen('#4488ff', width=1, style=QtCore.Qt.DashLine))
+                      else pg.mkPen('#4488ff', width=1, style=QtCore.Qt.PenStyle.DashLine))
 
     def _draw_sim_lines(self, ldscoeffs, ldsx, ldsy):
         # Cached for the SVG export, so the file holds the curves on screen.
@@ -5116,7 +5114,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         pos = event.scenePos()
         for i, pl in enumerate(self._roi_plots):
             if pl.vb.sceneBoundingRect().contains(pos):
-                if event.button() == QtCore.Qt.RightButton:
+                if event.button() == QtCore.Qt.MouseButton.RightButton:
                     pt = pl.vb.mapSceneToView(pos)
                     self._set_centre_override(i, pt.x())
                     event.accept(); return
@@ -5433,21 +5431,21 @@ _mid   = QtGui.QColor(42,  42,  42)
 _light = QtGui.QColor(58,  58,  58)
 _text  = QtGui.QColor(210, 210, 210)
 _hilit = QtGui.QColor(42,  130, 218)
-_p.setColor(QtGui.QPalette.Window,          _dark)
-_p.setColor(QtGui.QPalette.WindowText,      _text)
-_p.setColor(QtGui.QPalette.Base,            _mid)
-_p.setColor(QtGui.QPalette.AlternateBase,   _light)
-_p.setColor(QtGui.QPalette.Text,            _text)
-_p.setColor(QtGui.QPalette.Button,          _light)
-_p.setColor(QtGui.QPalette.ButtonText,      _text)
-_p.setColor(QtGui.QPalette.ToolTipBase,     _mid)
-_p.setColor(QtGui.QPalette.ToolTipText,     _text)
-_p.setColor(QtGui.QPalette.Highlight,       _hilit)
-_p.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor(0, 0, 0))
-_p.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.Text,       QtGui.QColor(100, 100, 100))
-_p.setColor(QtGui.QPalette.Disabled, QtGui.QPalette.ButtonText, QtGui.QColor(100, 100, 100))
+_p.setColor(QtGui.QPalette.ColorRole.Window,          _dark)
+_p.setColor(QtGui.QPalette.ColorRole.WindowText,      _text)
+_p.setColor(QtGui.QPalette.ColorRole.Base,            _mid)
+_p.setColor(QtGui.QPalette.ColorRole.AlternateBase,   _light)
+_p.setColor(QtGui.QPalette.ColorRole.Text,            _text)
+_p.setColor(QtGui.QPalette.ColorRole.Button,          _light)
+_p.setColor(QtGui.QPalette.ColorRole.ButtonText,      _text)
+_p.setColor(QtGui.QPalette.ColorRole.ToolTipBase,     _mid)
+_p.setColor(QtGui.QPalette.ColorRole.ToolTipText,     _text)
+_p.setColor(QtGui.QPalette.ColorRole.Highlight,       _hilit)
+_p.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor(0, 0, 0))
+_p.setColor(QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.Text,       QtGui.QColor(100, 100, 100))
+_p.setColor(QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor(100, 100, 100))
 app.setPalette(_p)
 
 win = DMSSlider()
 win.show()
-sys.exit(app.exec_())
+sys.exit(app.exec())

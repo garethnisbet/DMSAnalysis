@@ -22,7 +22,7 @@ chosen via a dialog (default path supplied with :meth:`set_save_path`).
 import copy
 import json
 
-from PyQt5 import QtWidgets, QtCore
+from .qt import QtWidgets, QtCore
 
 
 # (path, label, type)  — type ∈ {'int','float','str','bool','intlist','floatlist'}
@@ -160,9 +160,9 @@ class ConfigTable(QtWidgets.QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(
-            QtWidgets.QAbstractItemView.DoubleClicked
-            | QtWidgets.QAbstractItemView.SelectedClicked
-            | QtWidgets.QAbstractItemView.EditKeyPressed)
+            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked
+            | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed)
         self.table.cellChanged.connect(self._on_cell_changed)
         layout.addWidget(self.table)
 
@@ -194,12 +194,12 @@ class ConfigTable(QtWidgets.QWidget):
             self.table.insertRow(row)
 
             name_item = QtWidgets.QTableWidgetItem(label)
-            name_item.setFlags(QtCore.Qt.ItemIsEnabled)
+            name_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
             self.table.setItem(row, 0, name_item)
 
             val_item = QtWidgets.QTableWidgetItem(_format(value, typ))
-            val_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsEditable
-                              | QtCore.Qt.ItemIsSelectable)
+            val_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsEditable
+                              | QtCore.Qt.ItemFlag.ItemIsSelectable)
             self.table.setItem(row, 1, val_item)
 
             self._rows.append((path, typ))

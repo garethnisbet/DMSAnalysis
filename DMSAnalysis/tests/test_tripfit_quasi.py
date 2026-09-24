@@ -161,8 +161,9 @@ def test_batch_app_runs_a_quasicrystal_config():
 
 # ── GUI ──────────────────────────────────────────────────────────────────────────
 def _window(cfg):
-    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-    from PyQt5 import QtWidgets
+    from .gui_harness import offscreen
+    offscreen()
+    from ..qt import QtWidgets
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     from .. import tripslider
     win = tripslider.TripSlider(copy.deepcopy(cfg), CONFIG)
@@ -183,7 +184,7 @@ def test_gui_quasicrystal_mode_mirrors_the_slider():
         assert win._crystal_combo.currentText() == 'Icosahedral (quasicrystal)'
         assert sorted(win._param_sliders) == [0] + list(range(6, 15))
         # a clipped readout drops the sign of a negative phason element
-        from PyQt5 import QtGui
+        from ..qt import QtGui
         for fs in win._param_sliders.values():
             text = fs._fmt % (-abs(fs.val))
             fm = QtGui.QFontMetrics(fs._vl.font())

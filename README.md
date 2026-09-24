@@ -32,12 +32,16 @@ No build step. Clone the repository and run from its root. Requirements:
 
 ```
 numpy  scipy  matplotlib  Pillow  shapely  imageio  joblib
-PyQt5  pyqtgraph          # for the slider / tripslider GUIs
+PyQt6  pyqtgraph          # for the slider / tripslider GUIs (PyQt5 also works)
 ```
 
 ```bash
-pip install numpy scipy matplotlib Pillow shapely imageio joblib PyQt5 pyqtgraph
+pip install numpy scipy matplotlib Pillow shapely imageio joblib PyQt6 pyqtgraph
 ```
+
+PyQt6 is preferred because it has wheels for arm64 (Apple silicon, aarch64
+Linux). An existing PyQt5 install is used if PyQt6 is absent; set
+`PYQTGRAPH_QT_LIB=PyQt5` to force it.
 
 ## Usage
 
