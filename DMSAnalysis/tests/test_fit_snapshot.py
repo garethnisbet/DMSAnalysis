@@ -1,16 +1,17 @@
 """A completed fit leaves a run record you can rerun from.
 
-`_write_fit_snapshot` writes three files into
+`_write_fit_snapshot` writes four files into
 ``Processing/<scannum>_dp<datapoint>_<YYYYMMDD-HHMMSS>/``:
 
 * ``Result.txt``  — the solution, and the recipe: starting guess, optimiser,
   which slots were free, their bounds, and the sampling/peak settings
 * ``IM_*.png``    — the detector image with the simulated DMS lines over it
 * ``PLOT_*.svg``  — the integrated ROI curves as vector art
+* ``session_*.json`` — the slider session, so Load Session reopens the result
 
 The record is written automatically when a fit finishes (after the post-fit
 curve rebuild, so the curves in it are the refined ones); the manual button
-writes the same three plus the code/config snapshot.  These tests drive the
+writes the same four plus the code/config snapshot.  These tests drive the
 writer over a small hand-made curve state, so they exercise the files without
 running an optimisation.
 
@@ -84,7 +85,7 @@ def _write(win, method='COBYLA', **kw):
     return outpath, sorted(os.listdir(outpath))
 
 
-def test_snapshot_writes_three_files_in_a_scan_dp_time_folder():
+def test_snapshot_writes_four_files_in_a_scan_dp_time_folder():
     win = slider_on(CONFIG).win
     _curve_state(win)
     outpath, files = _write(win)
@@ -95,7 +96,8 @@ def test_snapshot_writes_three_files_in_a_scan_dp_time_folder():
     assert os.path.basename(os.path.dirname(outpath)) == 'Processing'
 
     stem = '%s_dp%d' % (win._scannum, int(win._datapoint))
-    assert files == ['IM_%s.png' % stem, 'PLOT_%s.svg' % stem, 'Result.txt'], files
+    assert files == ['IM_%s.png' % stem, 'PLOT_%s.svg' % stem, 'Result.txt',
+                     'session_%s.json' % stem], files
     for f in files:
         assert os.path.getsize(os.path.join(outpath, f)) > 0, f
 
@@ -161,7 +163,7 @@ def test_no_fit_is_offered_and_records_itself_as_such():
     _curve_state(win)
     outpath, files = _write(win, method='NoFit')
     assert os.path.basename(outpath).endswith('_NoFit'), outpath
-    assert len(files) == 3, files
+    assert len(files) == 4, files
 
     txt = open(os.path.join(outpath, 'Result.txt')).read()
     assert '[NoFit]' in txt
@@ -170,6 +172,38 @@ def test_no_fit_is_offered_and_records_itself_as_such():
     assert 'started from' not in txt          # there was no starting point to beat
     assert 'initial_guess = np.array([' in txt
 
+
+def test_the_session_in_the_record_restores_the_fit():
+    """The record's session file is what Load Session reads: it carries the
+    refined guess, the geometry and the fit result, and restoring it puts the
+    refined guess back on the sliders."""
+    import json
+    sl  = slider_on(CONFIG)
+    win = sl.win
+    _curve_state(win)
+    win._last_res_x = np.array([1.0, 2.0])
+    win._last_fit_info = {'opt': 0.1234, 'method': 'COBYLA'}
+    # a finished fit writes its result into the sliders; move one as it would
+    label = next(lb for lb, idx, *_ in sl.slider_defs if idx == 10)
+    refined_dd = win._sliders[label].val + 7.0
+    win._sliders[label].setValue(refined_dd)
+    win._sync_ig()
+    refined = np.asarray(win.ig, dtype=float).copy()
+
+    outpath, _ = _write(win)
+    stem = '%s_dp%d' % (win._scannum, int(win._datapoint))
+    with open(os.path.join(outpath, 'session_%s.json' % stem)) as fh:
+        data = json.load(fh)
+
+    assert np.allclose(data['initial_guess'], refined)
+    assert data['hkl'] == win._hkl.tolist()
+    assert data['fit_result']['method'] == 'COBYLA'
+    assert data['fit_result']['res_x'] == [1.0, 2.0]
+
+    win._sliders[label].setValue(refined_dd - 20.0)   # wander off
+    win._restore_from_dict(data)
+    win._sync_ig()
+    assert np.isclose(win.ig[10], refined_dd)
 
 if __name__ == '__main__':
     for name, fn in sorted(globals().items()):

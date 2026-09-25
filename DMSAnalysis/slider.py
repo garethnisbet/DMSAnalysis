@@ -1762,8 +1762,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._btn_save_fit.setToolTip(
             'Write the last completed fit to Processing/<scan>_dp<dp>_<time>/ '
             'again, with the reproducibility extras.\n\nEvery fit already '
-            'writes its own record there — Result.txt, the DMS overlay PNG and '
-            'the integrated-curve SVG.  This adds the config, the code '
+            'writes its own record there — Result.txt, the DMS overlay PNG, '
+            'the integrated-curve SVG and a session file for Load Session.  This adds the config, the code '
             'snapshots and res.x.txt, in a folder of its own.')
         self._btn_save_fit.setEnabled(False)
         self._btn_save_fit.clicked.connect(self._on_save_fit_processing)
@@ -5016,9 +5016,10 @@ class DMSSlider(QtWidgets.QMainWindow):
     def _write_fit_snapshot(self, out, extras=False):
         """Write the run record for a completed fit and return its directory.
 
-        Three files, always: the solution (``Result.txt``), the detector image
-        with the DMS lines over it (``IM_*.png``) and the integrated curves
-        (``PLOT_*.svg``).  `extras` adds the reproducibility snapshot the manual
+        Four files, always: the solution (``Result.txt``), the detector image
+        with the DMS lines over it (``IM_*.png``), the integrated curves
+        (``PLOT_*.svg``) and the slider session (``session_*.json``, reloadable
+        with **Load Session**).  `extras` adds the reproducibility snapshot the manual
         save has always written — the code, the config and the raw result
         vector.  Raises on failure; callers report it."""
         outpath = self._snapshot_dir(out.get('method'))
@@ -5029,6 +5030,11 @@ class DMSSlider(QtWidgets.QMainWindow):
                                 out.get('dmsindex'))
         if not self._write_curves_svg(os.path.join(outpath, 'PLOT_%s.svg' % stem)):
             print('No integrated curves to export to %s' % outpath)
+        # The session as it stands after the fit — refined geometry, selected
+        # reflections, manual centres, fit result — so Load Session on this file
+        # puts the slider back exactly where this record was made.
+        self._write_session(os.path.join(outpath, 'session_%s.json' % stem),
+                            self._session_dict())
 
         if extras:
             import shutil

@@ -526,7 +526,15 @@ Processing/<scannum>_dp<datapoint>_<YYYYMMDD-HHMMSS>_<method>/
     Result.txt              # the solution, and the recipe to rerun it
     IM_<scan>_dp<dp>.png    # the detector image with the DMS lines over it
     PLOT_<scan>_dp<dp>.svg  # the integrated ROI curves, as vector art
+    session_<scan>_dp<dp>.json  # the slider session after the fit
 ```
+
+The session file is the same `_session_dict` the auto-save and **Save Session**
+write, taken once the refined values are on the sliders — so **Load Session** on
+it reopens the result: refined geometry, selected reflections, manual centres
+and the fit result. Restoring rebuilds the ROIs at the *refined* geometry (as
+any session restore does), whereas the fit was scored on the ROIs it started
+from, so the reloaded χ² can differ slightly from the one in `Result.txt`.
 
 Seconds are in the stamp because a fit takes seconds: two fits in one minute
 must not share a folder. The method comes last, as in `fit.py`'s batch
@@ -562,7 +570,7 @@ method. In `FitWorker` it is a branch that skips straight to the final
 scoring/rendering the optimising paths end in, so the result dict it emits is
 the same shape as a real fit's.
 
-**Save fit snapshot → Processing** writes the same three files again in a folder
+**Save fit snapshot → Processing** writes the same four files again in a folder
 of its own, plus the reproducibility extras the manual save always had:
 `slider.py`, `ts_quasi.py`, `config_<scan>.json` and `res.x.txt`. Test:
 `DMSAnalysis/tests/test_fit_snapshot.py`.
