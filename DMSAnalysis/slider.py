@@ -511,17 +511,9 @@ def perturbed_starts(n, ndim, rng):
                                for _ in range(n - 1)]
 
 
-class FitStopped(Exception):
-    """Raised inside the objective to abort a fit when Stop is pressed.
-
-    Deliberately *not* StopIteration.  joblib consumes the multi-start tasks as
-    a generator, and a StopIteration escaping a task can be absorbed by that
-    generator machinery as a normal end-of-iteration instead of propagating —
-    so the abort is swallowed and the fit appears to ignore Stop.  A dedicated
-    exception cannot be mistaken for anything else.  It must also stay clear of
-    dmsfit_ico_hkl.fit's `except Exception`, so every check runs *before* the
-    objective is called, never inside it.
-    """
+# Raised inside the objective to abort a fit when Stop is pressed.  Lives in
+# ts_quasi so one raised in a multi-start worker process is this same class.
+FitStopped = ts.FitStopped
 
 
 class ScaledObjective:
@@ -930,9 +922,13 @@ class FitWorker(QtCore.QThread):
                       else list(free_idx))
         self._t0         = time.time()
         self._stop_event = threading.Event()
+        # The multi-start branches run their starts in worker processes, which
+        # cannot see _stop_event; they poll this instead.
+        self._stop_flag  = ts.StopFlag()
 
     def stop(self):
         self._stop_event.set()
+        self._stop_flag.set()
 
     def run(self):
         dms      = self._dms
@@ -1023,18 +1019,15 @@ class FitWorker(QtCore.QThread):
                 n = self._n_starts
                 rng = np.random.default_rng(42)
                 starts = perturbed_starts(n, ndim, rng)
-                def _run_one_b(s):
-                    if ev.is_set():
-                        raise FitStopped('stopped')
-                    _d = copy.deepcopy(dms)
-                    _o = ScaledObjective(lambda xf: _d.fit(_expand(xf)), x0,
-                                         steps, should_stop=ev.is_set)
-                    r = minimize(_o, s, method=cur, bounds=zbnds, tol=tolerance)
-                    obj._record(_o.best_f, _o.best_z)
-                    return r
-                results = Parallel(n_jobs=n, prefer='threads')(
-                    delayed(_run_one_b)(s) for s in starts)
-                res = min(results, key=lambda r: r.fun)
+                # One worker process per start (see ts.run_scaled_start).
+                runs = Parallel(n_jobs=n)(
+                    delayed(ts.run_scaled_start)(
+                        dms, template, free, x0, steps, s, cur, tolerance,
+                        bounds=zbnds, stop=self._stop_flag)
+                    for s in starts)
+                for _r, bf, bz in runs:
+                    obj._record(bf, bz)
+                res = min((r for r, _, _ in runs), key=lambda r: r.fun)
             elif cur in ('BHPowell', 'BHCOBYLA', 'BHNelderMead'):
                 bh_map = {'BHPowell':     ('Powell',      150),
                           'BHCOBYLA':     ('COBYLA',      400),
@@ -1054,21 +1047,20 @@ class FitWorker(QtCore.QThread):
                 rng = np.random.default_rng(42)
                 starts = perturbed_starts(n, ndim, rng)
                 opts = _opts_for(cur)
-                def _run_one(s):
-                    if ev.is_set():
-                        raise FitStopped('stopped')
-                    _d = copy.deepcopy(dms)
-                    _o = ScaledObjective(lambda xf: _d.fit(_expand(xf)), x0,
-                                         steps, should_stop=ev.is_set)
+                def _opts_at(s):
                     o = dict(opts)
                     if cur == 'Nelder-Mead':
                         o['initial_simplex'] = initial_simplex(s, np.ones(ndim))
-                    r = minimize(_o, s, method=cur, tol=tolerance, options=o)
-                    obj._record(_o.best_f, _o.best_z)
-                    return r
-                results = Parallel(n_jobs=n, prefer='threads')(
-                    delayed(_run_one)(s) for s in starts)
-                res = min(results, key=lambda r: r.fun)
+                    return o
+                # One worker process per start (see ts.run_scaled_start).
+                runs = Parallel(n_jobs=n)(
+                    delayed(ts.run_scaled_start)(
+                        dms, template, free, x0, steps, s, cur, tolerance,
+                        options=_opts_at(s), stop=self._stop_flag)
+                    for s in starts)
+                for _r, bf, bz in runs:
+                    obj._record(bf, bz)
+                res = min((r for r, _, _ in runs), key=lambda r: r.fun)
 
             elapsed = time.time() - self._t0
             dms.hkllistrange[2] = numsteps
@@ -1106,6 +1098,8 @@ class FitWorker(QtCore.QThread):
         except Exception as e:
             self.error.emit(str(e), time.time() - self._t0)
             import traceback; traceback.print_exc()
+        finally:
+            self._stop_flag.close()
 
 
 # ── ROI-build worker (kernel + curve integration in a background thread) ───────

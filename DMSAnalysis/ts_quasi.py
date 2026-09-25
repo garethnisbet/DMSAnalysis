@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from scipy.optimize import minimize, differential_evolution, basinhopping
 import copy
+import os
 #from scipy.optimize import differential_evolution
 from joblib import Parallel, delayed
 # shapely powers the Kossel-line intersection test used by the tripfit engine;
@@ -793,6 +794,66 @@ def makekernel(func,size, sigma,sigma2 = 1):
     elif func=='custom2':
         return np.exp(-((x-x0)**2 + (y-y0)**2) / sigma**2)+np.pi*0.5*sigma2/(((x-x0)**2+(0.5*sigma2)**2)+((y-y0)**2+(0.5*sigma2)**2))
 
+def convolve_binary(shape, rows, cols, weights, dense_fraction=1/32.):
+    '''ndimage.convolve(im, weights) for an image that is 1 at (rows, cols) and 0
+    everywhere else — the simulated DMS image — bit for bit, without touching
+    the empty pixels.
+
+    ndimage computes each output pixel as a running sum of input*weight over
+    the kernel footprint, in C order of the (flipped) kernel, skipping weights
+    with |w| <= DBL_EPSILON, with 'reflect' boundaries.  On a binary image every
+    term is either +0.0, which leaves a float sum unchanged, or exactly w.  So
+    adding w into each pixel a line pixel reaches, one kernel offset at a time
+    in that same order, performs the identical sequence of additions: within
+    one offset each output pixel is reached at most once (the map from a
+    reflected source position to an output is a shift), so every pixel sees its
+    terms in ndimage's order.  Near an edge a line pixel also contributes
+    through its mirror image, which is what 'reflect' reads there.
+
+    The full convolution of a detector-sized frame costs ~0.25 s and was ~80%
+    of every objective evaluation; the line pixels are a fraction of a percent
+    of the frame.  Past `dense_fraction` of the frame lit, ndimage is used
+    directly — same result, and cheaper once the image stops being sparse.'''
+    H, W = int(shape[0]), int(shape[1])
+    weights = np.asarray(weights, dtype=float)
+    key = np.unique(np.asarray(rows, dtype=np.int64) * W
+                    + np.asarray(cols, dtype=np.int64))
+    if key.size > dense_fraction * H * W:
+        im = np.zeros((H, W))
+        im.flat[key] = 1
+        return ndimage.convolve(im, weights)
+    kh, kw = weights.shape
+    rh, rw = kh // 2, kw // 2
+    qr, qc = key // W, key % W
+
+    def _preimages(q, n, r):
+        # Positions x in [-r, n-1+r] that 'reflect' (d c b a | a b c d | d c b a)
+        # reads as q: q itself, its mirror past the low edge, and past the high.
+        lo, hi = -1 - q, 2 * n - 1 - q
+        return [(q, np.ones(q.shape, bool)), (lo, lo >= -r), (hi, hi <= n - 1 + r)]
+
+    vr, vc = [], []
+    for xr, mr in _preimages(qr, H, rh):
+        for xc, mc in _preimages(qc, W, rw):
+            m = mr & mc
+            vr.append(xr[m]); vc.append(xc[m])
+    vr, vc = np.concatenate(vr), np.concatenate(vc)
+
+    out = np.zeros(H * W)
+    wf = weights[::-1, ::-1]               # convolve = correlate with the flip
+    eps = np.finfo(float).eps
+    for i in range(kh):
+        pr = vr - (i - rh)
+        in_r = (pr >= 0) & (pr < H)
+        for j in range(kw):
+            w = wf[i, j]
+            if not abs(w) > eps:
+                continue
+            pc = vc - (j - rw)
+            m = in_r & (pc >= 0) & (pc < W)
+            out[pr[m] * W + pc[m]] += w
+    return out.reshape(H, W)
+
 def gauss(x,sigma, intensity,centre, bg):
     return intensity*np.exp(-(((x)-centre)**2/(2*sigma**2)))+bg
     
@@ -1001,6 +1062,95 @@ def roi_rasterise(path, imshape):
     return im
 
 
+class RoiKernel(object):
+    '''The ROI kernel stack, stored as each plane's lit pixels.
+
+    Stands in for the dense (H, W, n) array roibuilder_ico_hkl used to return:
+    `shape` is the dense shape, `kernel[:, :, i]` rebuilds plane i exactly, and
+    `kernel[:, :, sel]` for a slice or index list is another RoiKernel.  A ROI
+    is a thin strip along one line, so the dense stack was almost entirely
+    zeros — 832 MB for 42 ROIs on a Pilatus 2M frame, copied whole into every
+    parallel fit start.  This holds the same information in a few hundred kB.
+
+    `pixels(i)` is `np.where(kernel[:, :, i] > 0)` without building the plane,
+    which is all msroi ever reads from it.'''
+    def __init__(self, imshape, rows, cols, values):
+        self.imshape = (int(imshape[0]), int(imshape[1]))
+        self._rows, self._cols, self._values = list(rows), list(cols), list(values)
+
+    @classmethod
+    def from_planes(cls, planes, imshape):
+        rows, cols, values = [], [], []
+        for p in planes:
+            r, c = np.nonzero(p)
+            rows.append(r); cols.append(c); values.append(p[r, c])
+        return cls(imshape, rows, cols, values)
+
+    @classmethod
+    def from_masks(cls, coords, imshape):
+        '''Binary planes lit at each (M, 2) array of (row, col) in `coords` —
+        what multiroifit's ROI mask stack is.  Stored in np.where order, one
+        entry per pixel, like from_planes.'''
+        W = int(imshape[1])
+        rows, cols, values = [], [], []
+        for rc in coords:
+            rc = np.asarray(rc).astype(int).reshape(-1, 2)
+            key = np.unique(rc[:, 0].astype(np.int64) * W + rc[:, 1])
+            rows.append(key // W); cols.append(key % W)
+            values.append(np.ones(len(key)))
+        return cls(imshape, rows, cols, values)
+
+    @property
+    def shape(self):
+        return self.imshape + (len(self._rows),)
+
+    @property
+    def nbytes(self):
+        return sum(a.nbytes for a in self._rows + self._cols + self._values)
+
+    def pixels(self, i):
+        pos = self._values[i] > 0
+        return self._rows[i][pos], self._cols[i][pos]
+
+    def plane(self, i):
+        p = np.zeros(self.imshape)
+        p[self._rows[i], self._cols[i]] = self._values[i]
+        return p
+
+    def __len__(self):
+        return len(self._rows)
+
+    def __getitem__(self, key):
+        if not (isinstance(key, tuple) and len(key) == 3
+                and key[0] == slice(None) and key[1] == slice(None)):
+            raise TypeError('RoiKernel supports kernel[:, :, i] and '
+                            'kernel[:, :, selection] only')
+        sel = key[2]
+        if isinstance(sel, (int, np.integer)):
+            return self.plane(sel)
+        idx = np.arange(len(self))[sel]
+        return RoiKernel(self.imshape, [self._rows[i] for i in idx],
+                         [self._cols[i] for i in idx], [self._values[i] for i in idx])
+
+    def copy(self):
+        return RoiKernel(self.imshape, [a.copy() for a in self._rows],
+                         [a.copy() for a in self._cols], [a.copy() for a in self._values])
+
+    def __array__(self, dtype=None, copy=None):
+        '''The dense stack, for anything that still wants one.'''
+        out = np.zeros(self.shape)
+        for i in range(len(self)):
+            out[self._rows[i], self._cols[i], i] = self._values[i]
+        return out if dtype is None else out.astype(dtype)
+
+
+def roi_pixels(kernel, i):
+    '''np.where(kernel[:, :, i] > 0) for a dense stack or a RoiKernel.'''
+    if isinstance(kernel, RoiKernel):
+        return kernel.pixels(i)
+    return np.where(kernel[:, :, i] > 0)
+
+
 def roibuilder_ico_hkl(args):
     #builderargs=reflist,hkllist,hklint,1,psirange,100,hkl,detvects,imdata.shape,simsigma,azir,psi,px,py,scatv,detdistancepx,rotx,roty,rotz,energy,ig,reflist2,mtrx2
     #                ref,hkllist,hklint,1,psirange,100,hkl,detvects,emptyim,     simsigma,azir,psi,px,py,scatv,detdistancepx,rotx,roty,rotz,energy,   reflist2,mtrx2
@@ -1035,8 +1185,7 @@ def roibuilder_ico_hkl(args):
 
     numrefs=reflist.shape[0]
     reflist2_arr=np.asarray(reflist2)
-    kernelstack=np.zeros((imshape[0],imshape[1],numrefs*2))
-    keep=np.array([[]]*1).T
+    kept_planes=[]      # the ROI planes kept, in ROI order (2 per reflection)
     for i1 in range(0,numrefs,1):
         ref=reflist[i1,:]
         # The perpendicular component of *this* reflection, not the whole list.
@@ -1081,64 +1230,64 @@ def roibuilder_ico_hkl(args):
             roi1 = roi_rasterise(roiindex[run[:half]], imshape)
             roi2 = roi_rasterise(roiindex[run[half:]], imshape)
             if roi1.any() and roi2.any():
-                kernelstack[:,:,(i1*2)]=roi1
-                kernelstack[:,:,(i1*2)+1]=roi2
-                keep=np.vstack([keep,(i1*2)])
-                keep=np.vstack([keep,(i1*2)+1])
+                kept_planes.append(roi1)
+                kept_planes.append(roi2)
             else:
                 print('ROI '+str(i1)+' removed because a half is off the detector.')
         else:
             print('ROI '+str(i1)+' removed because lines miss the detector.')
-#     keep=uniquearray(keep) # clean duplicates
-    if keep.shape[0] >0:
-        keep=tuple(map(tuple,keep.T.astype(int)))[0]
-        return kernelstack[:,:,keep]
+    if kept_planes:
+        # Sparse: a ROI is a thin strip, and the dense (H, W, n) stack this used
+        # to return was ~20 MB per ROI of zeros on a Pilatus 2M frame.
+        return RoiKernel.from_planes(kept_planes, imshape)
     else:
         print('No ROIS used!')
-        return kernelstack+1
+        return np.ones((imshape[0],imshape[1],numrefs*2))
+
+class msroi_sampler(object):
+    """
+    The pixels msroi integrates for one ROI, worked out once.
+
+    They depend only on the kernel plane, the width and the image shape 
+    The fit integrates the same ROIs of a new simulated image on every evaluation,
+    so it keeps one of these per ROI and pays only for the gather and the sum.
+
+    `pixels`, if given, is np.where(kernel > 0) already worked out (roi_pixels),
+    and `kernel` is then not read.
+    """
+
+    def __init__(self, kernel, width, imshape, pixels=None):
+        vs_idx = np.where(kernel > 0) if pixels is None else pixels
+        dv = np.array([[vs_idx[0][-1] - vs_idx[0][0], vs_idx[1][-1] - vs_idx[1][0]]], dtype=float)
+        v = (dv @ np.array([[0, 1], [-1, 0]])).flatten()
+        self.v = v / np.linalg.norm(v)
+        vs = np.stack([vs_idx[0], vs_idx[1]], axis=1).astype(float)
+
+        irange = np.arange(int(np.round(-width / 2.0)), int(np.round(width / 2.0)))
+        offsets = np.outer(irange, self.v)                                         # (W, 2)
+        shifted = np.round(vs[np.newaxis] + offsets[:, np.newaxis]).astype(int)   # (W, N, 2)
+
+        self.valid = ((shifted[:, :, 0] > 0) & (shifted[:, :, 0] < imshape[0]) &
+                      (shifted[:, :, 1] >= 0) & (shifted[:, :, 1] < imshape[1]))
+        self.r0 = np.clip(shifted[:, :, 0], 0, imshape[0] - 1)
+        self.r1 = np.clip(shifted[:, :, 1], 0, imshape[1] - 1)
+        w_idx, n_idx = np.where(self.valid)
+        self.roi = shifted[w_idx, n_idx]                                           # (M, 2)
+
+    def sums(self, img):
+        '''(W, 1) sum of the image along the path at each perpendicular offset.'''
+        vals = np.where(self.valid, img[self.r0, self.r1], 0.0)
+        return vals.sum(axis=1, keepdims=True)
+
 def msroi(img, kernel, width):
     ''' Kernel should be 2D array'''
-    vs_idx = np.where(kernel > 0)
-    dv = np.array([[vs_idx[0][-1] - vs_idx[0][0], vs_idx[1][-1] - vs_idx[1][0]]], dtype=float)
-    v = (dv @ np.array([[0, 1], [-1, 0]])).flatten()
-    v = v / np.linalg.norm(v)
-    vs = np.stack([vs_idx[0], vs_idx[1]], axis=1).astype(float)
-
-    irange = np.arange(int(np.round(-width / 2.0)), int(np.round(width / 2.0)))
-    offsets = np.outer(irange, v)                                              # (W, 2)
-    shifted = np.round(vs[np.newaxis] + offsets[:, np.newaxis]).astype(int)   # (W, N, 2)
-
-    valid = ((shifted[:, :, 0] > 0) & (shifted[:, :, 0] < img.shape[0]) &
-             (shifted[:, :, 1] >= 0) & (shifted[:, :, 1] < img.shape[1]))
-    r0 = np.clip(shifted[:, :, 0], 0, img.shape[0] - 1)
-    r1 = np.clip(shifted[:, :, 1], 0, img.shape[1] - 1)
-    vals = np.where(valid, img[r0, r1], 0.0)
-    v1 = vals.sum(axis=1, keepdims=True)                                       # (W, 1)
-    w_idx, n_idx = np.where(valid)
-    v2 = shifted[w_idx, n_idx]                                                 # (M, 2)
-    return v1, v2
+    s = msroi_sampler(kernel, width, img.shape)
+    return s.sums(img), s.roi
 
 def msroi2(img, kernel, width):
     ''' Kernel should be 2D array'''
-    vs_idx = np.where(kernel > 0)
-    dv = np.array([[vs_idx[0][-1] - vs_idx[0][0], vs_idx[1][-1] - vs_idx[1][0]]], dtype=float)
-    v = (dv @ np.array([[0, 1], [-1, 0]])).flatten()
-    v = v / np.linalg.norm(v)
-    vs = np.stack([vs_idx[0], vs_idx[1]], axis=1).astype(float)
-
-    irange = np.arange(int(np.round(-width / 2.0)), int(np.round(width / 2.0)))
-    offsets = np.outer(irange, v)                                              # (W, 2)
-    shifted = np.round(vs[np.newaxis] + offsets[:, np.newaxis]).astype(int)   # (W, N, 2)
-
-    valid = ((shifted[:, :, 0] > 0) & (shifted[:, :, 0] < img.shape[0]) &
-             (shifted[:, :, 1] >= 0) & (shifted[:, :, 1] < img.shape[1]))
-    r0 = np.clip(shifted[:, :, 0], 0, img.shape[0] - 1)
-    r1 = np.clip(shifted[:, :, 1], 0, img.shape[1] - 1)
-    vals = np.where(valid, img[r0, r1], 0.0)
-    v1 = vals.sum(axis=1, keepdims=True)                                       # (W, 1)
-    w_idx, n_idx = np.where(valid)
-    v2 = shifted[w_idx, n_idx]                                                 # (M, 2)
-    return v1, v2, v
+    s = msroi_sampler(kernel, width, img.shape)
+    return s.sums(img), s.roi, s.v
 
 
 def roi_walk_path(vs):
@@ -1233,9 +1382,10 @@ def multiroifit(img,kernel,width,percentileval,method='gauss',sig=None):
     vy=[]
     v3=[]
     pcovlist=[]
-    v4=np.zeros((img.shape[0],img.shape[1],kernel.shape[2]))
+    v4=[]
     for i1 in range(kernel.shape[2]):
-        sumvals,roi = msroi(img,kernel[:,:,i1],width)
+        s = msroi_sampler(None, width, img.shape, pixels=roi_pixels(kernel, i1))
+        sumvals, roi = s.sums(img), s.roi
         xdata=np.arange(len(sumvals))
         ydata=sumvals[:,0]
         # xdata=xdata[ydata>np.percentile(ydata, percentileval)]
@@ -1252,11 +1402,14 @@ def multiroifit(img,kernel,width,percentileval,method='gauss',sig=None):
         vx.append(xdata)
         vy.append(ydata)
         v3.append(fitpoints)
-        v4[roi[:,0].astype(int),roi[:,1].astype(int),i1]=1
+        v4.append(roi)
         pcovlist.append(pcov)
-    return v1, np.array(vx),np.array(vy), np.array(v3), v4, pcovlist
-def _multiroifit2_one(img, kernel_slice, width, sig, idx, method='gauss'):
-    sumvals, roi, transvect0 = msroi2(img, kernel_slice, width)
+    # v4, the pixels each ROI integrated, used to be a dense (H, W, n) stack —
+    # ~20 MB per ROI allocated on every call; np.asarray/np.sum still give it.
+    return v1, np.array(vx),np.array(vy), np.array(v3), RoiKernel.from_masks(v4, img.shape), pcovlist
+def _multiroifit2_one(img, pixels, width, sig, idx, method='gauss'):
+    s = msroi_sampler(None, width, img.shape, pixels=pixels)
+    sumvals, roi = s.sums(img), s.roi
     xdata = np.arange(len(sumvals))
     ydata = sumvals[:, 0]
     try:
@@ -1271,10 +1424,10 @@ def _multiroifit2_one(img, kernel_slice, width, sig, idx, method='gauss'):
 def multiroifit2(img,kernel,width,percentileval,sig,method='gauss'):
     n = kernel.shape[2]
     results = Parallel(n_jobs=-1)(
-        delayed(_multiroifit2_one)(img, kernel[:, :, i1], width, sig, i1, method)
+        delayed(_multiroifit2_one)(img, roi_pixels(kernel, i1), width, sig, i1, method)
         for i1 in range(n)
     )
-    v4 = np.zeros((img.shape[0], img.shape[1], n))
+    v4 = []
     v1 = np.array([[]]*4).T
     vx, vy, v3, pcovlist = [], [], [], []
     for i1, (coef, xdata, ydata, fitpoints, roi, pcov) in enumerate(results):
@@ -1282,9 +1435,9 @@ def multiroifit2(img,kernel,width,percentileval,sig,method='gauss'):
         vx.append(xdata)
         vy.append(ydata)
         v3.append(fitpoints)
-        v4[roi[:, 0].astype(int), roi[:, 1].astype(int), i1] = 1
+        v4.append(roi)
         pcovlist.append(pcov)
-    return v1, np.array(vx), np.array(vy), np.array(v3), v4, pcovlist
+    return v1, np.array(vx), np.array(vy), np.array(v3), RoiKernel.from_masks(v4, img.shape), pcovlist
 class res(object):
     def __init__(self,x):
         self.x=x
@@ -2680,12 +2833,29 @@ class dmsfit_ico_hkl(object):
         so the residual compares like with like (see AUTO_DOUBLET_SIG).'''
         self.peakmethod = method
         self.peaksig = sig
+    def _roi_samplers(self):
+        '''One msroi_sampler per ROI, built on first use and kept while the
+        kernel, width and image shape stay what they were built from.  Built
+        in ROI order inside the caller, so a ROI that cannot be sampled raises
+        exactly where msroi did.'''
+        key = (self.kernel.shape, self.width, self.imsim.shape)
+        cache = getattr(self, '_roi_sampler_cache', None)
+        if cache is None or cache[0] is not self.kernel or cache[1] != key:
+            cache = (self.kernel, key, [])
+            self._roi_sampler_cache = cache
+        samplers = cache[2]
+        for i1 in range(self.kernel.shape[2]):
+            if i1 == len(samplers):
+                samplers.append(msroi_sampler(None, self.width, self.imsim.shape,
+                                              pixels=roi_pixels(self.kernel, i1)))
+            yield samplers[i1]
+
     def _simcoeffs(self):
         '''Per-ROI peak coefficients of the current simulated image, using the
         selected peak-position method.  v1[:,2] is the centre per ROI.'''
         v1=np.array([[]]*4).T
-        for i1 in range(self.kernel.shape[2]):
-            sumvals,roi = msroi(self.imsim,self.kernel[:,:,i1],self.width)
+        for sampler in self._roi_samplers():
+            sumvals = sampler.sums(self.imsim)
             xdata=np.arange(len(sumvals))
             ydata=sumvals[:,0]
             try:
@@ -2988,10 +3158,13 @@ class dmsfit_ico_hkl(object):
         # so a fit's own result, read back through inputarray, described a
         # geometry the fit had never evaluated.
         self.inputarray = np.array([a,b,c,alpha,beta,gamma,psicorrection,chicorrection,thetacorrection,l_correction,detdistancepx,detxrot,detyrot,detzrot,energy,self.a11,self.a12,self.a13,self.a21,self.a22,self.a23,self.a31,self.a32,self.a33])
-        imsim[self.dmsindex]=1
         if self.simsigma != 0:
-            self.imsim=ndimage.convolve(imsim,makekernel('gauss',15,self.simsigma))
+            # Identical to ndimage.convolve of the binary line image, computed
+            # from the line pixels alone — see convolve_binary.
+            self.imsim=convolve_binary(imsim.shape, pxv2d[:,0], pxv2d[:,1],
+                                       makekernel('gauss',15,self.simsigma))
         else:
+            imsim[self.dmsindex]=1
             self.imsim=imsim
 
         # ── Per-reflection line data for visualisation ────────────────────────
@@ -3133,6 +3306,85 @@ class dmsfit_ico_hkl(object):
         except Exception:
             return (self._total_failure_score(), np.zeros(self.imdata.shape),
                     np.array([[],[]]), self.imdata, self.inputarray)
+
+
+# ── Multi-start fits in worker processes ─────────────────────────────────────────
+# The slider runs several optimiser starts at once.  They used to run on
+# threads, which only overlapped while the objective sat in GIL-free C code (the
+# old full-frame ndimage.convolve).  With that gone the objective is mostly the
+# per-ROI curve fits, which hold the GIL, so threads took turns: four starts cost
+# what four sequential ones did.  Processes run them truly in parallel.  What
+# runs in a worker must live here rather than in slider.py, or unpickling it
+# would import the GUI module.
+
+class FitStopped(Exception):
+    """Raised inside the objective to abort a fit when Stop is pressed.
+
+    Deliberately *not* StopIteration.  joblib consumes the multi-start tasks as
+    a generator, and a StopIteration escaping a task can be absorbed by that
+    generator machinery as a normal end-of-iteration instead of propagating —
+    so the abort is swallowed and the fit appears to ignore Stop.  A dedicated
+    exception cannot be mistaken for anything else.  It must also stay clear of
+    dmsfit_ico_hkl.fit's `except Exception`, so every check runs *before* the
+    objective is called, never inside it.  Defined here so one raised in a
+    worker process is the same class the slider catches.
+    """
+
+
+class StopFlag(object):
+    '''A stop request that worker processes can see: a file that exists once
+    set.  A threading.Event does not cross a process boundary, and a
+    multiprocessing.Manager event needs the parent's auth key, which joblib's
+    workers do not have.  Checking costs one stat per objective evaluation.'''
+    def __init__(self):
+        import tempfile
+        self._dir = tempfile.mkdtemp(prefix='dms_stop_')
+        self.path = os.path.join(self._dir, 'stop')
+
+    def set(self):
+        try:
+            open(self.path, 'w').close()
+        except OSError:          # already closed: nothing left running to stop
+            pass
+
+    def is_set(self):
+        return os.path.exists(self.path)
+
+    def close(self):
+        import shutil
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+
+def run_scaled_start(dms, template, free, anchor, steps, z0, method, tol,
+                     options=None, bounds=None, stop=None):
+    '''One start of the slider's multi-start fit, runnable in a worker process.
+
+    Minimises dms.fit over the `free` positions of the reduced vector
+    `template`, in step-scaled coordinates x = anchor + z * steps (the slider's
+    ScaledObjective), from z0.  Works on its own copy of the engine, as each
+    threaded start did.  Returns (OptimizeResult, best_f, best_z): the best
+    point any evaluation reached, which the optimiser need not return.'''
+    d = copy.deepcopy(dms)
+    template = np.asarray(template, dtype=float)
+    free = np.asarray(free, dtype=int)
+    anchor = np.asarray(anchor, dtype=float)
+    steps = (np.ones_like(anchor) if steps is None
+             else np.asarray(steps, dtype=float))
+    best = [np.inf, None]
+
+    def objective(z):
+        if stop is not None and stop.is_set():
+            raise FitStopped('stopped')
+        full = template.copy()
+        full[free] = anchor + np.asarray(z, dtype=float) * steps
+        f = d.fit(full)
+        if np.isfinite(f) and f < best[0]:
+            best[0], best[1] = float(f), np.array(z, dtype=float)
+        return f
+
+    res = minimize(objective, z0, method=method, bounds=bounds, tol=tol,
+                   options=options)
+    return res, best[0], best[1]
 
 
 # ── Multiple-intersection (Renninger triple-intersection) lattice fitting ───────

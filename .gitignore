@@ -6,9 +6,13 @@ __pycache__/
 .claude/
 .vscode/
 .idea/
+.venv/
 
 # Run output snapshots (large, regenerated per run)
 /Processing/
+
+# Local scan data (detector images, .nxs, sessions) — too large for the repo
+/data/
 
 # User-generated run artefacts (written to the working directory)
 /slider_state_*.json

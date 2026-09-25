@@ -582,6 +582,12 @@ of the line moves both halves the same way, but a *rotation* moves them
 oppositely — the pair is what makes the fit sensitive to the line's orientation
 and not only its position.
 
+The stack comes back as a `RoiKernel` — each plane's lit pixels rather than a
+dense `(H, W, n)` array. `kernel.shape`, `kernel[:, :, i]` (the exact dense
+plane), `kernel[:, :, selection]`, `.copy()` and `np.asarray(kernel)` behave as
+they did on the array; `roi_pixels(kernel, i)` is `np.where(kernel[:, :, i] > 0)`
+for either form, without building the plane.
+
 The locus it starts from is the reflection's on-detector pixels in scan order,
 and it is not always one tidy curve, so the path is prepared in three steps
 (see *Making the pair from a locus that is not one tidy curve* in `CLAUDE.md`):
@@ -610,6 +616,14 @@ the ROI is laid along a line the fit is not scored on. Anything touching either
 Extracts an intensity line profile perpendicular to a kernel streak in an image.
 
 - **Returns:** `(sumvals, roi_coords)` — integrated intensity per slice and corresponding pixel coordinates.
+
+### `msroi_sampler(kernel, width, imshape)`
+The pixels `msroi` integrates for one kernel plane, worked out once: they depend
+on the kernel, width and image shape but not on the image. `.sums(img)` is
+`msroi`'s `sumvals` for any image of that shape; `.roi` and `.v` are its
+coordinates and perpendicular direction. The fit engine keeps one per ROI
+(`dmsfit_ico_hkl._roi_samplers`), rebuilt if `kernel`, `width` or the image
+shape change.
 
 ### `roi_outline(kernel, width)`
 Closed `(rows, cols)` outline of the strip `msroi` integrates for one kernel
@@ -653,6 +667,8 @@ needs it or the strip's two edges come out as zigzags.
 |----------|-----------|-------------|
 | `gaussfilter` | `(image, siglow, sigblur, orderval)` | High-pass Gaussian filter (subtract low-pass, then smooth) |
 | `makekernel` | `(func, size, sigma, sigma2)` | Creates 2D convolution kernel: `'gauss'`, `'lorentz'`, `'custom1'`, `'custom2'` |
+| `run_scaled_start` | `(dms, template, free, anchor, steps, z0, method, tol, options, bounds, stop)` | One start of the slider's multi-start fit in step-scaled coordinates, runnable in a worker process; returns `(result, best_f, best_z)`. `stop` is a `StopFlag`; setting it raises `FitStopped` in the worker |
+| `convolve_binary` | `(shape, rows, cols, weights, dense_fraction=1/32)` | `ndimage.convolve` of an image that is 1 at `(rows, cols)` and 0 elsewhere, bit for bit, from the lit pixels alone; falls back to `ndimage` past `dense_fraction` of the frame lit |
 | `fft2_filter` | `(img, lp_box_r, lp_box_c, hp_box_r, hp_box_c)` | 2D FFT bandpass filter; returns `(real, imag, abs, mask)` |
 
 ---

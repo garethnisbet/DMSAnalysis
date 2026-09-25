@@ -450,6 +450,72 @@ A run too short to fit a circle to, or one the tolerance rejects, is kept as the
 points the sweep sampled, so switching method can add resolution but never loses
 a curve. Tests: `DMSAnalysis/tests/test_dms_curves.py`.
 
+### The objective's cost, and why its fast paths are exact
+
+Every optimiser in `fit.py` and the slider scores through `dmsfit_ico_hkl.fit`:
+`imcalc` (geometry → simulated image → smear) then, per ROI, `msroi` + a peak
+fit. The vectorised geometry was never the cost. Two things were, and both now
+have replacements that reproduce the old result **bit for bit** — the optimisers
+see the last bit of the objective, so "close" would change fits:
+
+* **The smear.** `ndimage.convolve` of the whole frame with the 15×15 Gaussian
+  was ~80% of an evaluation (~0.25 s per Pilatus 2M frame, ~1.2 s at zoom 2),
+  though only the line pixels are non-zero. `convolve_binary` adds their
+  weights directly. It is exact because ndimage sums `input*weight` over the
+  footprint in C order of the flipped kernel, skipping `|w| <= DBL_EPSILON`, and
+  on a binary image each term is `+0.0` (a no-op) or exactly `w` — so adding
+  `w` one kernel offset at a time, mirrored at the edges for `reflect`, is the
+  same sequence of additions.
+* **The ROIs.** `msroi` found each ROI's pixels with an `np.where` over a whole
+  detector-sized kernel plane on every evaluation. They depend only on kernel,
+  width and image shape, so `msroi_sampler` works them out once and the engine
+  caches one per ROI.
+
+Measured on synthetic 1679×1475 scenes (10–12 ROIs): ~300 ms → ~8–10 ms per
+evaluation at zoom 1, ~1.2 s → ~7 ms at zoom 2, with objective values, residuals,
+the simulated image and `dmsindex` identical. What is left is spread thinly over
+the geometry, the smear and the per-ROI `curve_fit`s. Anything that changes the
+smear or the ROI sums must keep
+`DMSAnalysis/tests/test_fit_objective_speedups.py` passing — it compares with
+`array_equal`, not a tolerance.
+
+**The ROI kernel is sparse.** `roibuilder_ico_hkl` returns a `RoiKernel`: each
+plane's lit pixels, not a dense `(H, W, n)` stack (0.6 MB instead of 832 MB for
+the 42 ROIs of `data/slider_state_913232_*`). It keeps the two things callers
+used — `kernel.shape[2]` and `kernel[:, :, i]` (rebuilt exactly) — plus
+`kernel[:, :, selection]`, `.copy()`, and `np.asarray(kernel)` for the dense
+stack; `roi_pixels(kernel, i)` gives `np.where(plane > 0)` for either form
+without building the plane. `multiroifit`/`multiroifit2` return their ROI mask
+stack the same way. Only the degenerate "No ROIS used!" fallback still returns a
+dense all-ones array, exactly as before.
+
+**Multi-start fits run in processes, not threads.** The slider ran its parallel
+starts (COBYLA, Nelder-Mead, Powell, L-BFGS-B, TNC) on threads. Those overlapped
+only while the objective sat in GIL-free C — the old full-frame convolve — so
+once the smear stopped dominating, the starts took turns. Each start now runs
+`ts.run_scaled_start` in a joblib worker process; the sparse kernel is what makes
+sending the engine to a worker cheap (~10 MB, mostly the image). Stop reaches the
+workers through `ts.StopFlag` (a flag file — a `threading.Event` cannot cross a
+process boundary, and a `multiprocessing.Manager` event needs an auth key
+joblib's workers lack), and `FitStopped` lives in `ts_quasi` so the class raised
+in a worker is the one the slider catches. Anything a worker executes must live
+in `ts_quasi`, never `slider.py`, or unpickling it imports the GUI.
+
+On the real session (scan 913232, 42 ROIs), the slider's 4-start COBYLA took
+149.8 s before any of this, 34.4 s with the fast objective on threads, and 9.0 s
+with processes — every start taking the same number of evaluations to the same
+parameters in all three. In the app itself (the session restored in the real
+slider, fit through `FitWorker`): 152.5 s → 9.0 s, the same χ², the same refined
+vector, and a `Result.txt` that differs only in its timestamp and elapsed time;
+Stop ends a running fit within ~0.2 s.
+
+`DMSAnalysis/tests/test_fitworker_processes.py` drives the real `FitWorker`:
+the result must equal the same starts run in-process, and Stop must end a fit
+mid-run. It connects to the worker's signals with `DirectConnection` rather than
+pumping the event loop — `processEvents()` in a GUI test also runs the slider's
+queued startup task, whose modal missing-scan prompt (`_prompt_missing_scan`)
+blocks forever offscreen when the test config's data is not on the machine.
+
 ## Conventional crystals
 
 The same engine and apps also handle **ordinary (non-quasicrystal) crystals**
