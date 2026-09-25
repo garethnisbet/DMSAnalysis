@@ -84,6 +84,14 @@ once the `experiment` block is populated, the apps never read the `.dat` again.
 The three panel dividers and the window geometry are remembered between
 sessions.
 
+![The slider fitting an Al–Pd–Mn quasicrystal](DMS_Fit.png)
+
+*The slider on scan 913232 (datapoint 9), fitting an icosahedral Al–Pd–Mn
+quasicrystal. Left: the detector image with the predicted DMS lines of the
+selected reflections. Centre: the scan, fit, crystal-type, lattice/phason slider,
+reflection-list and identify controls. Right: the integrated ROI curves, two per
+reflection, with their target and simulated centres.*
+
 Typical flow in the **tripslider** (image-free):
 1. Add or edit triple intersections in the **Triple intersections** table (each
    row is three secondary reflections that should meet at one point).
@@ -95,6 +103,14 @@ Typical flow in the **tripslider** (image-free):
    a slider's box to lock that parameter at its current value.
 4. **Save config** to re-run the exact setup, locks included, in
    `python -m DMSAnalysis.tripfit`.
+
+![The tripslider GUI fitting five triple intersections](TripFit.png)
+
+*The tripslider refining the phason strain of the same quasicrystal with `a`
+locked (its tick box cleared). Each panel is one triple on the stereographic
+projection: the three Kossel lines meet at the marked point. The table at the
+bottom holds the five triples' 6D reflections and energies. The summed
+residual is 3.7e-11.*
 
 ### Conventional crystals and pseudo-cubic re-indexing
 
