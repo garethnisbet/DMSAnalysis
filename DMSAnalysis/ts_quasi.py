@@ -774,6 +774,72 @@ def dms2px(detv1,detv2,o,v):
     t=-(n[0]*o[0]+n[1]*o[1]+n[2]*o[2]+D)/(n[0]*v[:,0]+n[1]*v[:,1]+n[2]*v[:,2])# scalar from parametric representation of vectors 
     return (t*v.T).T+o # returns intersection coordinates
 
+
+# ── Detector mounting: which image axis the scattering plane runs along ────────
+# The engines work in a detector frame whose component 0 is normal to the
+# scattering plane and component 2 lies in it (along 2θ).  How those land on
+# the image depends on how the detector sits on the arm:
+#
+#   vertical   (default) — component 0 → rows, component 2 → columns.  For the
+#              Pilatus 100K in vertical scattering, 2θ (δ) runs along the long
+#              axis and an azimuthal scan sweeps the DMS lines across the short
+#              axis.  Every existing config is in this mode.
+#   horizontal — the same detector used in horizontal scattering: component 2
+#              → rows (2θ along the short axis), component 0 → columns, so an
+#              azimuthal scan sweeps the lines along the long axis.
+#
+# `scatv` keeps its meaning (bit 0: the sign of the in-plane component), and the
+# mounting rides in bit 1, so the existing positional argument tuples — builder
+# args, engine args, the joblib workers in fit.py — carry it unchanged.  Only
+# `scatv_code` builds the combined value and only the two helpers below read it.
+DET_ORIENTATIONS = ('vertical', 'horizontal')
+SCATV_HORIZONTAL = 2
+
+
+def det_orientation(name):
+    '''Validate a detector-orientation name (None → 'vertical').'''
+    name = 'vertical' if name is None else str(name).strip().lower()
+    if name not in DET_ORIENTATIONS:
+        raise ValueError('det_orientation must be one of %s, not %r'
+                         % (DET_ORIENTATIONS, name))
+    return name
+
+
+def scatv_code(scatv, orientation='vertical'):
+    '''The engines' ``scatv``: the sign bit of the config ``scatv`` plus the
+    mounting bit for ``orientation``.'''
+    code = int(scatv) & 1
+    if det_orientation(orientation) == 'horizontal':
+        code |= SCATV_HORIZONTAL
+    return code
+
+
+def scatv_orientation(code):
+    '''Split an engine ``scatv`` back into (config scatv, orientation).'''
+    code = int(code)
+    return code & 1, ('horizontal' if code & SCATV_HORIZONTAL else 'vertical')
+
+
+def det_to_pixels(p0, p2, px, py, scatv):
+    '''Detector-frame components (0: normal to the scattering plane, 2: in it)
+    → image (rows, cols) about the origin pixel (px row, py col).'''
+    code = int(scatv)
+    s2 = p2 if code & 1 else -p2
+    if code & SCATV_HORIZONTAL:
+        return px + s2, py + p0
+    return px + p0, py + s2
+
+
+def pixels_to_det(rows, cols, px, py, scatv):
+    '''Inverse of `det_to_pixels`: image (rows, cols) → components (0, 2).'''
+    code = int(scatv)
+    if code & SCATV_HORIZONTAL:
+        p0, s2 = cols - py, rows - px
+    else:
+        p0, s2 = rows - px, cols - py
+    return p0, (s2 if code & 1 else -s2)
+
+
 def psith2v(psi,th):
     X=np.sin((90.0-th)*np.pi/180.0)*np.cos((90.0+psi)*np.pi/180.0)
     Y=np.sin((90.0-th)*np.pi/180.0)*np.sin((90.0+psi)*np.pi/180.0)
@@ -792,6 +858,16 @@ def makekernel(func,size, sigma,sigma2 = 1):
         return np.pi*4.0*sigma/(((x-x0)**2+(0.5*sigma)**2)+((y-y0)**2+(0.5*sigma)**2))**0.25
     elif func=='custom2':
         return np.exp(-((x-x0)**2 + (y-y0)**2) / sigma**2)+np.pi*0.5*sigma2/(((x-x0)**2+(0.5*sigma2)**2)+((y-y0)**2+(0.5*sigma2)**2))
+
+def blur_gauss(img, size, sigma):
+    '''`ndimage.convolve(img, makekernel('gauss', size, sigma))`, done as two
+    1-D passes.  That kernel is exp(-(dx²+dy²)/σ²) = g(dx)·g(dy), so it
+    factors exactly, and the separable form gives the same image (to rounding,
+    ~1e-15) at ~10x less cost: size+size multiplies per pixel instead of
+    size².  Same boundary mode ('reflect') and origin as the 2-D call.'''
+    x = np.arange(0, size, 1, float) - size // 2
+    g = np.exp(-x**2 / sigma**2)
+    return ndimage.convolve1d(ndimage.convolve1d(img, g, axis=0), g, axis=1)
 
 def gauss(x,sigma, intensity,centre, bg):
     return intensity*np.exp(-(((x)-centre)**2/(2*sigma**2)))+bg
@@ -1096,9 +1172,23 @@ def roibuilder_ico_hkl(args):
     else:
         print('No ROIS used!')
         return kernelstack+1
+def roi_kernel_indices(kernel):
+    '''Pixel indices of every ROI in a (rows, cols, n_roi) kernel, one
+    `np.where` tuple per plane — exactly what `msroi` would find.
+
+    The kernel is fixed for the whole of a fit, but searching a full detector
+    plane for its few hundred lit pixels costs ~8 ms on a Pilatus 2M, which
+    was ~40% of every fit evaluation.  Find them once and pass the tuple to
+    `msroi` in place of the plane.'''
+    kernel = np.asarray(kernel)
+    return [np.where(kernel[:, :, i] > 0) for i in range(kernel.shape[2])]
+
+
 def msroi(img, kernel, width):
-    ''' Kernel should be 2D array'''
-    vs_idx = np.where(kernel > 0)
+    '''Integrate `img` across one ROI.  `kernel` is the ROI's 2D plane, or its
+    pixel indices as `roi_kernel_indices` returns them (same result, no
+    full-frame search).'''
+    vs_idx = kernel if isinstance(kernel, tuple) else np.where(kernel > 0)
     dv = np.array([[vs_idx[0][-1] - vs_idx[0][0], vs_idx[1][-1] - vs_idx[1][0]]], dtype=float)
     v = (dv @ np.array([[0, 1], [-1, 0]])).flatten()
     v = v / np.linalg.norm(v)
@@ -1900,12 +1990,8 @@ class dmscalc_ico(object):
         ref_idx_valid = ref_idx_all[valid_px]
 
         pxv2d=np.array(pxvec[:,[0,2]])
-        if self.scatv ==1:
-            pxv2d[:,0]=self.px+pxv2d[:,0]
-            pxv2d[:,1]=self.py+pxv2d[:,1]
-        else:
-            pxv2d[:,0]=self.px+pxv2d[:,0]
-            pxv2d[:,1]=self.py-pxv2d[:,1]
+        _r, _c = det_to_pixels(pxv2d[:,0], pxv2d[:,1], self.px, self.py, self.scatv)
+        pxv2d[:,0], pxv2d[:,1] = _r, _c
         try:
             m0 = pxv2d[:,0] > -1
             pxv2d = pxv2d[m0]; ref_idx_valid = ref_idx_valid[m0]
@@ -2120,12 +2206,8 @@ class dmscalc_ico_hkl(object):
         self.vecs = vecs
         #########  Shift vectors to non negative coordinates   ######################
         pxv2d=np.array(pxvec[:,[0,2]])
-        if self.scatv ==1:
-            pxv2d[:,0]=self.px+pxv2d[:,0]
-            pxv2d[:,1]=self.py+pxv2d[:,1]
-        else:
-            pxv2d[:,0]=self.px+pxv2d[:,0]
-            pxv2d[:,1]=self.py-pxv2d[:,1]
+        _r, _c = det_to_pixels(pxv2d[:,0], pxv2d[:,1], self.px, self.py, self.scatv)
+        pxv2d[:,0], pxv2d[:,1] = _r, _c
         try:
             pxv2d=pxv2d[np.where(pxv2d[:,0]>-1)]
             pxv2d=pxv2d[np.where(pxv2d[:,0]< imsim.shape[0])]
@@ -2488,6 +2570,51 @@ def dms_arc_points_even(centres, radii, normals, a0, a1, project,
     return pts, counts
 
 
+def dms_circle_runs(vecs, n_steps, n_refs, segment=None, min_fit_pts=4):
+    '''Cut the engine's exit-direction array into the continuous runs a circle
+    can be fitted to.
+
+    `vecs` is laid out as `dms_circle_curves` describes (two psi branches, each
+    `n_steps * n_refs + 1` rows with a leading sentinel).  Returns
+    `(P, runs, owner, fallback)`: the run points concatenated, index arrays into
+    `P` (one per run, in sweep order), the reflection each run belongs to, and
+    the `(reflection, points)` runs too short to fit.  Shared by the drawn
+    curves and `ridgefit`, which scores observed points against these circles.'''
+    vecs = np.asarray(vecs, dtype=float)
+    half = n_steps * n_refs + 1
+    owner, pts_all, fallback = [], [], []
+    if n_steps < 1 or n_refs < 1 or vecs.shape[0] < 2 * half:
+        return np.empty((0, 3)), [], np.empty(0, int), fallback
+    seg = None if segment is None else np.asarray(segment).ravel()
+    for b in (0, 1):
+        blk = vecs[b * half:(b + 1) * half][1:].reshape(n_steps, n_refs, 3)
+        for j in range(n_refs):
+            p  = blk[:, j, :]
+            idx = np.flatnonzero(np.isfinite(p).all(axis=1))
+            if idx.size == 0:
+                continue
+            pp = p[idx]
+            for run in dms_split_runs(pp, idx,
+                                      None if seg is None else seg[idx]):
+                if len(run) < min_fit_pts:
+                    # Too few points to determine a circle from — a locus that
+                    # only survives a step or two of this scan.  Kept as sampled
+                    # rather than dropped: at a coarse scan these are exactly the
+                    # fast-moving loci, and losing them would make the analytic
+                    # method show *less* than the sweep it is meant to reproduce.
+                    fallback.append((j, pp[run]))
+                    continue
+                owner.append(j)
+                pts_all.append(pp[run])
+    if not pts_all:
+        return np.empty((0, 3)), [], np.empty(0, int), fallback
+    P     = np.concatenate(pts_all)
+    lens  = np.array([len(p) for p in pts_all])
+    offs  = np.concatenate([[0], np.cumsum(lens)[:-1]])
+    runs  = [np.arange(o, o + l) for o, l in zip(offs, lens)]
+    return P, runs, np.asarray(owner, dtype=int), fallback
+
+
 def dms_circle_curves(vecs, n_steps, n_refs, project, segment=None, shape=None,
                       spacing_px=0.5, min_points=32, max_points=4000,
                       min_fit_pts=4, tol=DMS_CIRCLE_TOL):
@@ -2510,42 +2637,11 @@ def dms_circle_curves(vecs, n_steps, n_refs, project, segment=None, shape=None,
                 points the sweep sampled — too short to fit a circle to, or a
                 fit the tolerance rejected.  Every sampled point ends up in one
                 or the other, so switching method can never lose a curve.'''
-    vecs = np.asarray(vecs, dtype=float)
-    half = n_steps * n_refs + 1
     empty = (np.empty((0, 3)), np.empty(0, int), np.empty(0, int))
-    if n_steps < 1 or n_refs < 1 or vecs.shape[0] < 2 * half:
-        return empty + (0.0, [])
-    seg = None if segment is None else np.asarray(segment).ravel()
-
-    owner, pts_all, fallback = [], [], []
-    for b in (0, 1):
-        blk = vecs[b * half:(b + 1) * half][1:].reshape(n_steps, n_refs, 3)
-        for j in range(n_refs):
-            p  = blk[:, j, :]
-            idx = np.flatnonzero(np.isfinite(p).all(axis=1))
-            if idx.size == 0:
-                continue
-            pp = p[idx]
-            for run in dms_split_runs(pp, idx,
-                                      None if seg is None else seg[idx]):
-                if len(run) < min_fit_pts:
-                    # Too few points to determine a circle from — a locus that
-                    # only survives a step or two of this scan.  Kept as sampled
-                    # rather than dropped: at a coarse scan these are exactly the
-                    # fast-moving loci, and losing them would make the analytic
-                    # method show *less* than the sweep it is meant to reproduce.
-                    fallback.append((j, pp[run]))
-                    continue
-                owner.append(j)
-                pts_all.append(pp[run])
-    if not pts_all:
+    P, runs, owner, fallback = dms_circle_runs(vecs, n_steps, n_refs, segment,
+                                               min_fit_pts)
+    if not runs:
         return empty + (0.0, fallback)
-
-    P     = np.concatenate(pts_all)
-    lens  = np.array([len(p) for p in pts_all])
-    offs  = np.concatenate([[0], np.cumsum(lens)[:-1]])
-    runs  = [np.arange(o, o + l) for o, l in zip(offs, lens)]
-    owner = np.asarray(owner, dtype=int)
 
     c, r, n, a0, a1, resid = dms_fit_arcs(P, runs)
 
@@ -2576,6 +2672,9 @@ def _fit_roi_gauss(imsim, kernel_slice, width):
         return coef
     except:
         return np.array([100, 100, 100, 100])
+
+from types import SimpleNamespace as _Geometry
+
 
 class dmsfit_ico_hkl(object):
     '''
@@ -2647,6 +2746,15 @@ class dmsfit_ico_hkl(object):
         # of imcalc to fill the non-refined parameters around the reduced
         # optimiser vector.  Defaults to args[26] (the lattice 'a') in slot 0.
         self.ig_full = None
+        # Optional replacement objective: a callable mapping the reduced vector
+        # to a residual vector.  When set, fit / residuals / full score it
+        # instead of the ROI centres, and fit / residuals skip imcalc (the
+        # simulated image is not needed to score it; full still draws one for
+        # display).  ridgefit installs its ridge + cone residual here, so every
+        # optimiser that drives this engine works on it unchanged.
+        self.objective = None
+    def setObjective(self, fn):
+        self.objective = fn
     def setCalLattice(self, cal_lattice):
         self.calibration_lattice = cal_lattice
     def setIGFull(self, ig24):
@@ -2655,6 +2763,16 @@ class dmsfit_ico_hkl(object):
         (constrained lattice params, detector/energy when not refined, and the
         always-zero phason block) are read back from this template.'''
         self.ig_full = np.asarray(ig24, dtype=float).copy()
+    @property
+    def kernel(self):
+        return self._kernel
+    @kernel.setter
+    def kernel(self, kernel):
+        # The ROI pixels are found once here, not on every evaluation (see
+        # roi_kernel_indices).  A property, so reassigning the kernel — as
+        # ridgefit does — can never leave stale indices behind.
+        self._kernel = kernel
+        self._kernel_idx = roi_kernel_indices(kernel)
     def setLattice(self, lattice):
         self.lattice = lattice
     def setCurveMethod(self, method, spacing_px=None, max_points=None):
@@ -2684,8 +2802,8 @@ class dmsfit_ico_hkl(object):
         '''Per-ROI peak coefficients of the current simulated image, using the
         selected peak-position method.  v1[:,2] is the centre per ROI.'''
         v1=np.array([[]]*4).T
-        for i1 in range(self.kernel.shape[2]):
-            sumvals,roi = msroi(self.imsim,self.kernel[:,:,i1],self.width)
+        for i1 in range(len(self._kernel_idx)):
+            sumvals,roi = msroi(self.imsim,self._kernel_idx[i1],self.width)
             xdata=np.arange(len(sumvals))
             ydata=sumvals[:,0]
             try:
@@ -2699,8 +2817,13 @@ class dmsfit_ico_hkl(object):
         return v1
         
 ###########################
-    def imcalc(self,*inputs):
-        inputs=inputs[0]
+    def _geometry(self, inputs):
+        '''The engine's geometry for one parameter vector, without drawing
+        anything: every reflection's exit directions over the theta sweep (both
+        psi branches, as `imcalc` stacks them) and the detector map they are
+        projected through.  `imcalc` renders the simulated image from this;
+        `ridgefit` scores observed line points against the cones it holds,
+        which needs no image at all.'''
         chicorrection = 0.0    # chi-axis correction; only conventional crystals set it
         thetacorrection = 0.0  # theta (Bragg-angle) correction; conventional only
         if self.bravais in CONVENTIONAL_SYSTEMS:
@@ -2911,15 +3034,38 @@ class dmsfit_ico_hkl(object):
         vecs2=psith2v(self.psi-mslist[:,4]-psicorrection,mslist[:,5]+thetacorrection)
         vecs=np.concatenate((vecs1,vecs2),0)
         centralv=-psith2v(0,thb)*detdistancepx
+        return _Geometry(
+            lattice=lattice, hkl=hkl, energy=energy, thb=thb, detvs=detvs,
+            irmat=irmat, centralv=centralv, hkllist=hkllist, vecs=vecs,
+            N_steps=N_steps, N_refs=N_refs, psicorrection=psicorrection,
+            chicorrection=chicorrection, thetacorrection=thetacorrection,
+            l_correction=l_correction, detdistancepx=detdistancepx,
+            detxrot=detxrot, detyrot=detyrot, detzrot=detzrot)
+
+    def imcalc(self,*inputs):
+        g = self._geometry(inputs[0])
+        a,b,c,alpha,beta,gamma = g.lattice
+        hkl, energy, thb, detvs, irmat = g.hkl, g.energy, g.thb, g.detvs, g.irmat
+        centralv, hkllist, vecs = g.centralv, g.hkllist, g.vecs
+        N_steps, N_refs = g.N_steps, g.N_refs
+        psicorrection, chicorrection = g.psicorrection, g.chicorrection
+        thetacorrection, l_correction = g.thetacorrection, g.l_correction
+        detdistancepx, detxrot, detyrot, detzrot = (
+            g.detdistancepx, g.detxrot, g.detyrot, g.detzrot)
 
         def _to_pixels(v):
             '''Exit-direction vectors -> float (row, col) detector pixels.  The
             one map both curve methods project through, so an analytic curve and
-            the sampled one it was fitted to cannot land a pixel apart.'''
+            the sampled one it was fitted to cannot land a pixel apart.
+
+            Not rounded: the overlay is drawn at sub-pixel positions, so a line
+            sits on the cone the ridge objective scores (`ridgefit.ConeModel.
+            project` is this map).  Only the simulated image's pixel index is
+            rounded, below, where whole pixels are needed.'''
             pre = dms2px(detvs[0,:], detvs[1,:], centralv, np.asarray(v, dtype=float))
-            pv  = np.asarray(np.round(pre * irmat), dtype=float)
-            return (float(self.px) + pv[:,0],
-                    float(self.py) + (pv[:,2] if self.scatv == 1 else -pv[:,2]))
+            pv  = np.asarray(pre * irmat, dtype=float)
+            return det_to_pixels(pv[:,0], pv[:,2], float(self.px), float(self.py),
+                                 self.scatv)
 
         # ── Curve method: the sampled sweep, or the circles it lies on ────────
         self.curvemethod = dms_curve_method(getattr(self, 'curvemethod', 'sweep'))
@@ -2959,12 +3105,8 @@ class dmsfit_ico_hkl(object):
         imsim=np.zeros(np.shape(self.imdata))
         pxv2d=np.array(pxvec[:,[0,2]])
         self.bragg = thb
-        if self.scatv ==1:
-            pxv2d[:,0]=self.px+pxv2d[:,0]
-            pxv2d[:,1]=self.py+pxv2d[:,1]
-        else:
-            pxv2d[:,0]=self.px+pxv2d[:,0]
-            pxv2d[:,1]=self.py-pxv2d[:,1]
+        _r, _c = det_to_pixels(pxv2d[:,0], pxv2d[:,1], self.px, self.py, self.scatv)
+        pxv2d[:,0], pxv2d[:,1] = _r, _c
         pxv2d=pxv2d[np.where(pxv2d[:,0]>-1)]
         pxv2d=pxv2d[np.where(pxv2d[:,0]< imsim.shape[0])]
         pxv2d=pxv2d[np.where(pxv2d[:,1]>-1)]
@@ -2990,7 +3132,7 @@ class dmsfit_ico_hkl(object):
         self.inputarray = np.array([a,b,c,alpha,beta,gamma,psicorrection,chicorrection,thetacorrection,l_correction,detdistancepx,detxrot,detyrot,detzrot,energy,self.a11,self.a12,self.a13,self.a21,self.a22,self.a23,self.a31,self.a32,self.a33])
         imsim[self.dmsindex]=1
         if self.simsigma != 0:
-            self.imsim=ndimage.convolve(imsim,makekernel('gauss',15,self.simsigma))
+            self.imsim=blur_gauss(imsim,15,self.simsigma)
         else:
             self.imsim=imsim
 
@@ -3001,12 +3143,16 @@ class dmsfit_ico_hkl(object):
         elif N_steps > 0 and N_refs > 0:
             n_half = N_steps * N_refs + 1
             def _prepx_lines(pp_half):
-                px = np.asarray(np.round(pp_half[1:] * irmat), dtype=float)  # (N_steps*N_refs, 3)
+                # Unrounded, as in _to_pixels: sub-pixel overlay lines.
+                px = np.asarray(pp_half[1:] * irmat, dtype=float)  # (N_steps*N_refs, 3)
                 px = px.reshape(N_steps, N_refs, 3)
-                r = float(self.px) + px[:,:,0]
-                c = float(self.py) + (px[:,:,2] if self.scatv == 1 else -px[:,:,2])
+                r, c = det_to_pixels(px[:,:,0], px[:,:,2], float(self.px),
+                                     float(self.py), self.scatv)
                 h_im, w_im = imsim.shape
-                oob = (r < 0) | (r >= h_im) | (c < 0) | (c >= w_im) | np.isnan(r) | np.isnan(c)
+                # Unrounded points: pixel i spans [i-0.5, i+0.5), so the plate is
+                # [-0.5, size-0.5) — the same points the old rounding kept.
+                oob = ((r < -0.5) | (r >= h_im - 0.5) | (c < -0.5) | (c >= w_im - 0.5)
+                       | np.isnan(r) | np.isnan(c))
                 r[oob] = np.nan; c[oob] = np.nan
                 return r, c
             r1, c1 = _prepx_lines(prepxvec[:n_half])
@@ -3035,7 +3181,9 @@ class dmsfit_ico_hkl(object):
             return [(np.array([]), np.array([])) for _ in range(n_refs)]
         rows, cols = to_pixels(np.concatenate(blocks))
         h_im, w_im = shape
-        oob = ((rows < 0) | (rows >= h_im) | (cols < 0) | (cols >= w_im)
+        # Plate edges for unrounded points, as in the sweep path above.
+        oob = ((rows < -0.5) | (rows >= h_im - 0.5) | (cols < -0.5)
+               | (cols >= w_im - 0.5)
                | np.isnan(rows) | np.isnan(cols))
         rows = np.where(oob, np.nan, rows); cols = np.where(oob, np.nan, cols)
         start = 0
@@ -3103,6 +3251,8 @@ class dmsfit_ico_hkl(object):
         return float(n) * self._roi_fail_penalty() ** 2
 
     def fit(self,inputs):
+        if self.objective is not None:
+            return float(np.sum(np.asarray(self.objective(inputs))**2))
         try:
             resid, _, _ = self._centre_residuals(inputs)
             return float(np.sum(resid**2))
@@ -3113,6 +3263,8 @@ class dmsfit_ico_hkl(object):
         """Per-ROI centre residual vector, for scipy.optimize.least_squares.
         `fit` is exactly np.sum(residuals**2).  A robust loss (soft_l1 / huber)
         then downweights the penalty rows produced by failed ROIs."""
+        if self.objective is not None:
+            return np.asarray(self.objective(inputs), dtype=float)
         try:
             resid, _, _ = self._centre_residuals(inputs)
             return resid
@@ -3127,6 +3279,10 @@ class dmsfit_ico_hkl(object):
 
     def full(self,inputs):
         try:
+            if self.objective is not None:
+                self.imcalc(inputs)            # the image and lines, for display
+                result = self.fit(inputs)
+                return result,self.imsim, self.dmsindex, self.imdata, self.inputarray
             resid, _, _ = self._centre_residuals(inputs)
             result = float(np.sum(resid**2))
             return result,self.imsim, self.dmsindex, self.imdata, self.inputarray

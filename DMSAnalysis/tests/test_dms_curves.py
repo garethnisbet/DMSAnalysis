@@ -187,8 +187,8 @@ def test_theta_correction_shears_the_locus_and_is_reported():
 # ── the circle curves reproduce the sweep ─────────────────────────────────────
 
 def test_circles_cover_the_sweep_at_the_same_resolution():
-    """Every point the sampled sweep draws is on a circle curve, to within the
-    engine's whole-pixel rounding (sqrt(2) = one diagonal pixel).  Switching
+    """Every point the sampled sweep draws is on a circle curve, to within
+    the circle's ~0.5 px point spacing (1.5 px leaves room).  Switching
     method can add resolution but must never lose a curve."""
     for tag, kw in [('cubic', cubic_kwargs()), ('ico', ico_kwargs())]:
         for numsteps in (80, 400):

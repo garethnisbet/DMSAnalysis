@@ -16,6 +16,7 @@ from scipy import ndimage
 import imageio.v2 as imageio
 
 from . import ts_quasi as ts
+from . import ridgefit
 from . import dat2config
 from .config_table import ConfigTable
 
@@ -140,6 +141,10 @@ psi = cfg['geometry']['psi']
 hkl = np.array(cfg['geometry']['hkl'], dtype=float) * energy / energy0
 hklint = np.round(hkl)
 
+# image_first/image_numbers: path-numbered scans (see dat2config.image_number)
+IMAGE_NUMBERING_KEYS = ('image_first', 'image_numbers')
+imnumbering = {k: exp[k] for k in IMAGE_NUMBERING_KEYS if k in exp}
+imnum      = dat2config.image_number(exp, datapoint)
 _im_path = os.path.join(scanpath, imtemplate % imnum)
 try:
     im  = imageio.imread(_im_path)
@@ -157,6 +162,18 @@ for _note in STARTUP_NOTES:
 
 px = cfg['geometry']['px_unscaled'] * zoomval
 py = cfg['geometry']['py_unscaled'] * zoomval
+
+# Detector mounting (vertical / horizontal scattering, see ts.det_to_pixels):
+# which image axis the scattering plane runs along, plus the sign of the 2θ
+# axis on the image (geometry.scatv, the "Flip 2θ" box).  Both ride in the
+# engines' scatv.  The sign used to be fixed at 0 here whatever the config said.
+try:
+    det_orient = ts.det_orientation(cfg['geometry'].get('det_orientation'))
+except ValueError as _e:
+    STARTUP_NOTES.append(str(_e))
+    det_orient = 'vertical'
+scatv = ts.scatv_code(cfg['geometry'].get('scatv', scatv), det_orient)
+cfg['geometry']['det_orientation'] = det_orient     # shown in the Config table
 
 thb      = ts.bragg(lattice, hkl, energy).th()[0]
 thrange  = [thb - 27, thb + 10]
@@ -436,6 +453,25 @@ def reduced_slots():
 def extract_reduced(full_ig):
     """Reduced parameter vector consumed by dmsfit_ico_hkl.imcalc (current mode)."""
     return np.asarray(full_ig, dtype=float)[reduced_slots()]
+
+# Peak-position methods.  'ridge' is not a way of locating a peak in a ROI curve
+# but a different objective (ridgefit: measured line positions scored against the
+# cones), so the ROI curves themselves are still located with the curve fit.
+PEAK_METHODS = ('gauss', 'centroid', 'ridge')
+
+def roi_peak_method(pm):
+    """The estimator the ROI curves are located with under peak method `pm`."""
+    return 'gauss' if pm == 'ridge' else pm
+
+def ridge_colours(rpx, sat=2.0):
+    """RGBA per ridge point for a signed distance `rpx` (px): white on the cone,
+    shading to red outside / blue inside, saturating at `sat` px."""
+    t = np.clip(np.nan_to_num(np.asarray(rpx, dtype=float)) / sat, -1.0, 1.0)
+    a = np.abs(t)
+    r = np.where(t >= 0, 255, 255 * (1 - a) + 60 * a)
+    g = 255 * (1 - a) + 60 * a
+    b = np.where(t >= 0, 255 * (1 - a) + 60 * a, 255)
+    return [(int(ri), int(gi), int(bi), 230) for ri, gi, bi in zip(r, g, b)]
 
 # ── optimiser search steps ─────────────────────────────────────────────────────
 # A physically sensible search step for each slot of the 24-element guess (the
@@ -810,6 +846,23 @@ class FloatSlider(QtWidgets.QWidget):
 
 # ── Background update worker ───────────────────────────────────────────────────
 
+def discovery_points(lines):
+    """(rows, cols) of every finite point of an engine's `dmslines`, for the
+    DMS-lines scatter.  Taken from the lines, not from `dmsindex`: the index is
+    the simulated image's whole-pixel raster, so drawing it would snap every dot
+    to a pixel vertex, off the cone the lines (and the ridge fit) lie on."""
+    xs, ys = [], []
+    for x, y in lines:
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        ok = np.isfinite(x) & np.isfinite(y)
+        xs.append(x[ok])
+        ys.append(y[ok])
+    if not xs:
+        return np.array([]), np.array([])
+    return np.concatenate(ys), np.concatenate(xs)
+
+
 class UpdateWorker(QtCore.QThread):
     """Runs one vectorised dms.imcalc in a background thread; discards stale
     requests.  Emits ('discovery', (rows, cols)) for the full-reflist scatter or
@@ -874,14 +927,9 @@ class UpdateWorker(QtCore.QThread):
                 # in flight can't cause a length mismatch.
                 _push(dms_ref, last_hkl_ref)
                 dms_ref.imcalc(reduced_for_engine(dms_ref, ig))
-                dmsindex = dms_ref.dmsindex
-                if len(dmsindex) == 2 and len(dmsindex[0]) > 0:
-                    rows = np.asarray(dmsindex[0]).astype(float)
-                    cols = np.asarray(dmsindex[1]).astype(float)
-                else:
-                    rows = np.array([]); cols = np.array([])
                 disc_lines = [(np.copy(x), np.copy(y))
                               for x, y in (getattr(dms_ref, 'dmslines', None) or [])]
+                rows, cols = discovery_points(disc_lines)
 
                 # Selected reflections drawn live on top (one extra imcalc).
                 sel_lines = []
@@ -1121,7 +1169,8 @@ class BuildWorker(QtCore.QThread):
 
     def __init__(self, ig, sel6d, hkl, lattice, thrange, imdata, azir, psi,
                  px, py, psirange, peak_method, overrides,
-                 reuse_kernel=None, reuse_exp=None, parent=None):
+                 reuse_kernel=None, reuse_exp=None, reuse_ridge=None,
+                 parent=None):
         super().__init__(parent)
         # Two independent pieces of earlier work that can be carried forward.
         #
@@ -1140,6 +1189,11 @@ class BuildWorker(QtCore.QThread):
         # Either None ⇒ compute that part from scratch.
         self._reuse_kernel = reuse_kernel
         self._reuse_exp    = reuse_exp
+        # `reuse_ridge` — the ridge points measured on the last build, under
+        # the 'ridge' peak method.  Carried exactly when `reuse_exp` is (the
+        # post-fit rebuild): they are the fit's reference, as the ROI centres
+        # are for the other methods.
+        self._reuse_ridge  = reuse_ridge
         self._ig          = np.asarray(ig, dtype=float).copy()
         self._sel6d       = sel6d
         self._hkl         = np.asarray(hkl, dtype=float).copy()
@@ -1199,7 +1253,8 @@ class BuildWorker(QtCore.QThread):
             else:
                 imcoeffs, linedatax, linedatay, _, _, _ = \
                     ts.multiroifit2(self._imdata, kernel, self._width, 0.02,
-                                    ts.AUTO_DOUBLET_SIG, self._peak_method)
+                                    ts.AUTO_DOUBLET_SIG,
+                                    roi_peak_method(self._peak_method))
                 centres = np.array([imcoeffs[:, 2]]).T
             # Re-apply manual centre overrides (restored from a session, or
             # carried across a post-fit rebuild)
@@ -1219,7 +1274,8 @@ class BuildWorker(QtCore.QThread):
                 reflist2_fit, list(ig[15:24]), ig[0])
             fit_dms.setCalLattice(ig[:6].tolist())
             fit_dms.setLattice(ig[:6].tolist())
-            fit_dms.setPeakMethod(self._peak_method, ts.AUTO_DOUBLET_SIG)
+            fit_dms.setPeakMethod(roi_peak_method(self._peak_method),
+                                  ts.AUTO_DOUBLET_SIG)
             # The simulated image the fit is scored on is drawn by the same
             # curve method as the overlay, so the residual describes the curves
             # on screen.
@@ -1237,6 +1293,24 @@ class BuildWorker(QtCore.QThread):
             except Exception:
                 pass
 
+            # Ridge + cone: measure the checked reflections' lines along their
+            # predicted arcs and make the fit score those points against the
+            # cones instead of the ROI centres.  The ROIs above are still
+            # built: their curves are the panels on the right.
+            ridge, ridge_fitter = None, None
+            if self._peak_method == 'ridge':
+                model = ridgefit.ConeModel(fit_dms)
+                ridge = self._reuse_ridge
+                if ridge is None:
+                    ridge = ridgefit.extract_ridge(
+                        self._imdata,
+                        model.predicted_lines(extract_reduced(ig),
+                                              self._imdata.shape),
+                        self._width)
+                ridge_fitter = ridgefit.RidgeConeFit(model, ridge)
+                if len(ridge['row']):
+                    fit_dms.setObjective(ridge_fitter.residuals)
+
             self.done.emit({
                 'reflist_fit':      reflist_fit,
                 'reflist2_fit':     reflist2_fit,
@@ -1252,6 +1326,8 @@ class BuildWorker(QtCore.QThread):
                 # The width these ROIs were integrated at (the spinbox may move
                 # before the next build); the ROI overlay draws with it.
                 'width':            self._width,
+                'ridge':            ridge,
+                'ridge_fitter':     ridge_fitter,
             })
         except Exception as e:
             self.error.emit(str(e))
@@ -1306,6 +1382,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._datapoint      = datapoint
         self._datapoint0     = datapoint0
         self._imtemplate     = imtemplate
+        self._imnumbering    = dict(imnumbering)
         self._pending_scan_path = scanpath + str(scannum) + '.dat'
         # False while running on the placeholder metadata/blank image (the
         # config's scan folder was not readable); set True by _do_load_scan.
@@ -1359,6 +1436,12 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._kernel_width  = width
         # Outline items of the "ROIs" overlay toggle
         self._roi_overlay_items = []
+        # Ridge + cone peak method: the measured points from the last build and
+        # the objective scoring them (None under the ROI methods), and the
+        # scatter that draws them on the image.
+        self._ridge         = None
+        self._ridge_fitter  = None
+        self._ridge_scatter = None
         self._centres       = None
         self._linedatax     = None
         self._linedatay     = None
@@ -1394,7 +1477,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._last_fit_output = None
         self._selected_roi  = None
         self._active_method = opt_method if opt_method in algo_methods else algo_methods[0]
-        self._peak_method = peak_method if peak_method in ('gauss', 'centroid') else 'gauss'
+        self._peak_method = peak_method if peak_method in PEAK_METHODS else 'gauss'
 
         self._worker = UpdateWorker()
         self._worker.done.connect(self._on_update_done,
@@ -1610,6 +1693,41 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._lbl_scan_info.setFont(f_si)
         sbl.addWidget(self._lbl_scan_info, 4, 0, 1, 4)
 
+        # How the detector sits on the arm relative to the scattering plane
+        # (geometry.det_orientation; see ts.det_to_pixels).
+        _do_lbl = QtWidgets.QLabel('Detector')
+        _do_lbl.setToolTip(
+            'Which image axis the scattering plane runs along.\n\n'
+            'Vertical scattering: 2θ along the long axis of the Pilatus 100K; '
+            'an azimuthal scan sweeps the DMS lines across the short axis.\n\n'
+            'Horizontal scattering: 2θ along the short axis; an azimuthal scan '
+            'sweeps the lines along the long axis.\n\n'
+            'The detector rotations keep their meaning in the scattering-plane '
+            'frame (dxrot is about the axis normal to the scattering plane) in '
+            'both modes.')
+        self._det_combo = QtWidgets.QComboBox()
+        self._det_combo.addItem('vertical scattering', 'vertical')
+        self._det_combo.addItem('horizontal scattering', 'horizontal')
+        self._det_combo.setCurrentIndex(self._det_combo.findData(det_orient))
+        self._det_combo.setToolTip(_do_lbl.toolTip())
+        self._det_combo.currentIndexChanged.connect(self._on_det_orientation_changed)
+        sbl.addWidget(_do_lbl, 5, 0)
+        sbl.addWidget(self._det_combo, 5, 1, 1, 3)
+
+        # Sign of the 2θ axis on the image (geometry.scatv).  Ticked when 2θ
+        # decreases towards lower column numbers in vertical mode (rows in
+        # horizontal) — e.g. a lower-angle DMS line on the low-column side of
+        # the Bragg spot.
+        self._chk_flip2th = QtWidgets.QCheckBox('Flip 2θ axis')
+        self._chk_flip2th.setChecked(bool(ts.scatv_orientation(scatv)[0]))
+        self._chk_flip2th.setToolTip(
+            'Mirror the model along the image axis 2θ runs along '
+            '(geometry.scatv).\n\nCheck it against a line of known angle: a DMS '
+            'line from a reflection with a smaller Bragg angle than the primary '
+            '(e.g. 004 next to 0 0 4+τ) must lie on the low-2θ side of the spot.')
+        self._chk_flip2th.toggled.connect(self._on_flip2th_toggled)
+        sbl.addWidget(self._chk_flip2th, 6, 0, 1, 4)
+
         ctrl_col.addWidget(scan_box)
 
         # ── Fit (build integrated curves for the checked reflections, then fit) ──
@@ -1695,10 +1813,17 @@ class DMSSlider(QtWidgets.QMainWindow):
         _peak_lbl = QtWidgets.QLabel('Peak pos.')
         _peak_lbl.setToolTip('How peak positions are located in the raw and '
                              'simulated ROI curves: Gaussian curve fit or '
-                             'centroid (centre of mass). Rebuild curves to apply.')
+                             'centroid (centre of mass). Rebuild curves to apply.\n'
+                             'Ridge + cone: instead of two ROI centres per '
+                             'reflection, measure the line every few pixels along '
+                             'its predicted arc (profile across the local normal, '
+                             'within the Width) and fit the cones to those points '
+                             '— χ² is then over the measured points, in units of '
+                             'their errors. Manual ROI centres do not apply.')
         self._peak_combo = QtWidgets.QComboBox()
         self._peak_combo.addItem('Curve fit', 'gauss')
         self._peak_combo.addItem('Centroid', 'centroid')
+        self._peak_combo.addItem('Ridge + cone', 'ridge')
         self._peak_combo.setCurrentIndex(
             self._peak_combo.findData(self._peak_method))
         self._peak_combo.setToolTip(_peak_lbl.toolTip())
@@ -1967,17 +2092,30 @@ class DMSSlider(QtWidgets.QMainWindow):
             "reflection's colour — first half solid, second dashed. Needs "
             'Build curves; the outlines show the width they were integrated '
             'at, so they follow a width change only after a rebuild.')
+        # Ridge: the measured line points of the 'Ridge + cone' peak method,
+        # coloured by their current distance to the cone (blue inside, red
+        # outside, white on it).
+        self._chk_show_ridge = QtWidgets.QCheckBox('Ridge')
+        self._chk_show_ridge.setChecked(True)
+        self._chk_show_ridge.setToolTip(
+            'Show the measured line points of the Ridge + cone peak method, '
+            'coloured by their distance to the current cone: white on it, '
+            'red outside, blue inside, saturating at 2 px. Needs Build curves '
+            'with Peak pos. = Ridge + cone.')
         for _c in (self._chk_dms_lines, self._chk_labels, self._chk_labels_sel_only,
-                   self._chk_show_rois):
+                   self._chk_show_rois, self._chk_show_ridge):
             _f = _c.font(); _f.setPointSize(7); _c.setFont(_f)
         self._chk_labels.toggled.connect(self._on_labels_toggled)
         self._chk_labels_sel_only.toggled.connect(
             lambda _=None: self._refresh_overlay_labels())
         self._chk_show_rois.toggled.connect(self._on_show_rois_toggled)
+        self._chk_show_ridge.toggled.connect(
+            lambda _=None: self._refresh_ridge_overlay())
         lbl_row.addWidget(self._chk_dms_lines)
         lbl_row.addWidget(self._chk_labels)
         lbl_row.addWidget(self._chk_labels_sel_only)
         lbl_row.addWidget(self._chk_show_rois)
+        lbl_row.addWidget(self._chk_show_ridge)
         lbl_row.addStretch()
         arc_box_l.addLayout(lbl_row)
         ctrl_col2.addWidget(arc_box, 1)   # selected-reflections list expands
@@ -2706,6 +2844,35 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._vb.addItem(item)
             self._roi_overlay_items.append(item)
 
+    def _ridge_active(self):
+        """Whether the fit is scoring the ridge + cone objective: the method is
+        selected and the last build measured points under it."""
+        return (self._peak_method == 'ridge' and self._ridge_fitter is not None
+                and self._ridge is not None and len(self._ridge['row']) > 0)
+
+    def _refresh_ridge_overlay(self, rpx=None):
+        """Draw the ridge points on the detector image, coloured by `rpx`, their
+        signed distance (px) to the current cones (scored here if omitted)."""
+        chk = getattr(self, '_chk_show_ridge', None)
+        show = chk is not None and chk.isChecked() and self._ridge_active()
+        if not show:
+            if self._ridge_scatter is not None:
+                self._ridge_scatter.setVisible(False)
+            return
+        if rpx is None:
+            try:
+                rpx = self._ridge_fitter.pixel_residuals(extract_reduced(self.ig))
+            except Exception:
+                rpx = np.zeros(len(self._ridge['row']))
+        if self._ridge_scatter is None:
+            self._ridge_scatter = pg.ScatterPlotItem(size=4, pen=None)
+            self._ridge_scatter.setZValue(16)     # just above the ROI outlines
+            self._vb.addItem(self._ridge_scatter)
+        brushes = [pg.mkBrush(c) for c in ridge_colours(rpx)]
+        self._ridge_scatter.setData(x=self._ridge['col'], y=self._ridge['row'],
+                                    brush=brushes)
+        self._ridge_scatter.setVisible(True)
+
     def _on_show_rois_toggled(self, checked):
         self._refresh_roi_overlay()
         if checked and self._kernel is None:
@@ -2717,9 +2884,13 @@ class DMSSlider(QtWidgets.QMainWindow):
     def _maybe_update_live_curves(self):
         """When 'Live Curve' is on, recompute the ROI integrated curves at the
         current geometry (heavier — runs only if curves have been built)."""
+        if self._ridge_active():
+            self._update_residual_readout()
         if (getattr(self, '_chk_live_curve', None) is None
                 or not self._chk_live_curve.isChecked()
                 or self._fit_dms is None):
+            if self._ridge_active():
+                return            # the ridge readout above is already current
             # Geometry moved but the curves were not recomputed, so the residual
             # on screen no longer describes the current parameters.  Say so
             # rather than leaving a stale number looking current.
@@ -2734,7 +2905,7 @@ class DMSSlider(QtWidgets.QMainWindow):
     def _mark_residual_stale(self):
         """Flag the readout as no longer matching the current geometry."""
         lbl = getattr(self, '_lbl_resid', None)
-        if lbl is None or self._centres is None:
+        if lbl is None or self._centres is None or self._ridge_active():
             return
         if getattr(self, '_last_simcoefs', None) is None:
             return
@@ -3037,11 +3208,28 @@ class DMSSlider(QtWidgets.QMainWindow):
         try:
             folder = os.path.join(self._scanpath, os.path.dirname(self._imtemplate))
             ext = os.path.splitext(self._imtemplate)[1] or '.tif'
+            # File-name prefix before the number ('test' in test%d.tif).
+            prefix = os.path.basename(self._imtemplate).split('%')[0]
             out = []
-            for p in glob.glob(os.path.join(folder, '*' + ext)):
+            for p in glob.glob(os.path.join(folder, glob.escape(prefix) + '*' + ext)):
                 m = re.search(r'(\d+)' + re.escape(ext) + r'$', os.path.basename(p))
                 if m:
                     out.append((int(m.group(1)), p))
+            # A path-numbered folder (pilatus100k/) is shared by every scan of
+            # the visit: keep this scan's images only.
+            nb = getattr(self, '_imnumbering', {})
+            if 'image_numbers' in nb:
+                own = set(int(v) for v in nb['image_numbers'])
+                out = [t for t in out if t[0] in own]
+            elif 'image_first' in nb:
+                try:
+                    n = dat2config.scan_length(
+                        os.path.join(self._scanpath, '%s.dat' % self._scannum))
+                except Exception:
+                    n = None
+                first = int(nb['image_first'])
+                out = [t for t in out
+                       if t[0] >= first and (n is None or t[0] < first + n)]
             out.sort()
             return out
         except Exception:
@@ -3058,8 +3246,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         if n > 0:
             self._img_scrub.setEnabled(True)
             self._img_scrub.setRange(0, n - 1)
-            # Prefer the file whose number matches the analysis image (dp+1).
-            target = int(current) + 1
+            # Prefer the file whose number matches the analysis image.
+            target = dat2config.image_number(self._imnumbering, current)
             pos = next((i for i, (num, _) in enumerate(self._img_files)
                         if num == target), min(max(int(current), 0), n - 1))
             self._img_scrub.setValue(pos)
@@ -3078,7 +3266,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         if 0 <= idx < len(files):
             num, path = files[idx]
         else:
-            num = idx + 1
+            num = dat2config.image_number(self._imnumbering, idx)
             path = os.path.join(self._scanpath, self._imtemplate % num)
         try:
             im = imageio.imread(path)
@@ -3348,7 +3536,9 @@ class DMSSlider(QtWidgets.QMainWindow):
             ts.rotxyz([0, 1, 0], self.ig[12]).rmat() *
             ts.rotxyz([0, 0, 1], self.ig[13]).rmat()
         )
-        pxvec    = np.array([row - self._dms.px, 0.0, self._dms.py - col])
+        p0, p2   = ts.pixels_to_det(float(row), float(col), float(self._dms.px),
+                                    float(self._dms.py), scatv)
+        pxvec    = np.array([p0, 0.0, p2])
         prepxvec = pxvec @ np.linalg.inv(irmat)
         centralv = -np.array(ts.psith2v(0.0, float(thb_cur))).flatten() * self.ig[10]
         diff     = prepxvec - centralv
@@ -3731,6 +3921,19 @@ class DMSSlider(QtWidgets.QMainWindow):
             _cm_new = curve_method
         if _cm_new != curve_method:
             self._curve_combo.setCurrentIndex(self._curve_combo.findData(_cm_new))
+        # A geometry.det_orientation edit likewise goes through the mounting
+        # setter; the rebuilds below then pick it up.
+        try:
+            _do_new = ts.det_orientation(geo.get('det_orientation', det_orient))
+        except ValueError:
+            _do_new = det_orient
+        _sv_old = ts.scatv_orientation(scatv)[0]
+        try:
+            _sv_new = int(geo.get('scatv', _sv_old)) & 1
+        except (TypeError, ValueError):
+            _sv_new = _sv_old
+        if _do_new != det_orient or _sv_new != _sv_old:
+            self._set_det_orientation(_do_new, flip=bool(_sv_new))
         self._rebuild_dms_slice()
         self._rebuild_selected_engine()   # psi/px/py are baked into the engine
         self._do_update()
@@ -3753,9 +3956,16 @@ class DMSSlider(QtWidgets.QMainWindow):
 
     def _apply_reflections(self, ref_6d_list, checked_list=None):
         """Plot the given 6D reflections and add them to the selection list,
-        honouring their checked state.  Assumes the list has been cleared."""
-        if checked_list is None:
-            checked_list = [True] * len(ref_6d_list)
+        honouring their checked state.  Assumes the list has been cleared.
+
+        A checked list shorter than the reflection list (a hand-edited file —
+        reflections appended, ``ref_6d_checked`` left alone) is padded with
+        True: zip() used to stop at the shorter list, so only the first few
+        reflections loaded.  Returns the number of reflections not added (no
+        line on the plate at the current geometry)."""
+        checked_list = list(checked_list) if checked_list is not None else []
+        checked_list += [True] * (len(ref_6d_list) - len(checked_list))
+        n_skipped = 0
         # Bulk add without per-item rebuilds; one vectorised pass at the end.
         self._bulk_select = True
         if ref_6d_list:
@@ -3765,6 +3975,7 @@ class DMSSlider(QtWidgets.QMainWindow):
                 n_before = len(self._pick_items)
                 self._plot_arc(hkl_6d, palette[k % 10], draw=False)
                 if len(self._pick_items) <= n_before:
+                    n_skipped += 1
                     continue
                 arc_item = self._pick_items[-1]
                 self._add_arc_to_list(hkl_6d, arc_item)
@@ -3777,6 +3988,7 @@ class DMSSlider(QtWidgets.QMainWindow):
                         arc_item.setVisible(False)
         self._bulk_select = False
         self._on_selection_changed()
+        return n_skipped
 
     def _session_dict(self):
         """Capture the full workflow state so a session can be resumed: the
@@ -3837,6 +4049,10 @@ class DMSSlider(QtWidgets.QMainWindow):
             # the simulated image, so a restored session must fit on the same
             # construction it was saved on
             'curve_method':   curve_method,
+            # detector mounting (vertical / horizontal scattering)
+            'det_orientation': det_orient,
+            # sign of the 2θ axis on the image (the "Flip 2θ axis" box)
+            'scatv':           ts.scatv_orientation(scatv)[0],
             # whether "Build curves" had been run, so a restore can rebuild the
             # ROI grid (and re-apply manual_centres) without a manual click
             'curves_built':   self._centres is not None,
@@ -3916,10 +4132,28 @@ class DMSSlider(QtWidgets.QMainWindow):
         if not ref_6d_list:
             self._status.setText('No reflections found in %s' % os.path.basename(path))
             return
+        # 3-index reflections need a conventional crystal mode, 6-index the
+        # icosahedral ones; the wrong pairing used to load nothing, silently.
+        want = 3 if CONVENTIONAL else 6
+        bad = [r for r in ref_6d_list if len(r) != want]
+        if bad:
+            self._status.setText(
+                'Not loaded: %s has %d-index reflections but the crystal type is '
+                '%s (needs %d) — switch Crystal type first'
+                % (os.path.basename(path), len(bad[0]), bravais, want))
+            return
         self._on_clear_picks()
-        self._apply_reflections(ref_6d_list, data.get('ref_6d_checked'))
-        self._status.setText('Loaded %d reflections ← %s' % (
-            len(ref_6d_list), os.path.basename(path)))
+        n_skip = self._apply_reflections(ref_6d_list, data.get('ref_6d_checked'))
+        n_in = self._arc_list.count()
+        n_dup = len(ref_6d_list) - n_skip - n_in
+        notes = []
+        if n_skip:
+            notes.append('%d skipped: no line on the detector' % n_skip)
+        if n_dup > 0:
+            notes.append('%d duplicate%s merged' % (n_dup, 's' if n_dup > 1 else ''))
+        self._status.setText('Loaded %d reflections ← %s%s' % (
+            n_in, os.path.basename(path),
+            ('  (%s)' % '; '.join(notes)) if notes else ''))
 
     def _on_load_json(self):
         default_dir = os.getcwd()
@@ -4053,7 +4287,7 @@ class DMSSlider(QtWidgets.QMainWindow):
 
         # 4. Restore the peak-position method (applied on the next Build curves).
         pm = data.get('peak_method')
-        if pm in ('gauss', 'centroid'):
+        if pm in PEAK_METHODS:
             self._peak_method = pm
             if getattr(self, '_peak_combo', None) is not None:
                 self._suppress = True
@@ -4075,6 +4309,16 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._curve_combo.setCurrentIndex(self._curve_combo.findData(cm))
             self._suppress = False
         self._apply_curve_method()
+        # Detector mounting and 2θ sign; sessions from before the toggles are
+        # vertical and unflipped (the slider's sign was always 0 then).
+        try:
+            _flip = bool(int(data.get('scatv', 0)) & 1)
+        except (TypeError, ValueError):
+            _flip = False
+        try:
+            self._set_det_orientation(data.get('det_orientation', 'vertical'), flip=_flip)
+        except ValueError:
+            self._set_det_orientation('vertical', flip=_flip)
 
         # 5. Stash manual centre overrides and fit result.  Centre overrides are
         #    applied the next time "Build curves" rebuilds the ROI centres.
@@ -4451,7 +4695,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         m         = re.match(r'^(\d+)\.dat$', basename)
         snum_new  = int(m.group(1)) if m else self._scannum
         imtmpl    = exp['image_template']
-        imnum_new = dp + 1
+        imnumbering_new = {k: exp[k] for k in IMAGE_NUMBERING_KEYS if k in exp}
+        imnum_new = dat2config.image_number(exp, dp)
 
         # A missing/unreadable image is not fatal: the scan metadata is still
         # worth loading (geometry, lattice, energy all come from the .dat), so
@@ -4578,6 +4823,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._datapoint  = dp
         self._datapoint0 = dp0
         self._imtemplate = imtmpl
+        self._imnumbering = imnumbering_new
         self._initial_guess     = self.ig.copy()
         self._initial_guess[14] = en_new
         self._en_scan           = en_new
@@ -4624,6 +4870,7 @@ class DMSSlider(QtWidgets.QMainWindow):
             'hkl':            [float(v) for v in hkl_ref],
             'image_template': imtmpl,
         }
+        self._cfg['experiment'].update(imnumbering_new)
         if psi_new is not None:
             self._cfg['experiment']['psi'] = float(psi_new)
         # Whatever is now live — seeded from the .dat or kept from the sliders —
@@ -4684,7 +4931,8 @@ class DMSSlider(QtWidgets.QMainWindow):
                     'colmap': colmap, 'subcellsx': 7, 'subcellsy': 4,
                 },
                 'roi': {'width_per_zoom': 45, 'comwidth_per_zoom': 5},
-                'geometry': {'scatv': scatv},
+                'geometry': {'scatv': ts.scatv_orientation(scatv)[0],
+                             'det_orientation': det_orient},
                 'computation': {
                     'numsteps': numsteps,
                     'simsigma_per_zoom': simsigma / max(zoomval, 1),
@@ -4729,12 +4977,14 @@ class DMSSlider(QtWidgets.QMainWindow):
             'azir':           list(self._azir),
             'image_template': self._imtemplate,
         }
+        cfg['experiment'].update(self._imnumbering)
         cfg['geometry'].update({
             'hkl':         self._hkl.tolist(),
             'psi':         float(self._psi),
             'px_unscaled': float(self._px / zoomval),
             'py_unscaled': float(self._py / zoomval),
-            'scatv':       scatv,
+            'scatv':       ts.scatv_orientation(scatv)[0],
+            'det_orientation': det_orient,
         })
         cfg.setdefault('crystal', {})
         if CONVENTIONAL:
@@ -4901,9 +5151,10 @@ class DMSSlider(QtWidgets.QMainWindow):
         ig    = np.asarray(out['inputarray'], dtype=float)
         lines = []
         lines.append('DMS slider fit — %s' % strftime('%Y-%m-%d %H:%M:%S'))
-        lines.append('scan %s   datapoint %d   image %05d'
+        lines.append('scan %s   datapoint %d   image %s'
                      % (self._scannum, int(self._datapoint),
-                        int(self._datapoint) + 1))
+                        self._imtemplate % dat2config.image_number(
+                            self._imnumbering, self._datapoint)))
         lines.append('scan path %s' % self._scanpath)
         lines.append('crystal %s   pseudo-cubic M %d   curves %s   peaks %s'
                      % (bravais, int(self._pc_idx), curve_method,
@@ -4916,10 +5167,16 @@ class DMSSlider(QtWidgets.QMainWindow):
         if self._kernel is not None and self._ref_6d_fit is not None:
             n_no_target = (int(np.count_nonzero(np.isnan(self._centres[:, 0])))
                            if self._centres is not None else 0)
-            lines.append('scored on %d ROIs over %d reflections'
-                         '   (%d ROI(s) with no experimental peak, excluded)'
-                         % (self._kernel.shape[2], len(self._ref_6d_fit),
-                            n_no_target))
+            if (out.get('setup') or {}).get('ridge_points') is not None:
+                lines.append('scored on %d ridge points over %d reflections '
+                             '(ridge + cone; chi2 in units of each point\'s '
+                             'error)' % (out['setup']['ridge_points'],
+                                         len(self._ref_6d_fit)))
+            else:
+                lines.append('scored on %d ROIs over %d reflections'
+                             '   (%d ROI(s) with no experimental peak, excluded)'
+                             % (self._kernel.shape[2], len(self._ref_6d_fit),
+                                n_no_target))
         lines.append('')
         lines.append('geometry')
         lines.append('  hkl        %s' % np.array2string(self._hkl, precision=6))
@@ -5184,7 +5441,10 @@ class DMSSlider(QtWidgets.QMainWindow):
             self.ig, sel6d, self._hkl, self._lattice, self._thrange,
             self._imdata, self._azir, self._psi, self._px, self._py,
             self._psirange, self._peak_method, overrides,
-            reuse_kernel=reuse_kernel, reuse_exp=reuse_exp_d)
+            reuse_kernel=reuse_kernel, reuse_exp=reuse_exp_d,
+            reuse_ridge=(self._ridge if (reuse_exp_d is not None
+                                         and self._peak_method == 'ridge')
+                         else None))
         self._build_worker.done.connect(self._on_build_done)
         self._build_worker.error.connect(self._on_build_error)
         self._build_worker.start()
@@ -5207,6 +5467,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._centres           = res['centres']
         self._centre_override_rois = res['override_rois']
         self._fit_dms           = res['fit_dms']
+        self._ridge             = res.get('ridge')
+        self._ridge_fitter      = res.get('ridge_fitter')
         # The build snapshotted numsteps when it started; if the Points spinbox
         # moved while it ran, the engine would score at the old resolution while
         # Fit uses the current one.  Same reason _do_fit re-pushes it.
@@ -5219,6 +5481,13 @@ class DMSSlider(QtWidgets.QMainWindow):
             if self._centres is not None else 0
         note = ('  (%d ROI(s) have no peak — right-click to set a centre)'
                 % n_no_target) if n_no_target else ''
+        if self._ridge is not None:
+            n_pts = len(self._ridge['row'])
+            note = '  —  ridge: %d points%s' % (
+                n_pts, '' if n_pts else ' (none survived — the fit has nothing '
+                                         'to score; widen Width or check the lines)')
+            self._update_residual_readout()
+        self._refresh_ridge_overlay()
         if self._build_status:
             self._status.setText(self._build_status + note)
         else:
@@ -5400,7 +5669,7 @@ class DMSSlider(QtWidgets.QMainWindow):
                 # line drawn here is the one the residual is actually scoring.
                 coefs, ldsx, ldsy, _, _, _ = ts.multiroifit(
                     self._fit_dms.imsim, self._kernel, width, 10,
-                    self._peak_method, ts.AUTO_DOUBLET_SIG)
+                    roi_peak_method(self._peak_method), ts.AUTO_DOUBLET_SIG)
                 self._draw_sim_lines(coefs, ldsx, ldsy)
                 self._update_residual_readout(coefs)
             except Exception:
@@ -5420,6 +5689,22 @@ class DMSSlider(QtWidgets.QMainWindow):
         would be wasted work."""
         lbl = getattr(self, '_lbl_resid', None)
         if lbl is None:
+            return
+        if self._ridge_active():
+            # The ridge objective needs no simulated curves: it is cheap enough
+            # to score on every slider move, so it is never stale.
+            self._resid_stale = False
+            try:
+                rpx = self._ridge_fitter.pixel_residuals(extract_reduced(self.ig))
+                chi2 = float(np.sum((rpx / self._ridge_fitter.sig) ** 2))
+            except Exception as e:
+                lbl.setText('χ² —   (ridge: %s)' % type(e).__name__)
+                lbl.setStyleSheet('color: #ffaa55')
+                return
+            lbl.setText('χ² = %.6g   (ridge: %d pts, rms %.2f px)'
+                        % (chi2, len(rpx), float(np.sqrt(np.mean(rpx ** 2)))))
+            lbl.setStyleSheet('color: #cccccc')
+            self._refresh_ridge_overlay(rpx)
             return
         if simcoefs is None:
             simcoefs = getattr(self, '_last_simcoefs', None)
@@ -5520,7 +5805,8 @@ class DMSSlider(QtWidgets.QMainWindow):
             return
         self._peak_method = self._peak_combo.currentData()
         if self._fit_dms is not None:
-            self._fit_dms.setPeakMethod(self._peak_method, ts.AUTO_DOUBLET_SIG)
+            self._fit_dms.setPeakMethod(roi_peak_method(self._peak_method),
+                                        ts.AUTO_DOUBLET_SIG)
         if self._kernel is not None and not self._fitting:
             self._on_build_curves()
 
@@ -5539,6 +5825,49 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._maybe_update_live_curves()
         self._status.setText(
             'Curves: %s' % self._curve_combo.currentText())
+
+    def _on_det_orientation_changed(self, _idx=None):
+        """Switch the detector mounting (vertical / horizontal scattering).
+        Like the curve method, every live engine takes it, and built curves are
+        rebuilt, so the overlay, the ROIs and the fit all use one mapping."""
+        if self._suppress:
+            return
+        self._set_det_orientation(self._det_combo.currentData())
+        self._do_update()
+        self._maybe_update_live_curves()
+        self._status.setText('Detector: %s' % self._det_combo.currentText())
+
+    def _on_flip2th_toggled(self, on):
+        """Flip the sign of the 2θ axis on the image (geometry.scatv)."""
+        if self._suppress:
+            return
+        self._set_det_orientation(det_orient, flip=bool(on))
+        self._do_update()
+        self._maybe_update_live_curves()
+        self._status.setText('2θ axis %s' % ('flipped' if on else 'unflipped'))
+
+    def _set_det_orientation(self, name, flip=None):
+        """Make ``name`` the live mounting — and ``flip`` the 2θ sign when given
+        (None keeps it): the globals the engines are built from, the existing
+        engines, the live config and the two controls."""
+        global det_orient, scatv
+        det_orient = ts.det_orientation(name)
+        sign = ts.scatv_orientation(scatv)[0] if flip is None else int(bool(flip))
+        scatv = ts.scatv_code(sign, det_orient)
+        for eng in (self._dms, self._dms_full, self._sel_dms, self._fit_dms):
+            if eng is not None:
+                eng.scatv = scatv
+        geo = self._cfg.setdefault('geometry', {})
+        geo['det_orientation'] = det_orient
+        geo['scatv'] = sign
+        self._suppress = True
+        combo = getattr(self, '_det_combo', None)
+        if combo is not None and combo.currentData() != det_orient:
+            combo.setCurrentIndex(combo.findData(det_orient))
+        chk = getattr(self, '_chk_flip2th', None)
+        if chk is not None and chk.isChecked() != bool(sign):
+            chk.setChecked(bool(sign))
+        self._suppress = False
 
     def _apply_curve_method(self):
         """Push the active curve method into every engine that draws or scores."""
@@ -5629,6 +5958,8 @@ class DMSSlider(QtWidgets.QMainWindow):
             'numsteps':    int(numsteps),
             'tolerance':   float(tolerance),
             'peak_method': self._peak_method,
+            'ridge_points': (len(self._ridge['row'])
+                             if self._ridge_active() else None),
             'curve_method': curve_method,
             'roi_width':   float(self._kernel_width if self._kernel is not None
                                  else width),

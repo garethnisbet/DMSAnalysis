@@ -12,6 +12,7 @@ python -m DMSAnalysis.slider     [config.json]   # GUI: refine → build curves 
 python -m DMSAnalysis.fit        [config.json]   # batch fivefold-axis fitting (image-based)
 python -m DMSAnalysis.tripfit    [config.json]   # batch multiple-intersection lattice fit (image-free)
 python -m DMSAnalysis.tripslider [config.json]   # GUI for the multiple-intersection fit (image-free)
+python -m DMSAnalysis.ridgefit   [config.json]   # prototype: fit the cones to measured line positions (image-based)
 python -m DMSAnalysis.dat2config scan.dat out.json --datapoint N --datapoint0 M
 ```
 
@@ -70,6 +71,75 @@ the tick box, `True`/`False` force it. It also keeps the module-level `hklint`
 live hkl — before, a load left it at the value the app started on. Test:
 `DMSAnalysis/tests/test_scan_load_seeding.py`, which drives the real GUI
 headlessly over synthetic `.dat` files.
+
+### Older scans: path-numbered images and the `psic` azimuth
+
+2009-era i16 psi scans (SRS-format `.dat`, Pilatus 100K — e.g.
+`/dls/i16/data/2009/mt0/run3/105903.dat`) do not use the
+`<scan>-<detector>-files/%05d.tif` layout. Each row's image is
+`pilatus100k/test<path>.tif`, `path` being a scanned column (1232192, …), and
+the `pilatus100k` folder is shared by every scan of the visit. Their scanned
+azimuth is the `psic` column; the metadata `psi` is only the start value, and
+there is no `energy2` (the energy is the metadata `Energy`, keV).
+
+`dat2config` handles all of it. `_psi_of` reads `psi`, then `psic`, then the
+metadata. When no `-files` folder exists, `_path_numbered_images` finds the
+file for the first `path` value in the scan folder or one level below and
+returns a `%d` template (`pilatus100k/test%d.tif`) plus `image_first` (and
+`image_numbers` when the numbers are not contiguous) for the `experiment`
+block. **Every image read goes through `dat2config.image_number(exp, dp)`** —
+`image_numbers[dp]`, else `image_first + dp`, else the historical `dp + 1` —
+in the slider (startup, scan load, image scrubber), `fit.py` and `ridgefit.py`.
+The slider keeps the keys in `self._imnumbering`, writes them into exported and
+live configs, and the scrubber lists only this scan's frames from the shared
+folder. `fit.py` now takes energy, template and numbering from
+`extract_metadata` rather than reading `energy2` itself.
+
+The detector itself needs no special case: pixel size is the same 172 µm, the
+image is just smaller (195 × 487), and its geometry (distance, the ~35° tilt
+about the axis perpendicular to the beam on this setup) goes in the usual
+detector slots. Test: `DMSAnalysis/tests/test_path_numbered_scan.py`.
+
+### Detector mounting: vertical or horizontal scattering
+
+The Pilatus 100K rides on the detector arm and is used in two modes. In
+**vertical** scattering 2θ (δ) runs along its long axis, so a 2θ scan moves the
+pattern along the long axis and an azimuthal scan sweeps the DMS lines across
+the short axis. In **horizontal** scattering the two swap: an azimuthal sweep
+moves the lines along the long axis. `geometry.det_orientation`
+(`vertical` | `horizontal`, default `vertical` — what every existing config is)
+selects it; in the slider it is the **Detector** combo in the *Scan* box, also
+editable in the Config table, saved in sessions (older sessions restore as
+vertical) and written into exported configs.
+
+The engines compute a detector-frame vector whose component 0 is normal to the
+scattering plane and component 2 lies in it. **`ts.det_to_pixels` /
+`ts.pixels_to_det` are the only place those become image rows/cols**: vertical
+puts 0 on rows and ±2 on columns (the formula every engine used before), and
+horizontal puts ±2 on rows and 0 on columns. Every projection goes through
+them — the three engine classes' integer index, `imcalc`'s `_to_pixels` and its
+per-line arrays, `ridgefit.ConeModel.project/backproject`, and the slider's
+click back-projection (`_pixel_to_direction`) — so the overlay, the ROIs and the
+fit cannot disagree. The detector rotations keep their meaning in the
+scattering-plane frame in both modes (`dxrot` is about the axis normal to the
+scattering plane).
+
+The mounting rides in **bit 1 of the engines' `scatv`** (`ts.SCATV_HORIZONTAL`);
+bit 0 is the old sign. That keeps every positional argument tuple — builder
+args, engine args, fit.py's joblib workers — unchanged. Build the engine value
+with `ts.scatv_code(scatv, orientation)`; configs keep `scatv` as the sign
+alone. Never compare `scatv == 1` — the helpers decode it.
+
+**Flip 2θ axis** (tick box under the Detector combo) is that sign bit,
+`geometry.scatv`. The slider used to hard-code it to 0 and ignore the config,
+so a detector whose 2θ runs the other way could not be modelled. It now reads
+`geometry.scatv`, and the box, the Config table, sessions (older ones restore
+unflipped, as they were drawn) and exports all carry it. Check it against a
+line of known angle: a lower-Bragg-angle DMS line must sit on the low-2θ side
+of the primary spot. For 105903 (Pilatus 100K, vertical) the (004) line lies at
+column ≈85–91, left of the (0 0 4+τ) spot at column 257.6, and that needs the
+box ticked (scatv 1); unticked, the model puts low 2θ to the right.
+Test: `DMSAnalysis/tests/test_det_orientation.py`.
 
 ### Right-click removes a line; one empty arc used to disarm it
 
@@ -262,6 +332,7 @@ DMS/                          # repository root
 │   ├── fit.py                # Batch fitting script: loads data, builds ROIs, runs optimiser
 │   ├── tripfit.py            # Batch image-free lattice fit via Kossel-line triple intersections
 │   ├── tripslider.py         # pyqtgraph GUI for the multiple-intersection (tripfit) fit
+│   ├── ridgefit.py           # Prototype: ridge extraction + cone fit (image-based, no ROIs)
 │   ├── configs/              # Example JSON configs shipped with the package
 │   └── README.md             # Full library API documentation
 └── Processing/               # Timestamped output snapshots (auto-created when save=1, in CWD)
@@ -282,7 +353,7 @@ Each app reads a JSON config (passed as an argument, or the `configs/` default).
 | `display` | `zoomval` (1 or 2), `colourlim`, `colmap` — image display settings |
 | `roi` | `width_per_zoom`, `comwidth_per_zoom` — ROI extraction widths (scaled by `zoomval`) |
 | `geometry` | `hkl`, `psi`, `px_unscaled`, `py_unscaled` — primary reflection and detector origin |
-| `computation` | `numsteps`, `simsigma_per_zoom`, `thrange_delta`, `bravais`, `pseudocubic_transform` (1–12, conventional only), `curve_method` (`sweep`/`circle` — see *DMS curve method*), `opt_method`, `peak_method` (`gauss`/`centroid`), `tolerance` |
+| `computation` | `numsteps`, `simsigma_per_zoom`, `thrange_delta`, `bravais`, `pseudocubic_transform` (1–12, conventional only), `curve_method` (`sweep`/`circle` — see *DMS curve method*), `opt_method`, `peak_method` (`gauss`/`centroid`/`ridge` — see *Ridge + cone fit*), `tolerance` |
 | `crystal` | `lattice2`, `initial_guess_base`, `ref_6d` (quasicrystal 6D reflections) **or** `reflist_hkl` (conventional 3-index reflections) — starting parameters and reference reflections |
 | `manual_centres` | Dict of `"roi_index": pixel_position` overrides for poorly fitted ROI centres |
 
@@ -347,11 +418,24 @@ sweep:
 | sweep @ 4000 | 72.0 | — |
 
 So circles at 100 points cost about what a 1000-point sweep costs and are ~19x
-more faithful, or a third of the 4000-point sweep that would match them. 1.0 px
-is the engine's own whole-pixel rounding — the floor, not a limit of the method.
+more faithful, or a third of the 4000-point sweep that would match them. The
+1.0 px was measured when the overlay was rounded to whole pixels — the floor
+then, not a limit of the method.
 The rule is to switch the method *and* drop Points; leaving Points at 1000 just
 makes every overlay update and fit evaluation slower for a curve that was
 already right.
+
+**The overlay lines are not rounded.** `imcalc`'s `_to_pixels` and the sweep's
+`_prepx_lines` used to round the detector-frame vector to whole pixels, so even
+circle mode drew every point on a pixel vertex, up to ~0.7 px off the cone the
+ridge objective scores (`ridgefit.ConeModel.project`, the same map unrounded).
+`dmslines` is now sub-pixel and every drawn point lies on its reflection's cone
+to machine precision; only the simulated image's pixel index (`dmsindex`) is
+still rounded. The off-plate cut for the lines is `[-0.5, size-0.5)`, the region
+the rounding used to keep — `[0, size)` dropped or added an end segment on lines
+leaving the plate. The slider's **DMS lines** scatter is drawn from those lines
+(`slider.discovery_points`), not from `dmsindex` — the raster would put its dots
+back on the pixel vertices. Test: `DMSAnalysis/tests/test_overlay_subpixel.py`.
 
 Both the overlay and the fit engine take the setting, so the residual is
 always scored on the curves that are on screen; it is saved in the session, in
@@ -449,6 +533,77 @@ strain or a χ correction. Two things to know:
 A run too short to fit a circle to, or one the tolerance rejects, is kept as the
 points the sweep sampled, so switching method can add resolution but never loses
 a curve. Tests: `DMSAnalysis/tests/test_dms_curves.py`.
+
+## Ridge + cone fit (prototype, `ridgefit.py`)
+
+An alternative to the ROI-centre objective, reading the same batch-fit config as
+`fit.py`. The ROI fit keeps two numbers per reflection (one centre per half-line,
+from a strip with one fixed perpendicular laid along the *initial guess*), so a
+line's curvature and any sub-pixel detail are thrown away. `ridgefit` measures
+the line instead and fits the cones to the measurements:
+
+1. **Ridge extraction** (`extract_ridge`, once per pass): every predicted arc is
+   walked at `--step` px; at each stop a profile is sampled along the arc's
+   *local* normal (bilinear, averaged over a short segment along the line) and
+   fitted with a Gaussian on a linear background, giving an observed point and
+   its standard error. Dropped: stops near another reflection's line (crossings),
+   off the plate or across a module gap (pixels < 0 are masked), weak, too wide,
+   at the window edge, or jumping from the running median of their neighbours
+   (the window catching a parallel line).
+2. **Cone fit** (`RidgeConeFit`, `least_squares`): no image is rendered. Each
+   evaluation takes the engine's exit directions (`dmsfit_ico_hkl._geometry`, the
+   part of `imcalc` before drawing, split out for this), fits each run's circle
+   (`dms_circle_runs` + `dms_fit_arcs`), back-projects every ridge point through
+   the current detector map, and scores the signed pixel distance to the nearest
+   point on its own reflection's cone, divided by the point's error. Passes
+   re-extract at the fitted geometry, narrower (`--narrow`, 24 px) after the first.
+
+The residual is smooth in the parameters, so the Jacobian gives error bars
+(`parameter_errors`, scaled by the reduced χ²). Getting it smooth took two fixes
+that `tests/test_ridgefit.py` pins. Both made a residual flip sign under a
+1e-12 perturbation, which stalled the optimiser partway along the
+chi/dyrot/psicor valley:
+
+* a cone's "outside" comes from a normal oriented by `c·n ≥ 0`, so the two ψ
+  branches (one cone traversed both ways) agree;
+* a point is scored against the cone whose *drawn arc* covers it before the
+  nearest full circle. A θ range spanning zero puts the sweep's two halves on two
+  different cones ~0.1 px apart, and nearest-only tied between them. For the same
+  reason only the forward ray is scored, never the antipode.
+
+`--beam-centre` also refines (px, py), which no other fit path does. On 1041984
+dp34 (`TestExample.json` geometry, rhombohedral) the rms distance to the cones goes 6.9 → 3.3 px
+without it and → 1.1 px with it (most lines ≤ 0.6 px). Freeing all six lattice
+parameters instead (triclinic) gains almost nothing (3.2 px). `py` is strongly
+correlated with chicor/dyrot, though, so read its σ before believing it. Lines
+that stay offset along their whole length after the fit are the place to look
+for multi-phase doublets. `--compare` also scores start and result on the
+ROI-centre objective; `--save` writes `Processing/<scan>_dp<dp>_<stamp>_RidgeCone/`
+(`Result.txt`, `RIDGE.png`).
+
+**In the slider** it is the third **Peak pos.** option, *Ridge + cone*. It is not
+a ROI peak estimator but a different objective, plugged in through
+`dmsfit_ico_hkl.setObjective`: when set, the engine's `fit` / `residuals` / `full`
+score that callable instead of the ROI centres (and `fit` / `residuals` skip
+`imcalc`), so every optimiser in `FitWorker` (scalar, multistart, LSQ) and
+**No Fit** run on it unchanged. **Build curves** still builds the ROIs, whose
+curves are located with the Gaussian (`roi_peak_method`) and fill the panels.
+It then measures the ridge along the checked reflections' predicted arcs at the
+Width spinbox and installs the objective. A *Ridge* toggle next to *ROIs* draws
+the points on the image, coloured by their live distance to the cones. The χ²
+readout scores them on every slider move, since that needs no simulated image
+and so is never stale. The post-fit rebuild keeps the same points
+(`reuse_ridge`, carried exactly when `reuse_exp` is), as it keeps the ROI
+centres, so the reported χ² is the one the fit minimised. A new **Build curves**
+re-measures at the refined geometry, which is the CLI's next pass; narrow
+the Width first if the lines are now close. `Result.txt` says
+`scored on N ridge points`. Manual ROI centres do not apply. The beam centre is
+not refined here (only the CLI's `--beam-centre`). `fit.py` given
+`peak_method: ridge` (from an exported workflow) says so and fits ROI centres.
+Extraction is batched (one `map_coordinates`, one Levenberg–Marquardt over all
+profiles, two starts each, matching `curve_fit` to 1e-3 px on accepted
+profiles), at ~2 s for a full Pilatus 2M frame. Test:
+`DMSAnalysis/tests/test_ridge_peak_method.py`.
 
 ## Conventional crystals
 

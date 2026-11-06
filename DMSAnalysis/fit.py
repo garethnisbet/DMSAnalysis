@@ -16,6 +16,7 @@ from scipy.optimize import basinhopping
 from joblib import Parallel, delayed
 from collections import OrderedDict
 from . import loader as do
+from . import dat2config
 import imageio.v2 as imageio
 import re
 plt.ion()
@@ -50,7 +51,9 @@ scanpath      = cfg["scan"]["scanpath"]
 
 imnum=datapoint+1
 tolerance    = cfg["computation"]["tolerance"]
-scatv        = cfg["geometry"]["scatv"]
+# The engines' scatv also carries the detector mounting (ts.det_to_pixels).
+scatv        = ts.scatv_code(cfg["geometry"]["scatv"],
+                             cfg["geometry"].get("det_orientation"))
 save         = cfg["flags"]["save"]
 fit          = cfg["flags"]["fit"]
 firstplot    = cfg["flags"]["firstplot"]
@@ -75,6 +78,12 @@ OptMethod = cfg["computation"]["opt_method"]
 # Peak-position method for the raw and simulated ROI curves:
 # 'gauss' (Gaussian curve fit) or 'centroid' (centre of mass).
 peak_method = cfg["computation"].get("peak_method", "gauss")
+if peak_method == "ridge":
+    # The slider's 'Ridge + cone' is a different objective, not a ROI peak
+    # estimator; its batch path is ridgefit, which reads this same config.
+    print("peak_method 'ridge': fit.py fits ROI centres (Gaussian); for the ridge "
+          "+ cone fit run  python -m DMSAnalysis.ridgefit " + _cfg_path)
+    peak_method = "gauss"
 # How the DMS curves are computed from the hkl scan: 'sweep' (the sampled scan
 # points are the curve) or 'circle' (each continuous run reduced to the circle it
 # analytically lies on, re-sampled at detector resolution).  Same key and same
@@ -130,22 +139,19 @@ lattice=[met.a,met.b,met.c,met.alpha1,met.alpha2,met.alpha3]
 
 psi = cfg["geometry"]["psi"]
 
+# Energy, image template and image numbering as dat2config reads them, so a
+# scan without energy2 (psi scans, 2009 SRS files) or with path-numbered
+# images (pilatus100k/test%d.tif) loads like any other.
+_exp = dat2config.extract_metadata(scanpath + str(scannum) + '.dat',
+                                   datapoint, datapoint0)
+energy = _exp['energy']
+
 hkl = np.array(cfg["geometry"]["hkl"])
-hkl = hkl*d.energy2[datapoint]/d.energy2[datapoint0]
+hkl = hkl*energy/_exp['energy0']
 
 hklint=np.round(hkl)
-imtemplate=str(scannum)+'-pilatus2M-files/%05d.tif'
-
-try:
-    energy = d.energy2[datapoint]
-except:
-    try:
-        energy = d.metadata.Energy
-    except:
-        try:
-            energy = d.DCMenergy
-        except:
-            energy = d.metadata.en
+imtemplate=_exp['image_template']
+imnum=dat2config.image_number(_exp, datapoint)
 
 
 azir=[d.metadata['azih'],d.metadata['azik'],d.metadata['azil']]

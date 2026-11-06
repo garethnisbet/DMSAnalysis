@@ -338,7 +338,8 @@ down with it. Measured on 40 conventional reflections over a 1200x1200 detector
 | `sweep` @ 1000 | 17.8 | 19 px | `circle` @ 1000 | 43.6 | 1.0 px |
 | `sweep` @ 4000 | 72.0 | — | | | |
 
-1.0 px is the engine's whole-pixel rounding, i.e. the floor. `numsteps` still
+1.0 px was the overlay's old whole-pixel rounding, i.e. the floor (the overlay
+lines are now drawn unrounded, on the cones themselves). `numsteps` still
 sets how precisely each arc's *ends* are located, so it cannot go arbitrarily
 low: a run needs 4 surviving points before a circle can be fitted to it, and a
 locus that a coarse scan catches only once or twice is kept as those points. On

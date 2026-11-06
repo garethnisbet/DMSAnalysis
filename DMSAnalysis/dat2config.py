@@ -19,11 +19,18 @@ used to pull from the ``.dat``::
         "azir":           [azih, azik, azil],
         "hkl":            [h, k, l],                # primary reflection at datapoint
         "psi":            <azimuthal angle, deg>,
-        "image_template": "913123-pilatus2M-files/%05d.tif"
+        "image_template": "913123-pilatus2M-files/%05d.tif",
+        "image_first":    <image number of datapoint 0>      # optional
     }
 
 ``hkl`` and ``psi`` are the as-measured primary reflection and azimuth; they are
 omitted when the ``.dat`` does not carry them.
+
+Images are numbered ``datapoint + 1`` in the ``<scan>-<detector>-files``
+folders.  Older scans (2009 SRS-format i16 files) name each image by the
+``path`` column instead — ``pilatus100k/test%d.tif`` — and then carry
+``image_first`` (and ``image_numbers`` if the numbers are not contiguous);
+:func:`image_number` turns a datapoint into the file number either way.
 
 CLI::
 
@@ -96,29 +103,97 @@ def _hkl_at(d, idx):
 
 
 def _psi_of(d, idx):
-    """The azimuthal angle (deg).  Scanned ``psi`` column first, then the
-    metadata value; ``None`` when the file carries neither."""
-    try:
-        return float(d.psi[idx])
-    except (AttributeError, IndexError, TypeError):
-        pass
+    """The azimuthal angle (deg).  A scanned ``psi`` column first, then
+    ``psic`` (what the older GDA psi scans — e.g. 2009 SRS files — name the
+    scanned azimuth), then the metadata value; ``None`` when the file carries
+    none of them.  The metadata ``psi`` is the azimuth at the start of the scan
+    only, so on a psi scan it must never win over the column."""
+    for col in ('psi', 'psic'):
+        try:
+            return float(getattr(d, col)[idx])
+        except (AttributeError, IndexError, TypeError):
+            pass
     try:
         return float(d.metadata['psi'])
     except (AttributeError, KeyError, TypeError, ValueError):
         return None
 
 
-def _detector_template(dat_path, scannum):
-    """Return the ``%05d``-style image template for ``scannum``.
+IMAGE_EXTS = ('.tif', '.tiff', '.cbf', '.png', '.edf')
 
-    Looks for a ``<scannum>-<detector>-files`` directory beside the ``.dat`` and
-    uses its detector name; defaults to ``pilatus2M`` if none is found."""
+
+def _path_numbered_images(d, scandir):
+    """Image template + numbering for scans whose images are named by the
+    ``path`` column (older GDA/SRS files, e.g. 2009 i16 Pilatus 100K data:
+    ``pilatus100k/test1232192.tif`` for the row with ``path=1232192``).
+
+    Returns ``(template, numbering)`` — ``template`` relative to ``scandir``,
+    with ``%d`` where the number goes, and ``numbering`` the
+    ``image_first``/``image_numbers`` keys :func:`image_number` reads — or
+    ``None`` when the scan has no ``path`` column or no matching file is found
+    in ``scandir`` or one directory below it."""
+    try:
+        nums = [int(round(float(v))) for v in d.path]
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not nums:
+        return None
+    n0 = str(nums[0])
+    cands = (glob.glob(os.path.join(scandir, '*' + n0 + '.*')) +
+             glob.glob(os.path.join(scandir, '*', '*' + n0 + '.*')))
+    for p in sorted(cands):
+        base, ext = os.path.splitext(os.path.basename(p))
+        if ext.lower() not in IMAGE_EXTS or not base.endswith(n0):
+            continue
+        prefix = base[:-len(n0)]
+        if prefix and prefix[-1].isdigit():
+            continue                      # n0 is the tail of a longer number
+        rel = os.path.relpath(os.path.dirname(p), scandir)
+        tmpl = prefix + '%d' + ext
+        tmpl = tmpl if rel == '.' else rel + '/' + tmpl
+        contiguous = all(b - a == 1 for a, b in zip(nums, nums[1:]))
+        numbering = ({'image_first': nums[0]} if contiguous
+                     else {'image_first': nums[0], 'image_numbers': nums})
+        return tmpl, numbering
+    return None
+
+
+def _detector_template(dat_path, scannum, d=None):
+    """Return ``(template, numbering)`` for the scan's detector images.
+
+    Looks for a ``<scannum>-<detector>-files`` directory beside the ``.dat``
+    (``%05d`` files numbered from 1 — ``numbering`` empty).  Failing that, a
+    scan with a ``path`` column is searched for path-numbered images
+    (:func:`_path_numbered_images`).  Defaults to ``pilatus2M``."""
     scandir = os.path.dirname(os.path.abspath(dat_path))
     matches = sorted(glob.glob(os.path.join(scandir, '%s-*-files' % scannum)))
     if matches:
         folder = os.path.basename(matches[0])
-        return '%s/%%05d.tif' % folder
-    return '%s-pilatus2M-files/%%05d.tif' % scannum
+        return '%s/%%05d.tif' % folder, {}
+    if d is not None:
+        found = _path_numbered_images(d, scandir)
+        if found is not None:
+            return found
+    return '%s-pilatus2M-files/%%05d.tif' % scannum, {}
+
+
+def image_number(exp, datapoint):
+    """The number that goes into ``exp['image_template']`` for ``datapoint``.
+
+    ``image_numbers`` (an explicit per-point list) wins, then
+    ``image_first + datapoint``; with neither key it is ``datapoint + 1``, the
+    numbering of the ``<scan>-pilatus2M-files/%05d.tif`` folders."""
+    exp = exp or {}
+    dp = int(datapoint)
+    nums = exp.get('image_numbers')
+    if nums is not None and 0 <= dp < len(nums):
+        return int(nums[dp])
+    return int(exp.get('image_first', 1)) + dp
+
+
+def image_path(scanpath, exp, datapoint):
+    """Full path of the detector image for ``datapoint``."""
+    return os.path.join(scanpath, exp['image_template'] % image_number(exp, datapoint))
 
 
 def scan_length(dat_path):
@@ -164,13 +239,16 @@ def extract_metadata(dat_path, datapoint, datapoint0):
                float(m.alpha1), float(m.alpha2), float(m.alpha3)]
     azir = [float(m['azih']), float(m['azik']), float(m['azil'])]
 
+    tmpl, numbering = _detector_template(dat_path, scannum, d)
     exp = {
         'lattice':        lattice,
         'energy':         _energy_at(d, datapoint),
         'energy0':        _energy_at(d, datapoint0),
         'azir':           azir,
-        'image_template': _detector_template(dat_path, scannum),
+        'image_template': tmpl,
     }
+    # Only for path-numbered images; absent means datapoint + 1.
+    exp.update(numbering)
     # The primary reflection and the azimuth as measured.  Both are optional —
     # a scan that does not carry them simply leaves the key out, and the
     # consumer keeps whatever it was using.
