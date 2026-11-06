@@ -65,6 +65,25 @@ python -m DMSAnalysis.tripfit [config.json]
 python -m DMSAnalysis.dat2config scan.dat out.json --datapoint N --datapoint0 M
 ```
 
+### Example data
+
+`DMSAnalysis/example_data/913232/` holds one measured frame of scan 913232
+(icosahedral Al-Pd-Mn, Diamond i16, Pilatus 2M) with its `.dat`, and
+`DMSAnalysis/configs/example_913232.json` points at it, so the image apps run on
+any machine without access to the beamline data:
+
+```bash
+python -m DMSAnalysis.slider DMSAnalysis/configs/example_913232.json
+python -m DMSAnalysis.fit                      # the example is fit.py's default
+python -m DMSAnalysis.ridgefit DMSAnalysis/configs/example_913232.json
+```
+
+A relative `scan.scanpath` is read relative to the config file, so a config can
+travel with its data. The example runs at `zoomval: 1`: the ROI integrator
+interpolates, so the 2× zoom older configs use is no longer needed (and costs 4×
+the memory). See `DMSAnalysis/example_data/README.md` for what is (and
+is not) included.
+
 Typical flow in the **slider** (image-based):
 1. **Browse… → Load Scan** — the scan's own lattice, energy, primary `hkl` and
    `psi` come off the `.dat` and seed the sliders (untick **Seed sliders from
@@ -151,6 +170,7 @@ DMS/                          # repository root
 │   ├── tripfit.py            # image-free multiple-intersection batch lattice fit
 │   ├── tripslider.py         # image-free multiple-intersection GUI
 │   ├── configs/              # example JSON configs
+│   ├── example_data/         # one frame of scan 913232, for the example config
 │   ├── tests/                # self-verification tests (geometry, ROI kernels, GUI behaviour)
 │   └── README.md             # library API reference
 └── Processing/               # timestamped run snapshots (created in CWD when save=1)

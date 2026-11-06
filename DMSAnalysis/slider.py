@@ -68,7 +68,7 @@ else:
     }
 
 scannum    = cfg['scan']['scannum']
-scanpath   = cfg['scan']['scanpath']
+scanpath   = dat2config.resolve_scanpath(cfg['scan']['scanpath'], cfg_path)
 datapoint  = cfg['scan']['datapoint']
 datapoint0 = cfg['scan']['datapoint0']
 imnum      = datapoint + 1
@@ -186,6 +186,10 @@ hkllistrange = [thrange[0], thrange[1], numsteps]
 _roi         = cfg.get('roi', {})
 width        = _roi.get('width_per_zoom', 45) * zoomval
 comwidth     = _roi.get('comwidth_per_zoom', 5) * zoomval
+# Bin width (px) across each ROI: sub-pixel bins along the local normal, and a
+# splatted simulated image (ts_quasi.roi_sampler).  null / 0 in the config is
+# the legacy whole-pixel integrator.
+roibin       = ts.roi_bin_from_config(_roi, zoomval)
 _comp        = cfg.get('computation', {})
 bravais      = _comp.get('bravais', 'icosahedral')
 # Conventional (non-quasicrystal) crystals are indexed with 3-element Miller
@@ -1211,8 +1215,14 @@ class BuildWorker(QtCore.QThread):
         # spinboxes) so a change mid-build cannot straddle this build.
         self._numsteps    = numsteps
         self._width       = width
+        self._roibin      = roibin
         self._simsigma    = simsigma
         self._curve_method = curve_method
+        if reuse_exp is not None:
+            # Reused experimental curves keep the integrator they were
+            # extracted with, or data and simulation would be binned apart.
+            self._width  = reuse_exp.get('width', self._width)
+            self._roibin = reuse_exp.get('roibin', self._roibin)
 
     def run(self):
         try:
@@ -1254,7 +1264,8 @@ class BuildWorker(QtCore.QThread):
                 imcoeffs, linedatax, linedatay, _, _, _ = \
                     ts.multiroifit2(self._imdata, kernel, self._width, 0.02,
                                     ts.AUTO_DOUBLET_SIG,
-                                    roi_peak_method(self._peak_method))
+                                    roi_peak_method(self._peak_method),
+                                    step=self._roibin)
                 centres = np.array([imcoeffs[:, 2]]).T
             # Re-apply manual centre overrides (restored from a session, or
             # carried across a post-fit rebuild)
@@ -1276,6 +1287,8 @@ class BuildWorker(QtCore.QThread):
             fit_dms.setLattice(ig[:6].tolist())
             fit_dms.setPeakMethod(roi_peak_method(self._peak_method),
                                   ts.AUTO_DOUBLET_SIG)
+            # The simulated curves are integrated exactly as the data were.
+            fit_dms.setRoiBinStep(self._roibin)
             # The simulated image the fit is scored on is drawn by the same
             # curve method as the overlay, so the residual describes the curves
             # on screen.
@@ -1326,6 +1339,7 @@ class BuildWorker(QtCore.QThread):
                 # The width these ROIs were integrated at (the spinbox may move
                 # before the next build); the ROI overlay draws with it.
                 'width':            self._width,
+                'roibin':           self._roibin,
                 'ridge':            ridge,
                 'ridge_fitter':     ridge_fitter,
             })
@@ -1434,6 +1448,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         # the boxes on screen are the ones the curves came out of until the user
         # rebuilds.
         self._kernel_width  = width
+        self._kernel_roibin = roibin
         # Outline items of the "ROIs" overlay toggle
         self._roi_overlay_items = []
         # Ridge + cone peak method: the measured points from the last build and
@@ -1791,7 +1806,32 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._sb_width.setToolTip(_w_lbl.toolTip())
         self._sb_width.valueChanged.connect(self._on_width_changed)
         fitl.addWidget(_w_lbl, 2, 0)
-        fitl.addWidget(self._sb_width, 2, 1)
+
+        # Bin width across each ROI (roibin global).  The minimum is the legacy
+        # whole-pixel integrator.
+        _b_lbl = QtWidgets.QLabel('Bin (px)')
+        _b_lbl.setToolTip(
+            'Bin width across each ROI.  Sub-pixel bins sample the strip along '
+            'the line\'s local normal with bilinear interpolation, and the '
+            'simulated lines are drawn sub-pixel, so the fit residual is smooth '
+            'in the parameters.  "legacy" is the original whole-pixel '
+            'integrator.  Rebuild curves to apply.')
+        self._sb_roibin = QtWidgets.QDoubleSpinBox()
+        self._sb_roibin.setRange(0.0, 2.0)
+        self._sb_roibin.setDecimals(2)
+        self._sb_roibin.setSingleStep(0.05)
+        self._sb_roibin.setSpecialValueText('legacy')
+        self._sb_roibin.setValue(0.0 if roibin is None else float(roibin))
+        self._sb_roibin.setToolTip(_b_lbl.toolTip())
+        self._sb_roibin.valueChanged.connect(self._on_roibin_changed)
+        # Width and bin share the row: the Fit box is a two-column grid.
+        _wb = QtWidgets.QWidget()
+        _wbl = QtWidgets.QHBoxLayout(_wb)
+        _wbl.setContentsMargins(0, 0, 0, 0)
+        _wbl.addWidget(self._sb_width, 1)
+        _wbl.addWidget(_b_lbl)
+        _wbl.addWidget(self._sb_roibin, 1)
+        fitl.addWidget(_wb, 2, 1)
 
         # Simulation Gaussian blur sigma applied to the simulated DMS image
         # (simsigma global; the engine applies it live each imcalc).
@@ -2829,7 +2869,8 @@ class DMSSlider(QtWidgets.QMainWindow):
         sel_arcs, _ = self._selected_arcs()
         for i in range(self._kernel.shape[2]):
             try:
-                rows, cols = ts.roi_outline(self._kernel[:, :, i], w)
+                rows, cols = ts.roi_outline(self._kernel[:, :, i], w,
+                                            getattr(self, '_kernel_roibin', None))
             except Exception:
                 continue
             if np.size(rows) == 0:
@@ -3921,6 +3962,9 @@ class DMSSlider(QtWidgets.QMainWindow):
             _cm_new = curve_method
         if _cm_new != curve_method:
             self._curve_combo.setCurrentIndex(self._curve_combo.findData(_cm_new))
+        # roi.bin_step_per_zoom likewise goes through its spinbox.
+        if 'bin_step_per_zoom' in new_cfg.get('roi', {}):
+            self._set_roibin(ts.roi_bin_from_config(new_cfg['roi'], zoomval))
         # A geometry.det_orientation edit likewise goes through the mounting
         # setter; the rebuilds below then pick it up.
         try:
@@ -4049,6 +4093,8 @@ class DMSSlider(QtWidgets.QMainWindow):
             # the simulated image, so a restored session must fit on the same
             # construction it was saved on
             'curve_method':   curve_method,
+            # ROI bin width (px; None = legacy whole-pixel integrator)
+            'roi_bin_step':   roibin,
             # detector mounting (vertical / horizontal scattering)
             'det_orientation': det_orient,
             # sign of the 2θ axis on the image (the "Flip 2θ axis" box)
@@ -4309,6 +4355,10 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._curve_combo.setCurrentIndex(self._curve_combo.findData(cm))
             self._suppress = False
         self._apply_curve_method()
+        # ROI bin width.  Sessions from before the option keep the current
+        # setting: the ROIs are rebuilt on restore anyway.
+        if 'roi_bin_step' in data:
+            self._set_roibin(data.get('roi_bin_step'))
         # Detector mounting and 2θ sign; sessions from before the toggles are
         # vertical and unflipped (the slider's sign was always 0 then).
         try:
@@ -5008,6 +5058,9 @@ class DMSSlider(QtWidgets.QMainWindow):
         # pseudo-cubic indexing — the consumer must not re-apply the matrix.
         cfg['computation']['pseudocubic_transform'] = 1
         cfg.setdefault('roi', {})['width_per_zoom'] = float(width / max(zoomval, 1))
+        # fit.py integrates the same way (per zoom, like width_per_zoom)
+        cfg['roi']['bin_step_per_zoom'] = (None if roibin is None
+                                           else float(roibin / max(zoomval, 1)))
         # Template manual_centres reference ROI indices from a different ref_6d;
         # always clear them so workflow.py doesn't crash with an IndexError.
         cfg['manual_centres'] = {}
@@ -5205,8 +5258,10 @@ class DMSSlider(QtWidgets.QMainWindow):
             lines.append('  parallel starts %d   points %d   tolerance %g'
                          % (setup.get('n_parallel_starts', 1),
                             setup.get('numsteps', 0), setup.get('tolerance', 0.0)))
-            lines.append('  ROI width %g px   peaks %s   curves %s'
+            _rb = setup.get('roi_bin_step')
+            lines.append('  ROI width %g px   bins %s   peaks %s   curves %s'
                          % (setup.get('roi_width', float('nan')),
+                            'legacy' if _rb is None else '%g px' % _rb,
                             setup.get('peak_method', ''),
                             setup.get('curve_method', '')))
             lines.append('  detoptimize %s   energyopt %s'
@@ -5415,7 +5470,9 @@ class DMSSlider(QtWidgets.QMainWindow):
         reuse_exp_d  = ({'imcoeffs':  self._imcoeffs,
                          'linedatax': self._linedatax,
                          'linedatay': self._linedatay,
-                         'centres':   self._centres} if keep_exp else None)
+                         'centres':   self._centres,
+                         'width':     self._kernel_width,
+                         'roibin':    self._kernel_roibin} if keep_exp else None)
 
         if stale_sel:
             self._status.setText('Reflection selection changed — ROIs rebuilt '
@@ -5461,6 +5518,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._hkllistrange_fit  = res['hkllistrange_fit']
         self._kernel            = res['kernel']
         self._kernel_width      = res.get('width', width)
+        self._kernel_roibin     = res.get('roibin', roibin)
         self._imcoeffs          = res['imcoeffs']
         self._linedatax         = res['linedatax']
         self._linedatay         = res['linedatay']
@@ -5667,9 +5725,12 @@ class DMSSlider(QtWidgets.QMainWindow):
                     self._fit_dms.imcalc(extract_reduced(self.ig))
                 # Same estimator as dmsfit_ico_hkl._simcoeffs, so the sim centre
                 # line drawn here is the one the residual is actually scoring.
+                # ...and the width / bin step the kernel was built at, not the
+                # live spinboxes, which may have moved since.
                 coefs, ldsx, ldsy, _, _, _ = ts.multiroifit(
-                    self._fit_dms.imsim, self._kernel, width, 10,
-                    roi_peak_method(self._peak_method), ts.AUTO_DOUBLET_SIG)
+                    self._fit_dms.imsim, self._kernel, self._kernel_width, 10,
+                    roi_peak_method(self._peak_method), ts.AUTO_DOUBLET_SIG,
+                    step=self._kernel_roibin)
                 self._draw_sim_lines(coefs, ldsx, ldsy)
                 self._update_residual_readout(coefs)
             except Exception:
@@ -5894,6 +5955,31 @@ class DMSSlider(QtWidgets.QMainWindow):
         if self._fit_dms is not None:
             self._status.setText('Width = %d px — rebuild curves to apply' % width)
 
+    def _set_roibin(self, value):
+        """Set the ROI bin width from a config / session value (None or 0 is
+        legacy), through the spinbox so its handler runs."""
+        try:
+            step = ts.roi_bin_step(value)
+        except (TypeError, ValueError):
+            return
+        sb = getattr(self, '_sb_roibin', None)
+        if sb is None:
+            global roibin
+            roibin = step
+            return
+        sb.setValue(0.0 if step is None else step)
+        self._on_roibin_changed(sb.value())
+
+    def _on_roibin_changed(self, value):
+        """Update the ROI bin width (px); 0 is the legacy integrator."""
+        global roibin
+        roibin = ts.roi_bin_step(value)
+        txt = 'legacy' if roibin is None else '%.2f px' % roibin
+        if self._fit_dms is not None:
+            self._status.setText('ROI bins = %s — rebuild curves to apply' % txt)
+        else:
+            self._status.setText('ROI bins = %s' % txt)
+
     def _on_simsigma_changed(self, value):
         """Update the simulation Gaussian blur sigma.  The engine applies it each
         imcalc, so push the new value into the live engines and redraw."""
@@ -5963,6 +6049,8 @@ class DMSSlider(QtWidgets.QMainWindow):
             'curve_method': curve_method,
             'roi_width':   float(self._kernel_width if self._kernel is not None
                                  else width),
+            'roi_bin_step': (self._kernel_roibin if self._kernel is not None
+                             else roibin),
             'detoptimize': bool(detoptimize),
             'energyopt':   bool(energyopt),
         }

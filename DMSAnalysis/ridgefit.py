@@ -533,7 +533,8 @@ def load_case(cfg_path):
     zoomval = cfg['display']['zoomval']
     width = cfg['roi']['width_per_zoom'] * zoomval
     sc = cfg['scan']
-    scanpath, scannum = sc['scanpath'], sc['scannum']
+    scanpath = dat2config.resolve_scanpath(sc['scanpath'], cfg_path)
+    scannum = sc['scannum']
     datapoint, datapoint0 = sc['datapoint'], sc['datapoint0']
     bravais = cfg['computation']['bravais']
     detopt = bool(cfg['flags']['detoptimize'])
@@ -608,6 +609,7 @@ def load_case(cfg_path):
     eng.setLattice(ig[:6])
     eng.setIGFull(ig)
     eng.setCurveMethod(cfg['computation'].get('curve_method', 'sweep'))
+    eng.setRoiBinStep(ts.roi_bin_from_config(cfg.get('roi', {}), zoomval))
     eng.setPeakMethod(cfg['computation'].get('peak_method', 'gauss'),
                       ts.AUTO_DOUBLET_SIG)
     slots = list(ts.imcalc_param_indices(bravais, detopt, energyopt))
@@ -631,7 +633,8 @@ def roi_chi2(case, xs, apply=lambda x: x):
     eng = case['engine']
     kernel = ts.roibuilder_ico_hkl(case['builderargs'])
     co = ts.multiroifit2(case['img'], kernel, case['width'], 0.02,
-                         ts.AUTO_DOUBLET_SIG, eng.peakmethod)[0]
+                         ts.AUTO_DOUBLET_SIG, eng.peakmethod,
+                         step=eng.roibin)[0]
     centres = np.array([co[:, 2]]).T
     for k, v in case['manual_centres'].items():
         centres[int(k)] = v / 2 * case['zoomval']

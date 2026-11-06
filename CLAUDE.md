@@ -319,6 +319,19 @@ same `enabled` flag. It reads and writes the same config schema as
 
 Each app falls back to the example config in `DMSAnalysis/configs/` when no path is given.
 
+### Example data
+
+`DMSAnalysis/example_data/913232/` ships scan 913232 (icosahedral Al-Pd-Mn,
+i16, Pilatus 2M): the complete `.dat` and the one frame the example fits
+(datapoint 10, `00011.tif`, re-saved with lossless deflate, 9.9 → 3.4 MB; the
+full scan is 161 MB). `configs/example_913232.json` is the fivefold-axis
+config with `scan.scanpath: "../example_data/913232/"` and `zoomval: 1`, and is
+`fit.py`'s default. A **relative `scanpath` resolves against the config file**
+(`dat2config.resolve_scanpath`, used by the slider, `fit.py` and `ridgefit.py`),
+so a config can travel with its data. Other datapoints show a blank frame in
+the slider. See `DMSAnalysis/example_data/README.md`. Test:
+`DMSAnalysis/tests/test_example_data.py`.
+
 ## Architecture
 
 ```
@@ -351,7 +364,7 @@ Each app reads a JSON config (passed as an argument, or the `configs/` default).
 | `scan` | `scannum`, `scanpath`, `datapoint`, `datapoint0` — which scan file and image to load |
 | `flags` | `save`, `fit`, `firstplot`, `detoptimize`, `energyopt` — boolean run controls |
 | `display` | `zoomval` (1 or 2), `colourlim`, `colmap` — image display settings |
-| `roi` | `width_per_zoom`, `comwidth_per_zoom` — ROI extraction widths (scaled by `zoomval`) |
+| `roi` | `width_per_zoom`, `comwidth_per_zoom` — ROI extraction widths (scaled by `zoomval`); `bin_step_per_zoom` — bin width across each ROI, detector px (default 0.25, scaled by `zoomval` like the widths; `null`/0 = legacy whole-pixel integrator — see *Sub-pixel ROI integration*) |
 | `geometry` | `hkl`, `psi`, `px_unscaled`, `py_unscaled` — primary reflection and detector origin |
 | `computation` | `numsteps`, `simsigma_per_zoom`, `thrange_delta`, `bravais`, `pseudocubic_transform` (1–12, conventional only), `curve_method` (`sweep`/`circle` — see *DMS curve method*), `opt_method`, `peak_method` (`gauss`/`centroid`/`ridge` — see *Ridge + cone fit*), `tolerance` |
 | `crystal` | `lattice2`, `initial_guess_base`, `ref_6d` (quasicrystal 6D reflections) **or** `reflist_hkl` (conventional 3-index reflections) — starting parameters and reference reflections |
@@ -533,6 +546,88 @@ strain or a χ correction. Two things to know:
 A run too short to fit a circle to, or one the tolerance rejects, is kept as the
 points the sweep sampled, so switching method can add resolution but never loses
 a curve. Tests: `DMSAnalysis/tests/test_dms_curves.py`.
+
+### Sub-pixel ROI integration
+
+The ROI fit's design is unchanged: ROIs built once from the starting guess, and
+the data and every simulated image integrated through the same ones and
+located by the same `peakfit`. What changed is how a strip is sampled and how
+the simulated lines are drawn into the image the fit integrates.
+
+The legacy integrator (`msroi`) took whole-pixel offsets across the line (a
+width of 21 gave ~20 bins), the nearest pixel at each, and one normal per ROI
+(perpendicular to the chord between its first and last kernel pixel). The
+simulated image set whole pixels to 1. So the simulated centres — and χ² —
+were a **staircase in the parameters**: flat until a pixel flipped, then a jump.
+On the cubic test fixture, nudging dxrot by ±0.0025° gave χ² values 700× apart,
+and in sweep mode 41 steps produced only 20 distinct values.
+
+With `roi.bin_step_per_zoom` (`ts.roi_bin_from_config`; slider: **Bin (px)**
+next to *Width*, in image px like Width, default 0.25 × zoom):
+
+* `roi_sampler` lays sample points every `step` px across the strip, along the
+  **local** normal of a smoothed copy of the ROI path (±8 px window), with the
+  legacy chord normal fixing only the sign. `x` is still pixels from the strip
+  edge over the same span, so centres, manual centres, `AUTO_DOUBLET_SIG` and
+  sessions keep their meaning; there are just ~4× as many bins.
+* Along the line there is one sample per detector pixel (`roi_path_stride`:
+  1 at 0.25, `zoomval` at a zoomed step) — between detector pixels the image is
+  only interpolation, so denser sampling buys cost, not information.
+* `roi_profiles` integrates with bilinear interpolation. `roi_sample_set`
+  builds every ROI's weights once into one sparse (bins × pixels) matrix
+  (samples sharing a pixel summed), cached on the engine by `_samplers`, so an
+  evaluation is a single sparse mat-vec. On 913232 at zoom 1 (50 ROIs, 5 M
+  samples, 12 M non-zeros, 145 MB) an evaluation takes 0.086 s against the
+  legacy 0.119 s; building the matrix takes ~1 s and peaks at ~1.7 GB, once per
+  curve build.
+* `imcalc` **splats** the unrounded line points bilinearly (`splat_points`),
+  each weighted by the length of line it stands for (`_spacing_weights`,
+  capped at 1, so a coarse sweep point weighs what a pixel did). Overlapping
+  lines add rather than saturate. `dmsindex` is still the whole-pixel raster,
+  for the overlay PNG.
+* A located centre **outside its own strip** is marked not found
+  (`_centre_in_strip`): dropped as a target for the data, charged the fail
+  penalty for the simulation. With 4× the bins a Gaussian on a weak or sloping
+  curve could otherwise land off the strip and become a target — on 1041984
+  two ROIs did (61.8 and −20.1 on a 0–43 strip), tripling the starting χ².
+
+The result is a smooth, symmetric χ² about the truth. On 1041984 (the
+tetragonal example config) the legacy χ² changed slope direction 6–11 times
+over ±0.002 of any parameter and was flat in the detector ones, so LSQ and
+L-BFGS-B could not take a step; with 0.25 px bins every scan is monotone and
+both methods move and agree (χ² 688 → 326, same a and c to 3e-4 Å). That start
+leaves only 7 centres for 9 parameters, so it shows the fit can move, not a
+refined result. The local normal also
+helps a little on curved lines (a few percent narrower profile on a 63° arc —
+the strip already followed the line pixel by pixel, so the oblique-cut effect
+was always modest).
+
+`dmsfit_ico_hkl.setRoiBinStep(step)` switches the engine; an engine never told
+a step is the legacy one, bit for bit. The step must be the one the
+experimental curves were extracted with, so the slider snapshots it with the
+kernel (`_kernel_roibin`): moving the spinbox does nothing until **Build
+curves**, the live simulated curves and ROI outlines use the kernel's step, and
+a post-fit rebuild that reuses the experimental curves carries their width and
+step with them (`reuse_exp`). It is saved in sessions (`roi_bin_step`; an older
+session keeps the current setting, since the ROIs are rebuilt on restore
+anyway), exported as `roi.bin_step_per_zoom`, read by `fit.py` and `ridgefit.py`, and
+shown in `Result.txt` (`bins`). χ² is **not comparable** with legacy-binned
+runs. Test: `DMSAnalysis/tests/test_roi_subpixel.py`.
+
+**`zoomval` is no longer needed.** A cubic 2× zoom of the frame was a cheap way
+to get interpolation into the whole-pixel integrator, and it was costly: 4× the
+pixels in every kernel plane and in the image, twice the path per ROI. With
+interpolating ROIs, run at `zoomval: 1` — every `*_per_zoom` setting, the
+detector distance, the beam centre and manual centres are already stored per
+zoom, so nothing else in a config changes. The bundled example does.
+
+**The kernel is uint8 and holds only the kept ROIs.** `roibuilder_ico_hkl`
+used to allocate a float64 full-frame plane for every *candidate* ROI (two per
+reflection, most off the plate), then fancy-index a copy of the kept ones, and
+`multiroifit`/`multiroifit2` built a second such stack as the ROI mask. On
+913232 zoomed 2× (~45 reflections) that was >7 GB and the process was
+OOM-killed on a 15 GB machine; it is now 1.25 GB zoomed and 0.47 GB at zoom 1.
+Consumers only test `> 0`, slice or sum, so nothing else changed.
 
 ## Ridge + cone fit (prototype, `ridgefit.py`)
 

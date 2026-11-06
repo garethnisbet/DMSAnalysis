@@ -191,6 +191,21 @@ def image_number(exp, datapoint):
     return int(exp.get('image_first', 1)) + dp
 
 
+def resolve_scanpath(scanpath, cfg_path=None):
+    """A config's ``scan.scanpath`` as an absolute folder ending in a separator.
+
+    A relative path is taken relative to the config file's folder (or the
+    working directory when there is no file), so a config shipped next to its
+    data — ``configs/example_913232.json`` with ``../example_data/913232/`` —
+    runs from anywhere.  Absolute paths, the usual beamline case, are returned
+    unchanged apart from the trailing separator the apps concatenate onto."""
+    p = os.path.expanduser(str(scanpath))
+    if not os.path.isabs(p):
+        base = os.path.dirname(os.path.abspath(cfg_path)) if cfg_path else os.getcwd()
+        p = os.path.normpath(os.path.join(base, p))
+    return p if p.endswith(os.sep) else p + os.sep
+
+
 def image_path(scanpath, exp, datapoint):
     """Full path of the detector image for ``datapoint``."""
     return os.path.join(scanpath, exp['image_template'] % image_number(exp, datapoint))

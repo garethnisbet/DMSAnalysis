@@ -31,8 +31,9 @@ datestr=strftime("%Y%m%d%H%M")
 if len(sys.argv) > 1:
     _cfg_path = os.path.abspath(sys.argv[1])
 else:
-    _cfg_path = os.path.join(
-        CONFIGS, 'fit_fivefold_axis_AlPdMn_Not_Annealed_2M_2ROIS_internal_hkl.json')
+    # The bundled example: scan 913232 shipped in DMSAnalysis/example_data, so
+    # a bare `python -m DMSAnalysis.fit` runs on any machine.
+    _cfg_path = os.path.join(CONFIGS, 'example_913232.json')
 with open(_cfg_path) as _f:
     cfg = json.load(_f)
 
@@ -43,11 +44,14 @@ with open(_cfg_path) as _f:
 zoomval  = cfg["display"]["zoomval"]
 width    = cfg["roi"]["width_per_zoom"] * zoomval
 comwidth = cfg["roi"]["comwidth_per_zoom"] * zoomval
+# Bin width (px) across each ROI — sub-pixel by default; null / 0 is the legacy
+# whole-pixel integrator.  Data and simulation are integrated the same way.
+roibin   = ts.roi_bin_from_config(cfg["roi"], zoomval)
 
 scan = scannum = cfg["scan"]["scannum"]
 datapoint0    = cfg["scan"]["datapoint0"]
 datapoint     = cfg["scan"]["datapoint"]
-scanpath      = cfg["scan"]["scanpath"]
+scanpath      = dat2config.resolve_scanpath(cfg["scan"]["scanpath"], _cfg_path)
 
 imnum=datapoint+1
 tolerance    = cfg["computation"]["tolerance"]
@@ -245,7 +249,7 @@ builderargs=reflist,hkllist,hklint,intensity,psirange,threshold,hkl,detvects,imd
 kernel=ts.roibuilder_ico_hkl(builderargs)
 
 # linedataxc,linedatayc,linedataxcs,linedataycs, centres = ts.multiroigconv(imdata,kernel,width,[0,5,20],3.0, 2.0)
-imcoeffs,linedatax,linedatay, fitpoints, rois, pcov =ts.multiroifit2(imdata,kernel,width,0.02,ts.AUTO_DOUBLET_SIG,peak_method)
+imcoeffs,linedatax,linedatay, fitpoints, rois, pcov =ts.multiroifit2(imdata,kernel,width,0.02,ts.AUTO_DOUBLET_SIG,peak_method,step=roibin)
 # imcoeffs,linedatax,linedatay, fitpoints, rois =ts.multiroimin(imdata,kernel,width,0,0.01)
 centres=np.array([imcoeffs[:,2]]).T
 # linedatax,linedatay, centres, rois = ts.multiroicom(imdata,kernel,width,comwidth)
@@ -277,6 +281,7 @@ dms.setCalLattice(initial_guess[:6])
 dms.setLattice(initial_guess[:6])
 dms.setPeakMethod(peak_method, ts.AUTO_DOUBLET_SIG)
 dms.setCurveMethod(curve_method)
+dms.setRoiBinStep(roibin)
 dms.setIGFull(initial_guess)   # full guess for the conventional-crystal branch
 
 
@@ -365,7 +370,7 @@ plt.title('Overlay')
 # Same estimator as the residual uses on the simulated ROIs (see AUTO_DOUBLET_SIG);
 # the peak_method was previously dropped here, so the plotted simulated centres
 # could disagree with the ones the fit was scored on.
-imcoeffs,linedatasimx,linedatasimy, fitpointssim, rois2, covmat =ts.multiroifit(simim,kernel,width,10,peak_method,ts.AUTO_DOUBLET_SIG)
+imcoeffs,linedatasimx,linedatasimy, fitpointssim, rois2, covmat =ts.multiroifit(simim,kernel,width,10,peak_method,ts.AUTO_DOUBLET_SIG,step=roibin)
 # imcentres=imcoeffs[:,2]
 
 #
@@ -374,9 +379,13 @@ imcoeffs,linedatasimx,linedatasimy, fitpointssim, rois2, covmat =ts.multiroifit(
 # subcellsy = subcells
 subcellsx = cfg["display"]["subcellsx"]
 subcellsy = cfg["display"]["subcellsy"]
+# The config's grid is a minimum: it gains rows when there are more ROIs than
+# panels, rather than raising IndexError after the fit has run.
+subcellsx = max(int(subcellsx), int(np.ceil(kernel.shape[2] / max(int(subcellsy), 1))))
 
 if firstplot:
-    fig, axlist = plt.subplots(subcellsx,subcellsy,figsize=(6, 10))
+    fig, axlist = plt.subplots(subcellsx,subcellsy,figsize=(6, max(10, 10 * subcellsx / 7)),
+                               squeeze=False)
 
 
 ii = np.indices((subcellsx,subcellsy))
@@ -434,7 +443,10 @@ for i1 in range(kernel.shape[2]):
 plt.tight_layout()
 
 fig = plt.gcf()
-fig.canvas.setWindowTitle('iAlPdMn Not Annealed')
+# Portable across backends (the Qt-only canvas.setWindowTitle raised on Agg,
+# i.e. in any headless batch run, after the fit had finished).
+if getattr(fig.canvas, 'manager', None) is not None:
+    fig.canvas.manager.set_window_title('iAlPdMn Not Annealed')
 
 
 

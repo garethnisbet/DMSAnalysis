@@ -1111,8 +1111,11 @@ def roibuilder_ico_hkl(args):
 
     numrefs=reflist.shape[0]
     reflist2_arr=np.asarray(reflist2)
-    kernelstack=np.zeros((imshape[0],imshape[1],numrefs*2))
-    keep=np.array([[]]*1).T
+    # Planes only for the ROIs that are kept, as uint8: a full-frame float64
+    # plane per *candidate* ROI (then a fancy-indexed copy of the kept ones)
+    # needed ~7 GB on a zoomed Pilatus 2M with ~45 reflections, most of whose
+    # lines miss the plate.  Every consumer only tests `> 0`, slices or sums.
+    planes = []
     for i1 in range(0,numrefs,1):
         ref=reflist[i1,:]
         # The perpendicular component of *this* reflection, not the whole list.
@@ -1157,21 +1160,16 @@ def roibuilder_ico_hkl(args):
             roi1 = roi_rasterise(roiindex[run[:half]], imshape)
             roi2 = roi_rasterise(roiindex[run[half:]], imshape)
             if roi1.any() and roi2.any():
-                kernelstack[:,:,(i1*2)]=roi1
-                kernelstack[:,:,(i1*2)+1]=roi2
-                keep=np.vstack([keep,(i1*2)])
-                keep=np.vstack([keep,(i1*2)+1])
+                planes.append(np.asarray(roi1 > 0, dtype=np.uint8))
+                planes.append(np.asarray(roi2 > 0, dtype=np.uint8))
             else:
                 print('ROI '+str(i1)+' removed because a half is off the detector.')
         else:
             print('ROI '+str(i1)+' removed because lines miss the detector.')
-#     keep=uniquearray(keep) # clean duplicates
-    if keep.shape[0] >0:
-        keep=tuple(map(tuple,keep.T.astype(int)))[0]
-        return kernelstack[:,:,keep]
-    else:
-        print('No ROIS used!')
-        return kernelstack+1
+    if planes:
+        return np.stack(planes, axis=2)
+    print('No ROIS used!')
+    return np.ones((imshape[0], imshape[1], numrefs*2), dtype=np.uint8)
 def roi_kernel_indices(kernel):
     '''Pixel indices of every ROI in a (rows, cols, n_roi) kernel, one
     `np.where` tuple per plane — exactly what `msroi` would find.
@@ -1231,6 +1229,189 @@ def msroi2(img, kernel, width):
     return v1, v2, v
 
 
+# ── Sub-pixel ROI integration ──────────────────────────────────────────────────
+# `msroi` samples the strip at whole-pixel offsets across the line (a width of
+# 21 gives ~21 bins), takes the nearest pixel at each, and uses one direction
+# across the line for the whole ROI (normal to the chord from its first to last
+# kernel pixel).  The sub-pixel integrator keeps the strip — same ROI path, same
+# width, same x coordinate (pixels from the strip edge, so centres, manual
+# centres and AUTO_DOUBLET_SIG keep their meaning) — but
+#
+#   * samples it every `step` px (ROI_BIN_STEP) with bilinear interpolation,
+#   * crosses the line along its *local* normal, from a smoothed copy of the
+#     path, so a curved line is not cut obliquely toward the ROI's ends,
+#   * fixes all of that once per ROI (`roi_sampler`), so integrating an image
+#     is one `map_coordinates` call over every ROI (`roi_profiles`).
+#
+# The geometry depends only on the kernel, so the data and every simulated
+# image are integrated through exactly the same samples — the consistency the
+# ROI fit rests on.  `step=None` selects the original whole-pixel `msroi`.
+ROI_BIN_STEP = 0.25
+
+
+def roi_path_stride(step):
+    '''Path pixels between samples along a ROI at bin step `step`: one sample
+    per 1/ROI_BIN_STEP bins' worth of length, i.e. 1 at the default 0.25 and
+    `zoomval` when the step is scaled by the zoom (bin_step_per_zoom) — one
+    sample per detector pixel either way.  The image between detector pixels
+    is interpolation, so sampling it more densely along the line adds cost and
+    no information.'''
+    return max(1, int(round(float(step) / ROI_BIN_STEP)))
+
+
+def roi_bin_step(step):
+    '''Normalise a bin-step setting: None, 0, a negative value or 'legacy' mean
+    the original whole-pixel integrator (returned as None); anything else is a
+    positive bin width in pixels.'''
+    if step is None or (isinstance(step, str) and step.lower() == 'legacy'):
+        return None
+    step = float(step)
+    return step if step > 0 else None
+
+
+def roi_bin_from_config(roi_cfg, zoomval=1):
+    '''The image-pixel bin step a config's ``roi`` block asks for:
+    ``bin_step_per_zoom`` (default ROI_BIN_STEP) times ``zoomval``, like
+    ``width_per_zoom``.  null / 0 is the legacy integrator (None).'''
+    per = roi_bin_step((roi_cfg or {}).get('bin_step_per_zoom', ROI_BIN_STEP))
+    return None if per is None else per * max(float(zoomval), 1e-9)
+
+
+def roi_sampler(kernel, width, step):
+    '''Where one ROI's profile samples the image, at sub-pixel bins.
+
+    `kernel` is the ROI's 2D plane or its `np.where` index tuple.  Returns a
+    dict with ``x`` (B,) bin positions in pixels from the strip edge — the same
+    coordinate as the legacy integrator's bin index — and ``coords`` (B, N, 2)
+    float (row, col) sample points, one row of N along the path per bin, or
+    None for a ROI with fewer than two pixels.'''
+    vs_idx = kernel if isinstance(kernel, tuple) else np.where(np.asarray(kernel) > 0)
+    if len(vs_idx[0]) < 2:
+        return None
+    # The chord normal, exactly as msroi takes it: it fixes which way across the
+    # line x increases, so curves keep the legacy orientation.
+    dv = np.array([vs_idx[0][-1] - vs_idx[0][0], vs_idx[1][-1] - vs_idx[1][0]],
+                  dtype=float)
+    v0 = np.array([-dv[1], dv[0]])
+    if np.linalg.norm(v0) == 0:
+        v0 = np.array([1.0, 0.0])
+    v0 = v0 / np.linalg.norm(v0)
+
+    path = roi_walk_path(np.stack([vs_idx[0], vs_idx[1]], axis=1)).astype(float)
+    n = len(path)
+    # Smooth the rasterised path (its pixels zigzag ±0.5 px about the line) and
+    # take the tangent over the same window.  Up to ±8 px: long enough to
+    # average out the staircase, short enough that the sagitta of a curved line
+    # over the window stays well under a tenth of a pixel.
+    k = int(np.clip(n // 8, 1, 8))
+    i = np.arange(n)
+    lo, hi = np.clip(i - k, 0, n - 1), np.clip(i + k, 0, n - 1)
+    cs = np.vstack([np.zeros((1, 2)), np.cumsum(path, axis=0)])
+    centre = (cs[hi + 1] - cs[lo]) / (hi - lo + 1)[:, None]
+    tan = path[hi] - path[lo]
+    tl = np.linalg.norm(tan, axis=1)
+    chord_tan = np.array([v0[1], -v0[0]])
+    tan = np.where(tl[:, None] > 0, tan / np.where(tl > 0, tl, 1)[:, None],
+                   chord_tan[None, :])
+    nrm = np.stack([-tan[:, 1], tan[:, 0]], axis=1)
+    nrm = np.where((nrm @ v0)[:, None] < 0, -nrm, nrm)
+
+    irange = np.arange(int(np.round(-width / 2.0)), int(np.round(width / 2.0)))
+    if irange.size == 0:
+        irange = np.array([0])
+    span = float(irange[-1] - irange[0])
+    x = np.arange(0.0, span + 1e-9, float(step))
+    off = irange[0] + x
+    stride = roi_path_stride(step)
+    centre, nrm = centre[::stride], nrm[::stride]
+    coords = centre[None, :, :] + off[:, None, None] * nrm[None, :, :]
+    return {'x': x, 'coords': coords}
+
+
+def roi_sample_set(samplers, shape):
+    '''Precompute the integration of every ROI of `samplers` on an image of
+    `shape` as one sparse (bins x pixels) matrix of bilinear weights (zero for
+    samples off the plate).  Fixed for a fit, so each evaluation integrates
+    every ROI with one sparse mat-vec.'''
+    h, w = int(shape[0]), int(shape[1])
+    nb = [0 if s is None else s['coords'].shape[0] for s in samplers]
+    blocks = [s['coords'] for s in samplers if s is not None]
+    if not blocks:
+        return {'shape': (h, w), 'nbins': nb, 'M': None}
+    P = np.concatenate([b.reshape(-1, 2) for b in blocks])
+    bins = np.concatenate([
+        (np.repeat(np.arange(b.shape[0]), b.shape[1]) + off)
+        for b, off in zip(blocks, np.cumsum([0] + [b.shape[0] for b in blocks])[:-1])])
+    # Samples off the plate contribute 0, as the legacy integrator's do; one
+    # within the outer pixel ring is interpolated from what is on the plate.
+    inb = (P[:, 0] >= 0) & (P[:, 0] <= h - 1) & (P[:, 1] >= 0) & (P[:, 1] <= w - 1)
+    r = np.clip(P[:, 0], 0, h - 1)
+    c = np.clip(P[:, 1], 0, w - 1)
+    r0 = np.minimum(np.floor(r).astype(np.int64), h - 2 if h > 1 else 0)
+    c0 = np.minimum(np.floor(c).astype(np.int64), w - 2 if w > 1 else 0)
+    fr, fc = r - r0, c - c0
+    r1 = np.minimum(r0 + 1, h - 1)
+    c1 = np.minimum(c0 + 1, w - 1)
+    idx = np.stack([r0 * w + c0, r1 * w + c0, r0 * w + c1, r1 * w + c1])
+    wts = np.stack([(1 - fr) * (1 - fc), fr * (1 - fc), (1 - fr) * fc, fr * fc])
+    wts = wts * inb[None, :]
+    # One sparse (bins x pixels) matrix: every bin's bilinear weights, with the
+    # many samples that share a pixel summed once here rather than gathered on
+    # every evaluation.  A profile is then a single sparse mat-vec.
+    from scipy import sparse
+    total = int(sum(nb))
+    M = sparse.csr_matrix((wts.ravel(), (np.tile(bins, 4), idx.ravel())),
+                          shape=(total, h * w))
+    M.sum_duplicates()
+    M.eliminate_zeros()
+    return {'shape': (h, w), 'nbins': nb, 'M': M}
+
+
+def roi_profiles(img, samplers, sample_set=None):
+    '''Integrate `img` along every ROI of `samplers` (a list of `roi_sampler`
+    results, None allowed).  Returns one (B,) profile per ROI (an empty array
+    for None): at each bin, the sum along the path of the bilinearly
+    interpolated image.  Pass `sample_set` (roi_sample_set for these samplers
+    and this image shape) to skip rebuilding the gathers.'''
+    img = np.asarray(img, dtype=float)
+    ss = sample_set if sample_set is not None else roi_sample_set(samplers, img.shape)
+    if tuple(ss['shape']) != tuple(img.shape):
+        raise ValueError('sample set was built for a different image shape')
+    total = int(sum(ss['nbins']))
+    if total == 0:
+        return [np.array([]) for _ in samplers]
+    prof = ss['M'] @ img.ravel()
+    out, start = [], 0
+    for n in ss['nbins']:
+        out.append(prof[start:start + n] if n else np.array([]))
+        start += n
+    return out
+
+
+def roi_sample_pixels(sampler, shape):
+    '''The whole pixels a sub-pixel ROI reads, as an (M, 2) int array — the
+    analogue of msroi's second return value, for drawing the ROI mask.'''
+    if sampler is None:
+        return np.empty((0, 2), int)
+    P = np.round(sampler['coords'].reshape(-1, 2)).astype(int)
+    ok = ((P[:, 0] >= 0) & (P[:, 0] < shape[0]) &
+          (P[:, 1] >= 0) & (P[:, 1] < shape[1]))
+    return np.unique(P[ok], axis=0)
+
+
+def roi_curve(img, kernel, width, step=None):
+    '''One ROI's integrated curve as (x, y, roi pixels).  `step` None is the
+    legacy whole-pixel `msroi` (x the bin index); otherwise the sub-pixel
+    integrator at that bin width (x in pixels from the strip edge).'''
+    if step is None:
+        sumvals, roi = msroi(img, kernel, width)
+        return np.arange(len(sumvals)), sumvals[:, 0], roi
+    s = roi_sampler(kernel, width, step)
+    if s is None:
+        raise ValueError('ROI has fewer than two pixels')
+    return s['x'], roi_profiles(img, [s])[0], roi_sample_pixels(s, np.shape(img))
+
+
 def roi_walk_path(vs):
     '''Put a kernel plane's pixels back into path order by walking them.
 
@@ -1274,8 +1455,10 @@ def roi_walk_path(vs):
     return vs[order]
 
 
-def roi_outline(kernel, width):
+def roi_outline(kernel, width, step=None):
     '''Closed (rows, cols) outline of the strip `msroi` integrates for one ROI.
+    With a sub-pixel `step` it is the strip `roi_sampler` integrates instead:
+    the smoothed path offset along its local normals.
 
     `roibuilder_ico_hkl` lays a one-pixel-wide path along half of a DMS line;
     `msroi` then sums the image along that path at every perpendicular offset in
@@ -1289,6 +1472,13 @@ def roi_outline(kernel, width):
     it.  The path is put back into walk order first (`roi_walk_path`), without
     which a curved arc's two edges are drawn as zigzags.'''
     kernel = np.asarray(kernel)
+    if step is not None:
+        smp = roi_sampler(kernel, width, step)
+        if smp is None:
+            return np.array([]), np.array([])
+        e1, e2 = smp['coords'][0], smp['coords'][-1]
+        ring = np.concatenate([e1, e2[::-1], e1[:1]])
+        return ring[:, 0], ring[:, 1]
     vs_idx = np.where(kernel > 0)
     if len(vs_idx[0]) < 2:
         return np.array([]), np.array([])
@@ -1317,13 +1507,58 @@ def roi_outline(kernel, width):
     return ring[:, 0], ring[:, 1]
 
 
-def multiroifit(img,kernel,width,percentileval,method='gauss',sig=None):
+def _centre_in_strip(coef, xdata):
+    '''A located centre outside the strip it was integrated from is not a
+    measurement — a Gaussian dragged off the curve by a slope or a neighbour.
+    Mark it not found (NaN): for the data that drops the ROI's target, for the
+    simulation it is charged the fail penalty, as a line that left its ROI.'''
+    coef = np.array(coef, dtype=float)
+    if len(xdata) and not (xdata[0] <= coef[2] <= xdata[-1]):
+        coef[2] = np.nan
+    return coef
+
+
+def _multiroi_subpixel(img, kernel, width, step, method, sig):
+    '''multiroifit / multiroifit2 at a sub-pixel bin step: every ROI integrated
+    in one batch (roi_profiles), then each curve located with `peakfit`.'''
+    n = kernel.shape[2]
+    samplers = [roi_sampler(kernel[:, :, i], width, step) for i in range(n)]
+    profiles = roi_profiles(img, samplers)
+    v1 = np.array([[]]*4).T
+    vx, vy, v3, pcovlist = [], [], [], []
+    v4 = np.zeros((img.shape[0], img.shape[1], n), dtype=np.uint8)
+    for i1, (smp, ydata) in enumerate(zip(samplers, profiles)):
+        xdata = smp['x'] if smp is not None else np.array([])
+        try:
+            coef, pcov, fitpoints = peakfit(xdata, ydata, method, sig)
+            coef = _centre_in_strip(coef, xdata)
+        except Exception:
+            print('Fit not possible for _' + str(i1))
+            coef = np.array([0, 0, np.nan, 0])   # NaN centre: no usable peak here
+            pcov = np.zeros((4, 4))
+            fitpoints = ydata
+        v1 = np.vstack([v1, coef])
+        vx.append(xdata)
+        vy.append(ydata)
+        v3.append(fitpoints)
+        roi = roi_sample_pixels(smp, img.shape)
+        v4[roi[:, 0], roi[:, 1], i1] = 1
+        pcovlist.append(pcov)
+    return v1, np.array(vx), np.array(vy), np.array(v3), v4, pcovlist
+
+
+def multiroifit(img,kernel,width,percentileval,method='gauss',sig=None,step=None):
+    '''Integrate and locate every ROI of `kernel` in `img`.  `step` is the bin
+    width (ROI_BIN_STEP for the sub-pixel integrator); None is the original
+    whole-pixel `msroi`.'''
+    if step is not None:
+        return _multiroi_subpixel(img, kernel, width, step, method, sig)
     v1=np.array([[]]*4).T
     vx=[]
     vy=[]
     v3=[]
     pcovlist=[]
-    v4=np.zeros((img.shape[0],img.shape[1],kernel.shape[2]))
+    v4=np.zeros((img.shape[0],img.shape[1],kernel.shape[2]),dtype=np.uint8)
     for i1 in range(kernel.shape[2]):
         sumvals,roi = msroi(img,kernel[:,:,i1],width)
         xdata=np.arange(len(sumvals))
@@ -1358,13 +1593,17 @@ def _multiroifit2_one(img, kernel_slice, width, sig, idx, method='gauss'):
         fitpoints = ydata
     return coef, xdata, ydata, fitpoints, roi, pcov
 
-def multiroifit2(img,kernel,width,percentileval,sig,method='gauss'):
+def multiroifit2(img,kernel,width,percentileval,sig,method='gauss',step=None):
+    '''The experimental extraction: as multiroifit, ROIs fitted in parallel on
+    the legacy path.  `step` as in multiroifit.'''
+    if step is not None:
+        return _multiroi_subpixel(img, kernel, width, step, method, sig)
     n = kernel.shape[2]
     results = Parallel(n_jobs=-1)(
         delayed(_multiroifit2_one)(img, kernel[:, :, i1], width, sig, i1, method)
         for i1 in range(n)
     )
-    v4 = np.zeros((img.shape[0], img.shape[1], n))
+    v4 = np.zeros((img.shape[0], img.shape[1], n), dtype=np.uint8)
     v1 = np.array([[]]*4).T
     vx, vy, v3, pcovlist = [], [], [], []
     for i1, (coef, xdata, ydata, fitpoints, roi, pcov) in enumerate(results):
@@ -2663,6 +2902,85 @@ def dms_circle_curves(vecs, n_steps, n_refs, project, segment=None, shape=None,
     return pts, counts, owner[good], worst, fallback
 
 
+def _pre_components(pre, irmat):
+    '''Plate-plane intersection points -> unrounded detector-frame components
+    (0: normal to the scattering plane, 2: in it), NaN rows kept.'''
+    pv = np.asarray(pre, dtype=float) @ np.asarray(irmat, dtype=float)
+    return pv[:, 0], pv[:, 2]
+
+
+def _spacing_weights(P):
+    '''Per-point line length (px) of one ordered (n, 2) run, capped at 1: the
+    mean distance to its neighbours, ignoring NaN gaps.  A point whose
+    neighbours are a pixel or more away — a coarse sweep — weighs 1, as each
+    point did in the binary image; an over-sampled arc shares its pixel.'''
+    n = len(P)
+    if n == 0:
+        return np.zeros(0)
+    d = np.linalg.norm(np.diff(P, axis=0), axis=1) if n > 1 else np.zeros(0)
+    fwd = np.concatenate([d, [np.nan]])
+    bwd = np.concatenate([[np.nan], d])
+    both = np.stack([fwd, bwd])
+    cnt = np.isfinite(both).sum(0)
+    s = np.where(cnt > 0, np.nansum(both, 0) / np.maximum(cnt, 1), 1.0)
+    return np.minimum(s, 1.0)
+
+
+def _block_point_weights(rc, lens):
+    '''_spacing_weights over consecutive blocks of `rc` of the given lengths.'''
+    w = np.ones(len(rc))
+    start = 0
+    for ln in lens:
+        ln = int(ln)
+        w[start:start + ln] = _spacing_weights(rc[start:start + ln])
+        start += ln
+    return w
+
+
+def _sweep_point_weights(rc, n_steps, n_refs):
+    '''_spacing_weights for the sweep layout imcalc builds: two psi branches of
+    [one leading point, then n_steps x n_refs step-major], each reflection's
+    column a run.  Any other layout falls back to weight 1 per point.'''
+    w = np.ones(len(rc))
+    n_half = n_steps * n_refs + 1
+    if n_steps < 1 or n_refs < 1 or len(rc) != 2 * n_half:
+        return w
+    for h in range(2):
+        base = h * n_half + 1
+        P = rc[base:base + n_steps * n_refs].reshape(n_steps, n_refs, 2)
+        W = np.stack([_spacing_weights(P[:, j]) for j in range(n_refs)], axis=1)
+        w[base:base + n_steps * n_refs] = W.reshape(-1)
+    return w
+
+
+def splat_points(shape, rows, cols, weights=None):
+    '''Image of `shape` with each point's weight shared bilinearly over the four
+    pixels around it (pixel centres at integer coordinates).  The anti-aliased
+    counterpart of setting the nearest pixel to 1: the image changes smoothly
+    as a point moves.  Non-finite points and off-plate shares are dropped.'''
+    h, w = int(shape[0]), int(shape[1])
+    r = np.asarray(rows, dtype=float)
+    c = np.asarray(cols, dtype=float)
+    wt = np.ones(len(r)) if weights is None else np.asarray(weights, dtype=float)
+    ok = np.isfinite(r) & np.isfinite(c) & np.isfinite(wt)
+    r, c, wt = r[ok], c[ok], wt[ok]
+    r0 = np.floor(r).astype(np.int64)
+    c0 = np.floor(c).astype(np.int64)
+    fr, fc = r - r0, c - c0
+    idx, val = [], []
+    for dr, dc, f in ((0, 0, (1 - fr) * (1 - fc)), (1, 0, fr * (1 - fc)),
+                      (0, 1, (1 - fr) * fc), (1, 1, fr * fc)):
+        rr, cc = r0 + dr, c0 + dc
+        m = (rr >= 0) & (rr < h) & (cc >= 0) & (cc < w)
+        idx.append(rr[m] * w + cc[m])
+        val.append((wt * f)[m])
+    if not idx:
+        return np.zeros((h, w))
+    img = np.bincount(np.concatenate(idx), weights=np.concatenate(val),
+                      minlength=h * w)
+    return img.reshape(h, w)
+
+
 def _fit_roi_gauss(imsim, kernel_slice, width):
     sumvals, roi = msroi(imsim, kernel_slice, width)
     xdata = np.arange(len(sumvals))
@@ -2753,6 +3071,11 @@ class dmsfit_ico_hkl(object):
         # display).  ridgefit installs its ridge + cone residual here, so every
         # optimiser that drives this engine works on it unchanged.
         self.objective = None
+        # ROI bin step (px): None is the legacy whole-pixel integrator and the
+        # binary simulated image; a value selects the sub-pixel integrator and
+        # the splatted image (setRoiBinStep).
+        self.roibin = None
+        self._roi_samplers = None
     def setObjective(self, fn):
         self.objective = fn
     def setCalLattice(self, cal_lattice):
@@ -2773,6 +3096,7 @@ class dmsfit_ico_hkl(object):
         # ridgefit does — can never leave stale indices behind.
         self._kernel = kernel
         self._kernel_idx = roi_kernel_indices(kernel)
+        self._roi_samplers = None
     def setLattice(self, lattice):
         self.lattice = lattice
     def setCurveMethod(self, method, spacing_px=None, max_points=None):
@@ -2792,6 +3116,27 @@ class dmsfit_ico_hkl(object):
         if max_points is not None:
             self.curvemaxpoints = int(max_points)
 
+    def setRoiBinStep(self, step):
+        '''Bin width (px) across each ROI for the simulated curves — must be the
+        step the experimental curves were extracted with.  None (or 0) is the
+        legacy whole-pixel integrator with a binary simulated image; a value
+        integrates at sub-pixel bins along the local normal (roi_sampler) and
+        splats the simulated lines bilinearly, so the simulated centres move
+        continuously with the parameters instead of in whole-pixel steps.'''
+        self.roibin = roi_bin_step(step)
+        self._roi_samplers = None
+
+    def _samplers(self):
+        '''(samplers, sample set) for the current kernel, width and bin step,
+        built once and reused by every evaluation.'''
+        key = (float(self.width), self.roibin, tuple(np.shape(self.imdata)))
+        if self._roi_samplers is None or self._roi_samplers[0] != key:
+            smp = [roi_sampler(idx, self.width, self.roibin)
+                   for idx in self._kernel_idx]
+            self._roi_samplers = (key, smp,
+                                  roi_sample_set(smp, np.shape(self.imdata)))
+        return self._roi_samplers[1], self._roi_samplers[2]
+
     def setPeakMethod(self, method, sig=AUTO_DOUBLET_SIG):
         '''Set how peak positions are located in the simulated ROI curves.
         `sig` must be the value the experimental centres were extracted with,
@@ -2802,6 +3147,17 @@ class dmsfit_ico_hkl(object):
         '''Per-ROI peak coefficients of the current simulated image, using the
         selected peak-position method.  v1[:,2] is the centre per ROI.'''
         v1=np.array([[]]*4).T
+        if getattr(self, 'roibin', None) is not None:
+            samplers, sset = self._samplers()
+            for smp, ydata in zip(samplers,
+                                  roi_profiles(self.imsim, samplers, sset)):
+                try:
+                    coef, pcov, fitpoints = peakfit(smp['x'], ydata,
+                                                    self.peakmethod, self.peaksig)
+                    v1 = np.vstack([v1, _centre_in_strip(coef, smp['x'])])
+                except Exception:
+                    v1 = np.vstack([v1, [0, 0, np.nan, 0]])
+            return v1
         for i1 in range(len(self._kernel_idx)):
             sumvals,roi = msroi(self.imsim,self._kernel_idx[i1],self.width)
             xdata=np.arange(len(sumvals))
@@ -3130,7 +3486,21 @@ class dmsfit_ico_hkl(object):
         # so a fit's own result, read back through inputarray, described a
         # geometry the fit had never evaluated.
         self.inputarray = np.array([a,b,c,alpha,beta,gamma,psicorrection,chicorrection,thetacorrection,l_correction,detdistancepx,detxrot,detyrot,detzrot,energy,self.a11,self.a12,self.a13,self.a21,self.a22,self.a23,self.a31,self.a32,self.a33])
-        imsim[self.dmsindex]=1
+        if getattr(self, 'roibin', None) is not None:
+            # Sub-pixel: the lines are splatted at their exact positions, so the
+            # image (and every simulated ROI centre) moves continuously with the
+            # parameters.  dmsindex stays the whole-pixel raster, for display.
+            rc = det_to_pixels(*_pre_components(index_src, irmat),
+                               float(self.px), float(self.py), self.scatv)
+            rc = np.stack(rc, axis=1)
+            if arcs is None:
+                wts = _sweep_point_weights(rc, N_steps, N_refs)
+            else:
+                lens = list(arcs[1]) + [len(p) for _, p in arcs[4]]
+                wts = _block_point_weights(rc, lens)
+            imsim = splat_points(imsim.shape, rc[:, 0], rc[:, 1], wts)
+        else:
+            imsim[self.dmsindex]=1
         if self.simsigma != 0:
             self.imsim=blur_gauss(imsim,15,self.simsigma)
         else:
