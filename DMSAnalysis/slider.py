@@ -1233,6 +1233,12 @@ class BuildWorker(QtCore.QThread):
             reflist2_fit = np.array(rl2)
 
             hkllistrange_fit = [self._thrange[0], self._thrange[1], self._numsteps]
+            if not np.all(np.isfinite(self._thrange)):
+                # A NaN θ window makes every ROI the whole detector, and
+                # sampling those runs to gigabytes before anything fails.
+                raise ValueError('θ range is %s: the primary hkl has no Bragg '
+                                 'condition at this lattice and energy'
+                                 % self._thrange)
 
             if self._reuse_kernel is not None:
                 kernel = self._reuse_kernel
@@ -4304,6 +4310,28 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._restore_from_dict(data)
         self._status.setText('Loaded → %s' % os.path.basename(path))
 
+    def _refresh_bragg_window(self):
+        """Re-derive what hangs off the primary reflection — the θ window, the
+        hkl scan and the integer reference `hklint` — from the live hkl, energy
+        and scan lattice, as `_do_load_scan` does.
+
+        A session restore needs this after it sets hkl and energy: its scan
+        reload runs first, on the hkl and energy the window held *before*, so
+        it centres the θ window on the previous primary reflection.  Restoring
+        a session of another crystal made that NaN (sin θ > 1), and the ROI
+        builder then laid every ROI over the whole detector — a 6 GB sampler
+        on a Pilatus 2M frame."""
+        global hklint
+        thb = ts.bragg(self._lattice, self._hkl.copy(), self.ig[14]).th()[0]
+        if not np.isfinite(thb):
+            return              # no Bragg condition: keep the window there was
+        self._thrange = [thb - 27, thb + 10]
+        self._hkllist = ts.pilkhlrange(
+            self._lattice, self._hkl.copy(), self.ig[14],
+            self._thrange[0], self._thrange[1]).hklscan(numsteps)
+        hklint = np.round(self._hkl)
+        self._hklint = hklint.copy()
+
     def _restore_from_dict(self, data):
         """Restore the full workflow state captured by _session_dict()."""
         # 0. Restore the crystal type FIRST, so the correct slider set, fit engine
@@ -4393,6 +4421,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._suppress = False
         self.ig[:]   = ig_loaded
         self._hkl[:] = hkl_loaded
+        self._refresh_bragg_window()
 
         # 2.5 Restore the azimuthal reference and psi.  The scan reload above
         #     took both from the .dat when it seeded; the session values win so

@@ -47,6 +47,53 @@ def _render(model, x, shape, amp=200.0, bg=50.0, sig=2.0, seed=0):
     return np.random.default_rng(seed).poisson(im).astype(float)
 
 
+def _config_session(sl, cfg_path):
+    """A session dict that puts the window in the state a fresh start on
+    ``cfg_path`` would: its crystal type, scan, geometry and reflections.
+
+    The GUI harness is a singleton, so the window may have been built on
+    another test's config, and earlier tests leave it changed (a different
+    scan loaded, the detector toggles moved) even when it was built on this
+    one.  This test renders a synthetic image at the
+    tetragonal config's geometry and measures ridges on it; on another
+    config's geometry (detector distance, hkl, beam centre) most of its lines
+    miss the plate and the ridge holds a fraction of the points.  Restoring a
+    session is the app's own path for switching all of that at once."""
+    cfg = json.load(open(cfg_path))
+    geo, comp, roi = cfg['geometry'], cfg['computation'], cfg.get('roi', {})
+    ig = np.array(cfg['crystal']['initial_guess_base'], dtype=float)
+    zoom = cfg['display']['zoomval']
+    ig[10] = ig[10] / 2 * zoom          # the slider's startup conversions:
+    scanpath = os.path.join(sl.dat2config.resolve_scanpath(
+        cfg['scan']['scanpath'], cfg_path), '')   # restore appends the file name
+    try:                                # detdist halved, energy made absolute
+        exp = cfg.get('experiment') or sl.dat2config.extract_metadata(
+            os.path.join(scanpath, '%s.dat' % cfg['scan']['scannum']),
+            cfg['scan']['datapoint'], cfg['scan']['datapoint0'])
+        ig[14] += float(exp['energy'])
+    except Exception:                   # no scan on disk: keep the window's
+        ig[14] += float(sl.win.ig[14])
+    refs = cfg['crystal']['reflist_hkl']
+    return {
+        'bravais': comp['bravais'],
+        'pc_transform': comp.get('pseudocubic_transform', 1),
+        'scan': {'scanpath': scanpath,
+                 'scannum': cfg['scan']['scannum'],
+                 'datapoint': cfg['scan']['datapoint'],
+                 'datapoint0': cfg['scan']['datapoint0']},
+        'hkl': geo['hkl'], 'psi': geo['psi'],
+        'px': geo['px_unscaled'] * zoom, 'py': geo['py_unscaled'] * zoom,
+        'initial_guess': ig.tolist(),
+        'ref_6d': refs, 'ref_6d_checked': [True] * len(refs),
+        'peak_method': comp.get('peak_method', 'gauss'),
+        'curve_method': comp.get('curve_method', 'sweep'),
+        'roi_bin_step': sl.ts.roi_bin_from_config(roi, zoom),
+        'det_orientation': geo.get('det_orientation', 'vertical'),
+        'scatv': geo.get('scatv', 0),
+        'curves_built': False,
+    }
+
+
 def _wait(win, app, attr):
     w = getattr(win, attr)
     while w is not None and w.isRunning():
@@ -65,6 +112,11 @@ def test_ridge_peak_method_builds_scores_and_fits():
     cwd = os.getcwd()
     tmp = tempfile.mkdtemp()
     os.chdir(tmp)                    # the fit's run record goes to ./Processing
+    # Always reset: even when this config built the window, earlier tests
+    # (scan loads, detector toggles) leave it somewhere else.
+    before = win._session_dict()
+    win._restore_from_dict(_config_session(sl, CONFIG))
+    _wait(win, app, '_build_worker')
     try:
         win._on_clear_picks()
         win._apply_reflections(json.load(open(CONFIG))['crystal']['reflist_hkl'])
@@ -124,6 +176,8 @@ def test_ridge_peak_method_builds_scores_and_fits():
         os.chdir(cwd)
         win._imdata, _, win._active_method, _ = saved
         win._peak_combo.setCurrentIndex(win._peak_combo.findData(saved[1]))
+        _wait(win, app, '_build_worker')
+        win._restore_from_dict(before)   # hand the next test the window it had
         _wait(win, app, '_build_worker')
 
 

@@ -68,6 +68,14 @@ in that branch does hkl follow the energy ratio across a datapoint step
 twice. Session restore forces seeding off: the session's own geometry (now
 including `psi`, which it did not store before) wins over the file's.
 
+A session restore reloads the scan *before* it sets the session's hkl and
+energy, so that reload centres the θ window (and `hkllist`, `hklint`) on the
+previous primary reflection. `_refresh_bragg_window` re-derives them once the
+restored values are in. Without it, restoring another crystal's session left a
+NaN window (sin θ > 1), and **Build curves** then laid every ROI over the whole
+detector and was OOM-killed sampling them; the build worker now refuses a
+non-finite window. Test: `DMSAnalysis/tests/test_session_restore_bragg.py`.
+
 `hkl` at a datapoint comes from the scanned `h`/`k`/`l` columns when the scan has
 them. Most scans here (fixed-angle energy scans — 913232, 913123) do not: they
 carry one metadata hkl, recorded at the metadata energy `en`. The diffractometer
