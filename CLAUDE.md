@@ -23,6 +23,17 @@ reflections, then **Fit**. `fit.py` is the non-interactive/batch path. The
 — the sampled θ-sweep, or the circles they analytically are (see *DMS curve
 method* below).
 
+**IPython** (end of the Reset / Session button row) opens a qtconsole on an
+*in-process* kernel — same interpreter, thread and Qt loop as the slider, so it
+works on the live objects, not copies: `win` (the window), `ts`, `np`, the
+slider's module globals, and the engines `dms`, `dms_full`, `sel_dms`,
+`fit_dms`, `kernel` and `ig`. Those names are a snapshot taken when the console
+opens (the app rebuilds engines on Build curves, a type switch, a fit);
+`win._fit_dms` etc. are always current, and `dms_refresh()` re-binds the
+snapshot, as reopening does. Long code typed there blocks the GUI. Needs
+`qtconsole` + `ipykernel`; without them the button only reports that in the
+status line. Test: `DMSAnalysis/tests/test_ipython_console.py`.
+
 Two sets of view toggles, both off by default and neither touching the fit:
 **ROIs** (next to *DMS lines* / *Labels*) outlines the integration strips on the
 detector image — see *The ROI pair* below; and above the integrated-curve grid,

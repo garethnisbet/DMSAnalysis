@@ -2299,6 +2299,14 @@ class DMSSlider(QtWidgets.QMainWindow):
         btn_row.addWidget(btn_save)
         btn_row.addWidget(btn_load)
         btn_row.addWidget(btn_clear)
+        btn_console = QtWidgets.QPushButton('IPython')
+        btn_console.setStyleSheet('background: #303030; color: #e0e0e0')
+        btn_console.setToolTip('Open an IPython console running inside the '
+                               'slider: `win` is this window, `ts` the library, '
+                               'and the live engines are bound by name '
+                               '(type `dms_help()` for the list)')
+        btn_console.clicked.connect(self._on_open_console)
+        btn_row.addWidget(btn_console)
         ctrl_col2.addLayout(btn_row)
 
         # Status label
@@ -3911,6 +3919,86 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._hkl[:] = hkl_reset
         self._do_update()
         self._status.setText('Reset to initial guess')
+
+    # ── IPython console ──────────────────────────────────────────────────────
+    # The console runs an *in-process* kernel: same interpreter, same thread,
+    # same Qt event loop as the slider.  So what it sees is the live state, not
+    # a copy, and it can call into the GUI directly (win._on_print(), …).  The
+    # flip side is that a long computation typed into it blocks the GUI until
+    # it returns, exactly as it would in a slot.
+
+    def _console_namespace(self):
+        """Names pushed into the console on every open.  The engines are
+        rebuilt by the app (Build curves, a crystal-type switch, a fit), so
+        the bare names are a snapshot taken at open; `win.<attr>` is always
+        current, and `dms_refresh()` re-binds the snapshot."""
+        ns = {k: v for k, v in globals().items() if not k.startswith('__')}
+        ns.update({
+            'win': self, 'self': self, 'ts': ts, 'np': np,
+            'ridgefit': ridgefit, 'dat2config': dat2config,
+            'ig': np.asarray(self.ig, dtype=float).copy(),
+            'dms': self._dms,               # overlay engine (visible slice)
+            'dms_full': self._dms_full,     # overlay engine, whole reflist
+            'sel_dms': self._sel_dms,       # engine for the selected reflections
+            'fit_dms': self._fit_dms,       # fit engine (None until Build curves)
+            'kernel': self._kernel,         # ROI kernel stack (None until built)
+        })
+        return ns
+
+    def _on_open_console(self):
+        try:
+            from qtconsole.rich_jupyter_widget import RichJupyterWidget
+            from qtconsole.inprocess import QtInProcessKernelManager
+        except ImportError as exc:
+            self._status.setText('IPython console needs qtconsole and ipykernel: '
+                             'pip install qtconsole ipykernel  (%s)' % exc)
+            return
+
+        con = getattr(self, '_console', None)
+        if con is None:
+            km = QtInProcessKernelManager()
+            km.start_kernel(show_banner=False)
+            km.kernel.gui = 'qt'
+            kc = km.client()
+            kc.start_channels()
+
+            widget = RichJupyterWidget()
+            widget.set_default_style('linux')          # dark, matches the app
+            widget.kernel_manager, widget.kernel_client = km, kc
+            widget.banner = (
+                'DMS slider console — in-process, live objects.\n'
+                '  win       the slider window     ts   ts_quasi\n'
+                '  dms, dms_full, sel_dms, fit_dms, kernel, ig  (snapshot at open)\n'
+                '  dms_refresh()  re-bind the snapshot   dms_help()  this list\n\n')
+
+            con = QtWidgets.QMainWindow(self)
+            con.setWindowTitle('DMS slider — IPython')
+            con.setCentralWidget(widget)
+            con.resize(900, 560)
+            con._km, con._kc, con._widget = km, kc, widget
+            self._console = con
+
+        ns = self._console_namespace()
+        ns['dms_refresh'] = lambda: con._km.kernel.shell.push(
+            self._console_namespace(), interactive=False)
+        ns['dms_help'] = lambda: print(con._widget.banner)
+        con._km.kernel.shell.push(ns, interactive=False)
+
+        con.show()
+        con.raise_()
+        con.activateWindow()
+
+    def _close_console(self):
+        con = getattr(self, '_console', None)
+        if con is None:
+            return
+        try:
+            con._kc.stop_channels()
+            con._km.shutdown_kernel()
+        except Exception:
+            pass
+        con.close()
+        self._console = None
 
     def _on_print(self):
         self._sync_ig()
@@ -6170,6 +6258,7 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._write_session(SESSION_FILE, self._session_dict())
         except Exception:
             pass
+        self._close_console()
         self._worker.stop()
         if self._fit_worker and self._fit_worker.isRunning():
             self._fit_worker.wait()
