@@ -197,6 +197,20 @@ bravais      = _comp.get('bravais', 'icosahedral')
 # and no phason matrix (reflist2 = 0, phason = 0).
 CONVENTIONAL = bravais in ts.CONVENTIONAL_SYSTEMS
 opt_method   = _comp.get('opt_method', 'COBYLA')
+# τ used to project 6D reflections (icosahedral modes).  A config may give the
+# formula (crystal.tau_expr, e.g. "0.5+0.5*5**0.5") or just the number
+# (crystal.tau_approx, which exported configs have always carried); the default
+# is the 55/34 approximant.  The formula is kept for display, the float is used.
+_cr = cfg.get('crystal', {})
+try:
+    tau_expr = str(_cr['tau_expr'])
+    tau      = ts.eval_number_expr(tau_expr)
+except (KeyError, ValueError):
+    tau_expr = '55/34'
+    if 'tau_approx' in _cr and not np.isclose(float(_cr['tau_approx']),
+                                              ts.TAU_APPROX, rtol=0, atol=1e-15):
+        tau_expr = repr(float(_cr['tau_approx']))
+    tau      = ts.eval_number_expr(tau_expr)
 # How the DMS curves are computed from the hkl scan: 'sweep' (the sampled scan
 # points are the curve — the original) or 'circle' (each continuous run is
 # reduced to the circle it analytically lies on and re-sampled at detector
@@ -2011,6 +2025,28 @@ class DMSSlider(QtWidgets.QMainWindow):
         pc_row.addWidget(pc_lbl)
         pc_row.addWidget(self._pc_combo, 1)
         ct_v.addLayout(pc_row)
+        # τ for the 6D cut-and-projection (icosahedral modes only).  Accepts a
+        # formula — 55/34, 0.5+0.5*5**0.5, (1+sqrt(5))/2, tau — applied on Enter.
+        self._tau_row = QtWidgets.QWidget()
+        tau_l = QtWidgets.QHBoxLayout(self._tau_row)
+        tau_l.setContentsMargins(0, 0, 0, 0)
+        tau_lbl = QtWidgets.QLabel('τ')
+        self._tau_edit = QtWidgets.QLineEdit(tau_expr)
+        self._tau_edit.setToolTip(
+            'τ used to project the 6D reflections into parallel and '
+            'perpendicular space.  Enter a number or a formula — 55/34 (the '
+            'default approximant), 0.5+0.5*5**0.5 or tau (the golden ratio), '
+            'sqrt(…) allowed — and press Enter.  Changing it re-projects every '
+            'reflection and discards built curves.')
+        tau_lbl.setToolTip(self._tau_edit.toolTip())
+        self._tau_edit.returnPressed.connect(self._on_tau_entered)
+        self._tau_val = QtWidgets.QLabel('= %.10f' % tau)
+        self._tau_val.setStyleSheet('color: #999999')
+        tau_l.addWidget(tau_lbl)
+        tau_l.addWidget(self._tau_edit, 1)
+        tau_l.addWidget(self._tau_val)
+        self._tau_row.setVisible(not CONVENTIONAL)
+        ct_v.addWidget(self._tau_row)
         ctrl_col.addWidget(ct_box)
 
         # Sliders in scroll area
@@ -2588,18 +2624,7 @@ class DMSSlider(QtWidgets.QMainWindow):
 
         # Built curves / fit belong to the previous mode's parameter set —
         # invalidate them so a stale engine isn't reused.
-        self._fit_dms = None
-        self._kernel = self._centres = None
-        self._last_simcoefs = None
-        if getattr(self, '_lbl_resid', None) is not None:
-            self._lbl_resid.setText('χ² —')
-            self._lbl_resid.setStyleSheet('color: #cccccc')
-        self._reflist_fit = self._reflist2_fit = self._ref_6d_fit = None
-        self._last_res_x = None
-        self._last_fit_info = None
-        if getattr(self, '_btn_save_fit', None) is not None:
-            self._btn_save_fit.setEnabled(False)
-        self._init_line_plot()
+        self._invalidate_built_curves()
 
         # Rebuild the slider panel FIRST so self._sliders matches the new
         # slider_defs before anything (clear/redraw) calls _sync_ig.
@@ -2619,7 +2644,70 @@ class DMSSlider(QtWidgets.QMainWindow):
         # Pseudo-cubic re-indexing applies to 3-index reflections only.
         if getattr(self, '_pc_combo', None) is not None:
             self._pc_combo.setEnabled(CONVENTIONAL)
+        # τ only means something for the 6D cut-and-projection.
+        if getattr(self, '_tau_row', None) is not None:
+            self._tau_row.setVisible(not CONVENTIONAL)
         self._status.setText('Crystal type: %s' % bravais)
+
+    def _invalidate_built_curves(self):
+        """Drop built curves and the fit: they were made from reflections, an
+        indexing or a mode that no longer holds, so reusing them would fit
+        against stale geometry."""
+        self._fit_dms = None
+        self._kernel = self._centres = None
+        self._last_simcoefs = None
+        if getattr(self, '_lbl_resid', None) is not None:
+            self._lbl_resid.setText('χ² —')
+            self._lbl_resid.setStyleSheet('color: #cccccc')
+        self._reflist_fit = self._reflist2_fit = self._ref_6d_fit = None
+        self._last_res_x = None
+        self._last_fit_info = None
+        if getattr(self, '_btn_save_fit', None) is not None:
+            self._btn_save_fit.setEnabled(False)
+        self._init_line_plot()
+
+    # ── τ for the 6D cut-and-projection ──────────────────────────────────────
+
+    def _on_tau_entered(self):
+        text = self._tau_edit.text().strip()
+        try:
+            self._set_tau(text)
+        except ValueError as e:
+            self._tau_edit.setStyleSheet('border: 1px solid #d04040')
+            self._status.setText('τ not changed: %s' % e)
+
+    def _set_tau(self, expr):
+        """Set τ from a formula and re-project everything built from it: the
+        reflection list (and its |q_perp| cache), the overlay slice, the
+        arc-tracing engine and the selected reflections.  Built curves were
+        cut from the old projection, so they are discarded.  Raises
+        ``ValueError`` (and changes nothing) for a bad formula or τ ≤ 0."""
+        global tau, tau_expr
+        val = ts.eval_number_expr(expr)
+        if val <= 0:
+            raise ValueError('τ must be positive, got %g' % val)
+        self._tau_edit.setStyleSheet('')
+        self._tau_edit.setText(expr)
+        self._tau_val.setText('= %.10f' % val)
+        changed = val != tau
+        tau, tau_expr = val, expr
+        crys = self._cfg.setdefault('crystal', {})
+        crys['tau_expr'], crys['tau_approx'] = expr, val
+        if not changed:
+            return
+        self._cfgtable.set_config(self._cfg)
+        if CONVENTIONAL:        # nothing projected; takes effect on a switch back
+            self._status.setText('τ = %s (used in icosahedral modes)' % expr)
+            return
+        self._invalidate_built_curves()
+        self._rebuild_selected_engine()
+        self._regenerate_reflist()
+        self._dms_full = make_overlay_dms(
+            self.full_reflist, self.full_reflist2, self._hkl, self._imdata,
+            self._psirange, self._thrange, self._azir, self._psi,
+            self._px, self._py, self.ig)
+        self._status.setText('τ = %s = %.10f — reflections re-projected; '
+                             'rebuild curves before fitting' % (expr, val))
 
     # ── Pseudo-cubic re-indexing (Table 1 of doi:10.1107/S1600576723004120) ────
 
@@ -2672,18 +2760,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._arc_list.blockSignals(False)
 
         # Built curves / fit belong to the previous indexing — invalidate them.
-        self._fit_dms = None
-        self._kernel = self._centres = None
-        self._last_simcoefs = None
-        if getattr(self, '_lbl_resid', None) is not None:
-            self._lbl_resid.setText('χ² —')
-            self._lbl_resid.setStyleSheet('color: #cccccc')
-        self._reflist_fit = self._reflist2_fit = self._ref_6d_fit = None
-        self._last_res_x = None
-        self._last_fit_info = None
-        if getattr(self, '_btn_save_fit', None) is not None:
-            self._btn_save_fit.setEnabled(False)
-        self._init_line_plot()
+        self._invalidate_built_curves()
 
         self._rebuild_sliders()          # recentre h/k/l on the new indices
         self._rebuild_selected_engine()  # new hkl/azir baked into the engine
@@ -4157,6 +4234,8 @@ class DMSSlider(QtWidgets.QMainWindow):
             # active pseudo-cubic re-indexing matrix (hkl/ref_6d are stored
             # already re-indexed; restore sets the bookkeeping only)
             'pc_transform':   int(self._pc_idx),
+            # τ formula for the 6D projection (icosahedral modes)
+            'tau_expr':       tau_expr,
             'scan': {
                 'scanpath':   self._scanpath,
                 'scannum':    int(self._scannum),
@@ -4358,6 +4437,13 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._pc_combo.blockSignals(True)
             self._pc_combo.setCurrentIndex(self._pc_idx - 1)
             self._pc_combo.blockSignals(False)
+
+        # 0.6 τ, before anything is projected below.  Sessions from before the
+        #     option were projected with 55/34.
+        try:
+            self._set_tau(str(data.get('tau_expr', '55/34')))
+        except ValueError:
+            self._set_tau('55/34')
 
         # 1. Reload the scan/image, if the session records one.  Do this first so
         #    the saved geometry below overwrites the scan-derived defaults.
@@ -5163,6 +5249,7 @@ class DMSSlider(QtWidgets.QMainWindow):
             cfg['crystal']['ref_6d']     = ref_6d
             cfg['crystal']['lattice2']   = [float(self.ig[0])] * 3 + [90., 90., 90.]
             cfg['crystal']['tau_approx'] = float(tau)   # pass rational approx to workflow
+            cfg['crystal']['tau_expr']   = tau_expr
         cfg['crystal']['initial_guess_base'] = ig24.tolist()
         cfg['display']['zoomval']            = zoomval
         cfg['display']['colourlim']          = list(colourlim)

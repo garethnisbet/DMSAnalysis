@@ -909,7 +909,15 @@ A conventional system keeps exactly its old slots and reduced vector, so existin
 configs and residuals are unchanged.
 
 `tau_approx` defaults to `ts_quasi.TAU_APPROX` = 55/34, which `slider.py` also
-reads — one source. `fit.py` still projects with `Projection6d`, which uses the
+reads — one source. In the slider τ is settable: the **τ** field in the
+*Crystal type* box (icosahedral modes only) takes a formula — `55/34`,
+`0.5+0.5*5**0.5`, `(1+sqrt(5))/2`, `tau` — evaluated by
+`ts_quasi.eval_number_expr` (an AST walk over numbers, `+ - * / **`, `sqrt` and
+`tau`; never `eval`). Enter re-projects the reflection list, the selected
+reflections and the engines, and discards built curves. The formula is saved
+in sessions (`tau_expr`; older sessions restore as 55/34) and exported as
+`crystal.tau_expr` beside `crystal.tau_approx`; a config's `tau_expr`, else its
+`tau_approx`, sets it at startup. Test: `DMSAnalysis/tests/test_tau_setting.py`. `fit.py` still projects with `Projection6d`, which uses the
 exact golden ratio, so the image batch fit does not index a quasicrystal quite
 as the slider does; tripfit follows the slider.
 

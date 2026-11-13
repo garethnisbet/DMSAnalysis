@@ -38,6 +38,46 @@ TAU =  0.5+0.5*5**0.5
 # (Projection6dArrayApproximant) and exports as crystal.tau_approx.  Shared so
 # the tripfit engine indexes a quasicrystal exactly as the slider does.
 TAU_APPROX = 55 / 34.
+
+
+def eval_number_expr(text):
+    '''Evaluate an arithmetic formula such as ``0.5+0.5*5**0.5`` or ``55/34``
+    to a float, without ``eval``: numbers, ``+ - * / **``, unary signs,
+    parentheses, ``sqrt(x)`` and the constant ``tau`` (the golden ratio) only.
+    Raises ``ValueError`` for anything else or a non-finite result.'''
+    import ast
+    import math
+    import operator as op
+    bins = {ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul,
+            ast.Div: op.truediv, ast.Pow: op.pow}
+    unas = {ast.UAdd: op.pos, ast.USub: op.neg}
+
+    def ev(n):
+        if isinstance(n, ast.Expression):
+            return ev(n.body)
+        if isinstance(n, ast.Constant) and type(n.value) in (int, float):
+            return float(n.value)
+        if isinstance(n, ast.BinOp) and type(n.op) in bins:
+            l, r = ev(n.left), ev(n.right)
+            if isinstance(n.op, ast.Pow) and abs(r) > 64:
+                raise ValueError('exponent too large')
+            return bins[type(n.op)](l, r)
+        if isinstance(n, ast.UnaryOp) and type(n.op) in unas:
+            return unas[type(n.op)](ev(n.operand))
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id == 'sqrt' and len(n.args) == 1 and not n.keywords):
+            return math.sqrt(ev(n.args[0]))
+        if isinstance(n, ast.Name) and n.id == 'tau':
+            return TAU
+        raise ValueError('not allowed in a formula: %s' % ast.dump(n)[:40])
+
+    try:
+        val = ev(ast.parse(str(text).strip(), mode='eval'))
+    except (SyntaxError, ZeroDivisionError, OverflowError, TypeError) as e:
+        raise ValueError('cannot evaluate %r: %s' % (text, e))
+    if not isinstance(val, float) or not math.isfinite(val):
+        raise ValueError('%r does not evaluate to a finite number' % (text,))
+    return val
 ###################################
 
 # ── Conventional-crystal symmetry layer ────────────────────────────────────────
