@@ -224,6 +224,27 @@ tolerance    = _comp.get('tolerance', 1e-6)
 intensity    = _comp.get('intensity', 1)
 threshold    = _comp.get('threshold', 0)
 n_parallel_starts = _comp.get('n_parallel_starts', 4)
+
+
+def cpu_cores():
+    """Cores this process may run on (the affinity mask, not the machine's
+    total -- a batch-queue slot or taskset sees fewer)."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+
+def clamp_cores(n):
+    """A parallel-start count in [1, cpu_cores()]; junk gives the default 4."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 4
+    return min(max(n, 1), cpu_cores())
+
+
+n_parallel_starts = clamp_cores(n_parallel_starts)
 _flags       = cfg.get('flags', {})
 detoptimize  = _flags.get('detoptimize', 1)
 energyopt    = _flags.get('energyopt', 0)
@@ -1897,7 +1918,27 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._algo_combo.setCurrentIndex(algo_methods.index(self._active_method))
         self._algo_combo.currentIndexChanged.connect(
             lambda i: self._on_algo(algo_methods[i]))
-        fitl.addWidget(self._algo_combo, 5, 0, 1, 2)
+        # Cores: the multistart methods run one local search per core, in
+        # parallel threads (n_parallel_starts global -- it is both the number
+        # of starts and joblib's n_jobs).  Was fixed at the config's value, 4.
+        self._sb_cores = QtWidgets.QSpinBox()
+        self._sb_cores.setRange(1, cpu_cores())
+        self._sb_cores.setValue(int(n_parallel_starts))
+        self._sb_cores.setPrefix('cores ')
+        self._sb_cores.setToolTip(
+            'Parallel starts for the multistart optimisers (Nelder-Mead, '
+            'Powell, COBYLA, SLSQP, L-BFGS-B, TNC, …): one local search per '
+            'core, each from a perturbed copy of the guess, best result kept.  '
+            'More cores = more starts in the same wall time.\n\n'
+            'GA, dual annealing, basin hopping and LSQ are single-threaded and '
+            'ignore it.  Max %d (the cores this process may use).' % cpu_cores())
+        self._sb_cores.valueChanged.connect(self._on_cores_changed)
+        _ac = QtWidgets.QWidget()
+        _acl = QtWidgets.QHBoxLayout(_ac)
+        _acl.setContentsMargins(0, 0, 0, 0)
+        _acl.addWidget(self._algo_combo, 1)
+        _acl.addWidget(self._sb_cores)
+        fitl.addWidget(_ac, 5, 0, 1, 2)
 
         self._btn_fit = QtWidgets.QPushButton('Fit')
         self._btn_fit.setStyleSheet('background: #1a5c1a; color: #ccffcc; font-weight: bold')
@@ -2394,11 +2435,19 @@ class DMSSlider(QtWidgets.QMainWindow):
             'Rescale every ROI panel to its curves and re-enable auto-scaling, '
             'so later updates keep fitting the panel.')
         self._btn_roi_reset.clicked.connect(self._on_roi_reset_zoom)
-        for _w in (self._chk_roi_axes, self._chk_roi_zoom, self._btn_roi_reset):
+        self._btn_clear_centres = QtWidgets.QPushButton('Clear centres')
+        self._btn_clear_centres.setToolTip(
+            'Remove every manually assigned ROI centre (the amber lines set by '
+            'right-click) and go back to the automatically located peaks.  '
+            'A ROI whose peak could not be located has no target again.')
+        self._btn_clear_centres.clicked.connect(self._on_clear_manual_centres)
+        for _w in (self._chk_roi_axes, self._chk_roi_zoom, self._btn_roi_reset,
+                   self._btn_clear_centres):
             _f = _w.font(); _f.setPointSize(7); _w.setFont(_f)
         roi_opt_row.addWidget(self._chk_roi_axes)
         roi_opt_row.addWidget(self._chk_roi_zoom)
         roi_opt_row.addWidget(self._btn_roi_reset)
+        roi_opt_row.addWidget(self._btn_clear_centres)
         roi_opt_row.addStretch()
         roi_col.addLayout(roi_opt_row)
 
@@ -4266,6 +4315,8 @@ class DMSSlider(QtWidgets.QMainWindow):
             # the simulated image, so a restored session must fit on the same
             # construction it was saved on
             'curve_method':   curve_method,
+            # parallel starts / cores for the multistart optimisers
+            'n_parallel_starts': int(n_parallel_starts),
             # ROI bin width (px; None = legacy whole-pixel integrator)
             'roi_bin_step':   roibin,
             # detector mounting (vertical / horizontal scattering)
@@ -4547,7 +4598,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         #     curves come back on the construction the session was fitted on.
         #     Sessions written before this option existed have no key and stay
         #     on the sampled sweep, which is what they were computed with.
-        global curve_method
+        global curve_method, n_parallel_starts
         try:
             cm = ts.dms_curve_method(data.get('curve_method', 'sweep'))
         except ValueError:
@@ -4558,6 +4609,14 @@ class DMSSlider(QtWidgets.QMainWindow):
             self._curve_combo.setCurrentIndex(self._curve_combo.findData(cm))
             self._suppress = False
         self._apply_curve_method()
+        # Parallel starts (cores).  Older sessions have no key and keep the
+        # current setting; a session from a bigger machine is clamped.
+        if 'n_parallel_starts' in data:
+            n_parallel_starts = clamp_cores(data['n_parallel_starts'])
+            if getattr(self, '_sb_cores', None) is not None:
+                self._sb_cores.blockSignals(True)
+                self._sb_cores.setValue(int(n_parallel_starts))
+                self._sb_cores.blockSignals(False)
         # ROI bin width.  Sessions from before the option keep the current
         # setting: the ROIs are rebuilt on restore anyway.
         if 'roi_bin_step' in data:
@@ -5258,6 +5317,7 @@ class DMSSlider(QtWidgets.QMainWindow):
         cfg['computation']['peak_method']    = self._peak_method
         # fit.py reads this, so a batch run reproduces the curves the slider fitted
         cfg['computation']['curve_method']   = curve_method
+        cfg['computation']['n_parallel_starts'] = int(n_parallel_starts)
         # The exported hkl / azir / reflections are already in the active
         # pseudo-cubic indexing — the consumer must not re-apply the matrix.
         cfg['computation']['pseudocubic_transform'] = 1
@@ -6048,6 +6108,32 @@ class DMSSlider(QtWidgets.QMainWindow):
         self._update_residual_readout()
         self._status.setText('Centre override ROI %d: x=%.1f' % (roi_idx, x))
 
+    def _on_clear_manual_centres(self):
+        """Drop every manual ROI-centre override: each overridden ROI goes back
+        to the centre the build located (``imcoeffs[:, 2]``, NaN where none was
+        found).  Overrides restored from a session but not yet applied to a
+        build are dropped too, so the next Build curves does not bring them
+        back."""
+        n = len(self._centre_override_rois) + len(
+            set(self._pending_centre_overrides) - self._centre_override_rois)
+        self._pending_centre_overrides = {}
+        if self._centres is not None and self._imcoeffs is not None:
+            for ridx in self._centre_override_rois:
+                if ridx < self._centres.shape[0] and ridx < len(self._imcoeffs):
+                    auto = float(self._imcoeffs[ridx, 2])
+                    self._centres[ridx, 0] = auto
+                    if self._fit_dms is not None:
+                        self._fit_dms.centres[ridx, 0] = auto
+        self._centre_override_rois = set()
+        if not n:
+            self._status.setText('No manual centres to clear')
+            return
+        if self._exp_centre_lines:
+            self._draw_exp_lines()
+        self._update_residual_readout()
+        self._status.setText('Cleared %d manual centre(s) — back to the '
+                             'located peaks' % n)
+
     def _on_roi_mouse_moved(self, evt):
         pos = evt[0]
         for pl in self._roi_plots:
@@ -6139,6 +6225,11 @@ class DMSSlider(QtWidgets.QMainWindow):
         for eng in (self._dms, self._dms_full, self._sel_dms, self._fit_dms):
             if eng is not None:
                 eng.setCurveMethod(curve_method)
+
+    def _on_cores_changed(self, value):
+        """Number of parallel starts (= threads) for the next fit."""
+        global n_parallel_starts
+        n_parallel_starts = clamp_cores(value)
 
     def _on_numsteps_changed(self, value):
         """Update the point count (hkl scan resolution) used for the live image

@@ -23,6 +23,16 @@ reflections, then **Fit**. `fit.py` is the non-interactive/batch path. The
 — the sampled θ-sweep, or the circles they analytically are (see *DMS curve
 method* below).
 
+**cores** (spinbox beside the optimiser combo in the *Fit* box) is
+`computation.n_parallel_starts`: the multistart methods (Nelder-Mead, Powell,
+COBYLA, SLSQP, L-BFGS-B, TNC, …) run one perturbed start per core in parallel
+threads, so it is both the number of starts and joblib's `n_jobs`. It used to
+be fixed at the config's value (default 4). Range 1 to the cores the process
+may use (`slider.cpu_cores`, the affinity mask); saved in sessions (older ones
+keep the current value, larger values are clamped) and exported for `fit.py`.
+GA, dual annealing, basin hopping and LSQ are single-threaded and ignore it.
+Test: `DMSAnalysis/tests/test_cores_setting.py`.
+
 **IPython** (end of the Reset / Session button row) opens a qtconsole on an
 *in-process* kernel — same interpreter, thread and Qt loop as the slider, so it
 works on the live objects, not copies: `win` (the window), `ts`, `np`, the
@@ -42,7 +52,11 @@ width, the units the centres and residual are in; y the integrated intensity),
 **Drag zoom** makes left-drag zoom to a rectangle on a panel instead of panning,
 and **Reset zoom** rescales every panel to its curves and re-enables
 auto-scaling. Left-click still selects a ROI and right-click still assigns its
-centre in either mouse mode.
+centre in either mouse mode. **Clear centres** drops every right-click centre:
+each overridden ROI goes back to the peak the build located (`imcoeffs[:, 2]`,
+NaN — no target — where none was found), in the window and the fit engine, and
+overrides restored from a session but not yet built are dropped too
+(`_on_clear_manual_centres`). Test: `DMSAnalysis/tests/test_clear_centres.py`.
 
 ### Loading a scan: the .dat is the source
 
